@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-smb-proto"
+description = "I/O-free SMB 2/3 protocol codec, NTLM/SPNEGO authentication and SMB crypto primitives"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,26 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bitflags = "2.6"
+# Crypto (RustCrypto; AES uses AES-NI / ARMv8 crypto extensions at runtime).
+aes = "0.9"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+ghash = "0.6"
+ccm = { version = "0.6", default-features = false }
+cmac = "0.8"
+hmac = "0.13"
+sha2 = "0.11"
+md4 = "0.11"
+md-5 = "0.11"
+rc4 = "0.2"
+subtle = "2.6"
+zeroize = "1.8"
+getrandom = "0.4"
+
+[dev-dependencies]
+hex = "0.4"
+proptest = "1.5"
+tokio = { workspace = true }

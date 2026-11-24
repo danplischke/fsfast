@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-memory"
+description = "In-memory fsfast filesystem with fsspec MemoryFileSystem semantics"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,14 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+fsfast-testkit.workspace = true
+futures.workspace = true
+proptest = "1.5"
+tokio = { workspace = true }

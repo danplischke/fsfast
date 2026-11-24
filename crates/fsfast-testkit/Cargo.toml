@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-testkit"
+description = "Backend conformance suite every fsfast filesystem backend runs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,11 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1.5"
+tokio = { workspace = true }
