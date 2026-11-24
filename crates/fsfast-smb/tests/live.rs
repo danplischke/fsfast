@@ -31,3 +31,20 @@ async fn smoke_both_shares() {
         fs.close().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn negotiates_3_1_1_with_gmac_and_gcm() {
+    let Some(env) = common::env() else { return };
+    let fs = env.fs(&[]);
+    let i = fs.connection_info(&env.share).await.unwrap();
+    eprintln!("{i:?}");
+    assert_eq!(i.dialect, "3.1.1");
+    assert!(i.signing, "signing is required by the server and by default");
+    assert_eq!(i.signing_algorithm.as_deref(), Some("AES-GMAC"));
+    assert_eq!(i.cipher.as_deref(), Some("AES-128-GCM"));
+    assert!(!i.share_encrypted);
+    let e = fs.connection_info(&env.enc_share).await.unwrap();
+    assert!(e.share_encrypted && !e.encrypt_all, "{e:?}");
+    assert!(i.credit_window >= 64, "credit window did not grow: {}", i.credit_window);
+    fs.close().await.unwrap();
+}

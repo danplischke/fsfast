@@ -95,6 +95,33 @@ use crate::copy::CopyOutcome;
 use crate::handle::{IoShape, Undo};
 use crate::ops::Listing;
 
+/// What a connection negotiated (diagnostics; see
+/// [`SmbFileSystem::connection_info`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// Dialect, e.g. `"3.1.1"`.
+    pub dialect: String,
+    /// Signing algorithm (`"AES-GMAC"`, `"AES-CMAC"`, `"HMAC-SHA256"`), or
+    /// `None` for an unsigned guest/anonymous session.
+    pub signing_algorithm: Option<String>,
+    /// Whether requests are signed (and responses must be).
+    pub signing: bool,
+    /// Negotiated cipher, if encryption is possible.
+    pub cipher: Option<String>,
+    /// Whether the whole session is encrypted.
+    pub encrypt_all: bool,
+    /// Whether requests on the share are encrypted.
+    pub share_encrypted: bool,
+    /// Server limits.
+    pub max_read_size: u32,
+    /// Server limits.
+    pub max_write_size: u32,
+    /// Server limits.
+    pub max_transact_size: u32,
+    /// Credits currently available plus in flight.
+    pub credit_window: usize,
+}
+
 /// The fsspec `info()` keys after `name`/`size`/`type`, in the reference
 /// implementation's order (for the Python bindings).
 pub const INFO_KEYS: &[&str] = &["uid", "gid", "time", "mtime"];
@@ -143,6 +170,50 @@ impl SmbFileSystem {
             return Ok(());
         }
         self.client.connect().await
+    }
+
+    /// What the connection serving `share` negotiated (connecting if
+    /// needed): dialect, signing and encryption, server limits.
+    pub async fn connection_info(&self, share: &str) -> Result<ConnectionInfo> {
+        let ctx = self.client.ctx(share).await?;
+        let n = ctx.live.conn.neg();
+        let c = &ctx.live.crypto;
+        let dialect = match n.dialect {
+            d if d == fsfast_smb_proto::Dialect::SMB_2_0_2 => "2.0.2",
+            d if d == fsfast_smb_proto::Dialect::SMB_2_1 => "2.1",
+            d if d == fsfast_smb_proto::Dialect::SMB_3_0 => "3.0",
+            d if d == fsfast_smb_proto::Dialect::SMB_3_0_2 => "3.0.2",
+            _ => "3.1.1",
+        };
+        let signing_algorithm = c.signer.as_ref().map(|s| {
+            match s.algorithm() {
+                fsfast_smb_proto::crypto::SigningAlgorithm::HmacSha256 => "HMAC-SHA256",
+                fsfast_smb_proto::crypto::SigningAlgorithm::AesCmac => "AES-CMAC",
+                fsfast_smb_proto::crypto::SigningAlgorithm::AesGmac => "AES-GMAC",
+            }
+            .to_owned()
+        });
+        let cipher = n.cipher.map(|c| {
+            match c {
+                fsfast_smb_proto::crypto::Cipher::Aes128Ccm => "AES-128-CCM",
+                fsfast_smb_proto::crypto::Cipher::Aes128Gcm => "AES-128-GCM",
+                fsfast_smb_proto::crypto::Cipher::Aes256Ccm => "AES-256-CCM",
+                fsfast_smb_proto::crypto::Cipher::Aes256Gcm => "AES-256-GCM",
+            }
+            .to_owned()
+        });
+        Ok(ConnectionInfo {
+            dialect: dialect.to_owned(),
+            signing_algorithm,
+            signing: c.signing,
+            cipher,
+            encrypt_all: c.encrypt_all,
+            share_encrypted: ctx.tree.encrypt,
+            max_read_size: n.max_read_size,
+            max_write_size: n.max_write_size,
+            max_transact_size: n.max_transact_size,
+            credit_window: ctx.live.conn.shared.credits.window(),
+        })
     }
 
     fn share_mode(&self, reading: bool) -> ShareAccess {
