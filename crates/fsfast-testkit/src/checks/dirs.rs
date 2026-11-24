@@ -29,7 +29,10 @@ pub(crate) async fn mkdir_rmdir(ctx: &Ctx) -> CheckResult {
         .ctx(format_args!("mkdir({d:?}, create_parents=false)"))?;
     ctx.expect_dir(&d).await?;
     let entries = ctx.fs.ls(&d).await.ctx(format_args!("ls({d:?})"))?;
-    ensure!(entries.is_empty(), "a new directory is not empty: {entries:?}");
+    ensure!(
+        entries.is_empty(),
+        "a new directory is not empty: {entries:?}"
+    );
 
     // mkdir of an existing directory fails, with or without create_parents.
     for parents in [false, true] {
@@ -69,7 +72,10 @@ pub(crate) async fn mkdir_rmdir(ctx: &Ctx) -> CheckResult {
     ctx.expect_dir(&nested).await?;
 
     // Empty the tree bottom-up, then rmdir succeeds.
-    ctx.fs.rm_file(&file).await.ctx(format_args!("rm_file({file:?})"))?;
+    ctx.fs
+        .rm_file(&file)
+        .await
+        .ctx(format_args!("rm_file({file:?})"))?;
     for p in ["a/b/c", "a/b", "a"] {
         let p = path::join(&d, p);
         ctx.fs.rmdir(&p).await.ctx(format_args!("rmdir({p:?})"))?;
@@ -107,10 +113,9 @@ pub(crate) async fn makedirs(ctx: &Ctx) -> CheckResult {
     for d in ["md", "md/x", "md/x/y"] {
         ctx.expect_dir(&ctx.path(d)).await?;
     }
-    ctx.fs
-        .makedirs(&p, true)
-        .await
-        .ctx(format_args!("makedirs({p:?}, exist_ok=true) of an existing directory"))?;
+    ctx.fs.makedirs(&p, true).await.ctx(format_args!(
+        "makedirs({p:?}, exist_ok=true) of an existing directory"
+    ))?;
     expect_err(
         format!("makedirs({p:?}, exist_ok=false) of an existing directory"),
         ctx.fs.makedirs(&p, false).await,

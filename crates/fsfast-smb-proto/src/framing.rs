@@ -24,7 +24,10 @@ const NBSS_KEEPALIVE: u8 = 0x85;
 /// Build the 4-byte transport header for a frame of `len` bytes.
 pub fn transport_header(len: usize) -> Result<[u8; 4]> {
     if len > MAX_TRANSPORT_FRAME_LEN {
-        return Err(ProtoError::FrameTooLarge { len, max: MAX_TRANSPORT_FRAME_LEN });
+        return Err(ProtoError::FrameTooLarge {
+            len,
+            max: MAX_TRANSPORT_FRAME_LEN,
+        });
     }
     let l = (len as u32).to_be_bytes();
     Ok([0, l[1], l[2], l[3]])
@@ -61,13 +64,19 @@ impl Default for FrameDecoder {
 impl FrameDecoder {
     /// A decoder accepting frames up to the protocol maximum (16 MiB - 1).
     pub fn new() -> Self {
-        FrameDecoder { max_frame_len: MAX_TRANSPORT_FRAME_LEN, pending: None }
+        FrameDecoder {
+            max_frame_len: MAX_TRANSPORT_FRAME_LEN,
+            pending: None,
+        }
     }
 
     /// A decoder rejecting frames larger than `max` bytes, e.g.
     /// `MaxReadSize + 64 KiB` once negotiated, to bound memory use.
     pub fn with_max_frame_len(max: usize) -> Self {
-        FrameDecoder { max_frame_len: max.min(MAX_TRANSPORT_FRAME_LEN), pending: None }
+        FrameDecoder {
+            max_frame_len: max.min(MAX_TRANSPORT_FRAME_LEN),
+            pending: None,
+        }
     }
 
     /// Change the frame size limit.
@@ -90,7 +99,9 @@ impl FrameDecoder {
                         return Ok(None);
                     }
                     let kind = buf[0];
-                    let len = (usize::from(buf[1]) << 16) | (usize::from(buf[2]) << 8) | usize::from(buf[3]);
+                    let len = (usize::from(buf[1]) << 16)
+                        | (usize::from(buf[2]) << 8)
+                        | usize::from(buf[3]);
                     match kind {
                         NBSS_SESSION_MESSAGE => {}
                         NBSS_KEEPALIVE if len == 0 => {
@@ -105,7 +116,10 @@ impl FrameDecoder {
                         }
                     }
                     if len > self.max_frame_len {
-                        return Err(ProtoError::FrameTooLarge { len, max: self.max_frame_len });
+                        return Err(ProtoError::FrameTooLarge {
+                            len,
+                            max: self.max_frame_len,
+                        });
                     }
                     buf.advance(TRANSPORT_HEADER_LEN);
                     self.pending = Some(len);
@@ -128,7 +142,8 @@ impl FrameDecoder {
             Some(len) => len.saturating_sub(buf.len()),
             None if buf.len() < TRANSPORT_HEADER_LEN => TRANSPORT_HEADER_LEN - buf.len(),
             None => {
-                let len = (usize::from(buf[1]) << 16) | (usize::from(buf[2]) << 8) | usize::from(buf[3]);
+                let len =
+                    (usize::from(buf[1]) << 16) | (usize::from(buf[2]) << 8) | usize::from(buf[3]);
                 (TRANSPORT_HEADER_LEN + len).saturating_sub(buf.len())
             }
         }
@@ -141,7 +156,7 @@ mod tests {
 
     #[test]
     fn header_encoding() {
-        assert_eq!(transport_header(0x0102_03).unwrap(), [0, 1, 2, 3]);
+        assert_eq!(transport_header(0x0001_0203).unwrap(), [0, 1, 2, 3]);
         assert!(transport_header(MAX_TRANSPORT_FRAME_LEN + 1).is_err());
     }
 
@@ -179,7 +194,10 @@ mod tests {
     fn limit_enforced() {
         let mut dec = FrameDecoder::with_max_frame_len(10);
         let mut buf = BytesMut::from(&transport_header(11).unwrap()[..]);
-        assert!(matches!(dec.decode(&mut buf), Err(ProtoError::FrameTooLarge { len: 11, max: 10 })));
+        assert!(matches!(
+            dec.decode(&mut buf),
+            Err(ProtoError::FrameTooLarge { len: 11, max: 10 })
+        ));
     }
 
     #[test]

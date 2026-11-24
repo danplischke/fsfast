@@ -187,7 +187,10 @@ impl NegotiateContext {
         dst.put_u32_le(0);
         let data_start = dst.len();
         match self {
-            NegotiateContext::PreauthIntegrity { hash_algorithms, salt } => {
+            NegotiateContext::PreauthIntegrity {
+                hash_algorithms,
+                salt,
+            } => {
                 dst.put_u16_le(len_u16(hash_algorithms.len(), "too many hash algorithms")?);
                 dst.put_u16_le(len_u16(salt.len(), "salt too long")?);
                 for h in hash_algorithms {
@@ -202,7 +205,10 @@ impl NegotiateContext {
                 }
             }
             NegotiateContext::Compression { flags, algorithms } => {
-                dst.put_u16_le(len_u16(algorithms.len(), "too many compression algorithms")?);
+                dst.put_u16_le(len_u16(
+                    algorithms.len(),
+                    "too many compression algorithms",
+                )?);
                 dst.put_u16_le(0);
                 dst.put_u32_le(*flags);
                 for a in algorithms {
@@ -263,7 +269,10 @@ impl NegotiateContext {
                 let flags = r.u32()?;
                 NegotiateContext::Compression {
                     flags,
-                    algorithms: ids(&mut r, n)?.into_iter().map(CompressionAlgorithm).collect(),
+                    algorithms: ids(&mut r, n)?
+                        .into_iter()
+                        .map(CompressionAlgorithm)
+                        .collect(),
                 }
             }
             NETNAME_NEGOTIATE_CONTEXT_ID => {
@@ -285,7 +294,10 @@ impl NegotiateContext {
             SIGNING_CAPABILITIES => {
                 let n = usize::from(r.u16()?);
                 NegotiateContext::Signing {
-                    algorithms: ids(&mut r, n)?.into_iter().map(SigningAlgorithmId).collect(),
+                    algorithms: ids(&mut r, n)?
+                        .into_iter()
+                        .map(SigningAlgorithmId)
+                        .collect(),
                 }
             }
             _ => NegotiateContext::Unknown { context_type, data },
@@ -389,13 +401,21 @@ impl Message for NegotiateRequest {
         let ctx_off = r.u32()? as usize;
         let ctx_count = usize::from(r.u16()?);
         r.skip(2)?;
-        let dialects: Vec<Dialect> = (0..n).map(|_| r.u16().map(Dialect)).collect::<Result<_>>()?;
+        let dialects: Vec<Dialect> = (0..n)
+            .map(|_| r.u16().map(Dialect))
+            .collect::<Result<_>>()?;
         let negotiate_contexts = if dialects.contains(&Dialect::SMB_3_1_1) && ctx_count > 0 {
             decode_contexts(msg, ctx_off, ctx_count)?
         } else {
             Vec::new()
         };
-        Ok(NegotiateRequest { security_mode, capabilities, client_guid, dialects, negotiate_contexts })
+        Ok(NegotiateRequest {
+            security_mode,
+            capabilities,
+            client_guid,
+            dialects,
+            negotiate_contexts,
+        })
     }
 }
 
@@ -430,9 +450,10 @@ impl NegotiateResponse {
     /// The selected preauth hash algorithm and salt (3.1.1).
     pub fn preauth_integrity(&self) -> Option<(HashAlgorithm, &Bytes)> {
         self.negotiate_contexts.iter().find_map(|c| match c {
-            NegotiateContext::PreauthIntegrity { hash_algorithms, salt } => {
-                hash_algorithms.first().map(|h| (*h, salt))
-            }
+            NegotiateContext::PreauthIntegrity {
+                hash_algorithms,
+                salt,
+            } => hash_algorithms.first().map(|h| (*h, salt)),
             _ => None,
         })
     }
@@ -485,8 +506,15 @@ impl Message for NegotiateResponse {
         dst.put_u64_le(self.system_time.0);
         dst.put_u64_le(self.server_start_time.0);
         let sec_off = HEADER_LEN + 64;
-        dst.put_u16_le(if self.security_buffer.is_empty() { 0 } else { sec_off as u16 });
-        dst.put_u16_le(len_u16(self.security_buffer.len(), "security buffer too long")?);
+        dst.put_u16_le(if self.security_buffer.is_empty() {
+            0
+        } else {
+            sec_off as u16
+        });
+        dst.put_u16_le(len_u16(
+            self.security_buffer.len(),
+            "security buffer too long",
+        )?);
         let ctx_off_pos = dst.len();
         dst.put_u32_le(0);
         dst.put_slice(&self.security_buffer);
@@ -596,9 +624,16 @@ mod tests {
                     flags: COMPRESSION_CAPABILITIES_FLAG_CHAINED,
                     algorithms: vec![CompressionAlgorithm::LZ77, CompressionAlgorithm::PATTERN_V1],
                 },
-                NegotiateContext::Transport { flags: ACCEPT_TRANSPORT_LEVEL_SECURITY },
-                NegotiateContext::RdmaTransform { transform_ids: vec![RdmaTransformId::ENCRYPTION] },
-                NegotiateContext::Unknown { context_type: 0x100, data: Bytes::from_static(b"abc") },
+                NegotiateContext::Transport {
+                    flags: ACCEPT_TRANSPORT_LEVEL_SECURITY,
+                },
+                NegotiateContext::RdmaTransform {
+                    transform_ids: vec![RdmaTransformId::ENCRYPTION],
+                },
+                NegotiateContext::Unknown {
+                    context_type: 0x100,
+                    data: Bytes::from_static(b"abc"),
+                },
             ],
         };
         assert_eq!(round_trip(&req, false), req);
@@ -631,8 +666,12 @@ mod tests {
                     hash_algorithms: vec![HashAlgorithm::SHA512],
                     salt: Bytes::from_static(&[9; 32]),
                 },
-                NegotiateContext::Encryption { ciphers: vec![CipherId::AES_128_GCM] },
-                NegotiateContext::Signing { algorithms: vec![SigningAlgorithmId::AES_GMAC] },
+                NegotiateContext::Encryption {
+                    ciphers: vec![CipherId::AES_128_GCM],
+                },
+                NegotiateContext::Signing {
+                    algorithms: vec![SigningAlgorithmId::AES_GMAC],
+                },
             ],
         };
         let d = round_trip(&resp, true);

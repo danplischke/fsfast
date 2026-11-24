@@ -36,8 +36,14 @@ pub(crate) async fn pipe_cat_roundtrip(ctx: &Ctx) -> CheckResult {
         (small.clone(), ctx.pattern(&small, 1000)),
         (ctx.path("all_256_values.bin"), Bytes::from(all_256)),
         (ctx.path("all_256_mixed.bin"), Bytes::from(all_256_mixed)),
-        (ctx.path("nul_ff.bin"), Bytes::from_static(&[0, 0xff, 0, 0, 0xff, b'\n', b'\r'])),
-        (ctx.path("nested/deeper/file.bin"), Bytes::from_static(b"nested")),
+        (
+            ctx.path("nul_ff.bin"),
+            Bytes::from_static(&[0, 0xff, 0, 0, 0xff, b'\n', b'\r']),
+        ),
+        (
+            ctx.path("nested/deeper/file.bin"),
+            Bytes::from_static(b"nested"),
+        ),
     ];
     for (p, data) in &cases {
         ctx.put(p, data.clone()).await?;
@@ -64,14 +70,32 @@ pub(crate) async fn cat_file_ranges(ctx: &Ctx) -> CheckResult {
         ByteRange::Full,
         ByteRange::Bounded { start: 0, end: N },
         ByteRange::Bounded { start: 0, end: 1 },
-        ByteRange::Bounded { start: 10, end: 100 },
-        ByteRange::Bounded { start: N - 1, end: N },
+        ByteRange::Bounded {
+            start: 10,
+            end: 100,
+        },
+        ByteRange::Bounded {
+            start: N - 1,
+            end: N,
+        },
         // Past-EOF clamping.
-        ByteRange::Bounded { start: N - 5, end: N + 100 },
-        ByteRange::Bounded { start: 0, end: N + 1_000_000 },
+        ByteRange::Bounded {
+            start: N - 5,
+            end: N + 100,
+        },
+        ByteRange::Bounded {
+            start: 0,
+            end: N + 1_000_000,
+        },
         // Start at / beyond EOF.
-        ByteRange::Bounded { start: N, end: N + 10 },
-        ByteRange::Bounded { start: N + 10, end: N + 20 },
+        ByteRange::Bounded {
+            start: N,
+            end: N + 10,
+        },
+        ByteRange::Bounded {
+            start: N + 10,
+            end: N + 20,
+        },
         // Empty and inverted ranges.
         ByteRange::Bounded { start: 0, end: 0 },
         ByteRange::Bounded { start: 50, end: 50 },
@@ -155,17 +179,24 @@ pub(crate) async fn cat_ranges(ctx: &Ctx) -> CheckResult {
         4000..5000,
         5000..6000, // adjacent to the previous one
         0..10,
-        size - 10..size,          // far apart from the previous one
-        size - 100..size + 100,   // crosses EOF: truncated
-        size + 10..size + 20,     // entirely past EOF: empty
-        7000..7000,               // empty
-        9000..8000,               // inverted: empty
-        100..size / 2,            // large
+        size - 10..size,        // far apart from the previous one
+        size - 100..size + 100, // crosses EOF: truncated
+        size + 10..size + 20,   // entirely past EOF: empty
+        7000..7000,             // empty
+        Range {
+            start: 9000,
+            end: 8000,
+        }, // inverted: empty
+        100..size / 2,          // large
         size / 2 - 1..size / 2 + 1,
     ];
 
     let check = |what: &str, got: &[Bytes]| -> CheckResult {
-        ensure_eq!(got.len(), ranges.len(), "{what}: number of returned buffers");
+        ensure_eq!(
+            got.len(),
+            ranges.len(),
+            "{what}: number of returned buffers"
+        );
         for (i, (r, g)) in ranges.iter().zip(got).enumerate() {
             let c = clamp(size, r);
             compare_bytes(
@@ -202,12 +233,18 @@ pub(crate) async fn cat_ranges(ctx: &Ctx) -> CheckResult {
         .cat_ranges(&p, &[])
         .await
         .ctx(format_args!("cat_ranges({p:?}, [])"))?;
-    ensure!(none.is_empty(), "cat_ranges with no ranges returned {} buffers", none.len());
+    ensure!(
+        none.is_empty(),
+        "cat_ranges with no ranges returned {} buffers",
+        none.len()
+    );
 
     let missing = ctx.path("missing.bin");
     expect_err(
         format!("cat_ranges({missing:?})"),
-        ctx.fs.cat_ranges(&missing, &[0..1]).await,
+        ctx.fs
+            .cat_ranges(&missing, std::slice::from_ref(&(0..1)))
+            .await,
         &[ErrorKind::NotFound],
     )
 }
@@ -256,16 +293,24 @@ pub(crate) async fn read_at_eof(ctx: &Ctx) -> CheckResult {
         .await
         .ctx(format_args!("open_read({p:?})"))?;
     ensure_eq!(h.size(), N, "ReadHandle::size()");
-    ensure_eq!(h.info().name, path::normalize(&p), "ReadHandle::info().name");
-    ensure!(h.info().is_file(), "ReadHandle::info() is not a file: {:?}", h.info().file_type);
+    ensure_eq!(
+        h.info().name,
+        path::normalize(&p),
+        "ReadHandle::info().name"
+    );
+    ensure!(
+        h.info().is_file(),
+        "ReadHandle::info() is not a file: {:?}",
+        h.info().file_type
+    );
 
     let cases: [(u64, usize, Range<usize>); 8] = [
-        (N, 10, 0..0),                  // at EOF
-        (N + 100, 10, 0..0),            // past EOF
-        (u64::MAX / 2, 10, 0..0),       // far past EOF
+        (N, 10, 0..0),                              // at EOF
+        (N + 100, 10, 0..0),                        // past EOF
+        (u64::MAX / 2, 10, 0..0),                   // far past EOF
         (N - 5, 100, (N - 5) as usize..N as usize), // spans EOF: truncated
-        (0, 0, 0..0),                   // zero-length
-        (0, N as usize, 0..N as usize), // exactly the file
+        (0, 0, 0..0),                               // zero-length
+        (0, N as usize, 0..N as usize),             // exactly the file
         (0, N as usize + 50, 0..N as usize),
         (17, 1, 17..18),
     ];
@@ -291,8 +336,15 @@ pub(crate) async fn read_at_eof(ctx: &Ctx) -> CheckResult {
         .await
         .ctx(format_args!("open_read({empty:?})"))?;
     ensure_eq!(h.size(), 0, "ReadHandle::size() of an empty file");
-    let got = h.read_at(0, 10).await.ctx("read_at(0, 10) on an empty file")?;
-    ensure!(got.is_empty(), "read_at(0, 10) on an empty file returned {} bytes", got.len());
+    let got = h
+        .read_at(0, 10)
+        .await
+        .ctx("read_at(0, 10) on an empty file")?;
+    ensure!(
+        got.is_empty(),
+        "read_at(0, 10) on an empty file returned {} bytes",
+        got.len()
+    );
     h.close().await.ctx("ReadHandle::close")?;
     Ok(())
 }
@@ -323,7 +375,9 @@ pub(crate) async fn concurrent_read_at(ctx: &Ctx) -> CheckResult {
         let h = h.clone();
         // Spawned so that multi-threaded runtimes issue the calls truly in
         // parallel on the one handle.
-        tasks.push(tokio::spawn(async move { (off, len, h.read_at(off, len).await) }));
+        tasks.push(tokio::spawn(async move {
+            (off, len, h.read_at(off, len).await)
+        }));
     }
     for t in tasks {
         let (off, len, r) = match t.await {
@@ -377,7 +431,11 @@ pub(crate) async fn read_ranges_large(ctx: &Ctx) -> CheckResult {
         .await
         .ctx(format_args!("read_ranges({p:?})"))?;
     h.close().await.ctx("ReadHandle::close")?;
-    ensure_eq!(got.len(), ranges.len(), "read_ranges: number of returned buffers");
+    ensure_eq!(
+        got.len(),
+        ranges.len(),
+        "read_ranges: number of returned buffers"
+    );
     for (i, (r, g)) in ranges.iter().zip(&got).enumerate() {
         let c = clamp(size, r);
         verify_pattern(
@@ -402,7 +460,11 @@ pub(crate) async fn read_ranges_large(ctx: &Ctx) -> CheckResult {
         .cat_ranges(&p, &subset)
         .await
         .ctx(format_args!("cat_ranges({p:?})"))?;
-    ensure_eq!(got.len(), subset.len(), "cat_ranges: number of returned buffers");
+    ensure_eq!(
+        got.len(),
+        subset.len(),
+        "cat_ranges: number of returned buffers"
+    );
     for (i, (r, g)) in subset.iter().zip(&got).enumerate() {
         let c = clamp(size, r);
         verify_pattern(

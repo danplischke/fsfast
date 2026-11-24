@@ -12,7 +12,8 @@ use crate::error::{ProtoError, Result};
 use crate::header::{Command, HEADER_LEN, credit_charge_for};
 use crate::types::{Capabilities, Dialect, FileId, SecurityMode};
 use crate::wire::{
-    Guid, Reader, decode_utf16z, len_u16, len_u32, padding, patch_u16, patch_u32, put_utf16le, slice_bytes,
+    Guid, Reader, decode_utf16z, len_u16, len_u32, padding, patch_u16, patch_u32, put_utf16le,
+    slice_bytes,
 };
 
 /// IOCTL/FSCTL control codes.
@@ -267,8 +268,15 @@ impl FsctlData for ValidateNegotiateInfoRequest {
         let guid = r.guid()?;
         let security_mode = SecurityMode::from_bits_retain(r.u16()?);
         let n = usize::from(r.u16()?);
-        let dialects = (0..n).map(|_| r.u16().map(Dialect)).collect::<Result<_>>()?;
-        Ok(ValidateNegotiateInfoRequest { capabilities, guid, security_mode, dialects })
+        let dialects = (0..n)
+            .map(|_| r.u16().map(Dialect))
+            .collect::<Result<_>>()?;
+        Ok(ValidateNegotiateInfoRequest {
+            capabilities,
+            guid,
+            security_mode,
+            dialects,
+        })
     }
 }
 
@@ -330,7 +338,10 @@ impl FsctlData for SrvRequestResumeKeyResponse {
         // Windows reports ContextLength 0 but appends 4 reserved bytes; take
         // what the length says.
         let context = Bytes::copy_from_slice(r.bytes(len)?);
-        Ok(SrvRequestResumeKeyResponse { resume_key, context })
+        Ok(SrvRequestResumeKeyResponse {
+            resume_key,
+            context,
+        })
     }
 }
 
@@ -382,7 +393,11 @@ impl FsctlData for SrvCopyChunkCopy {
             let target_offset = r.u64()?;
             let length = r.u32()?;
             r.skip(4)?;
-            chunks.push(SrvCopyChunk { source_offset, target_offset, length });
+            chunks.push(SrvCopyChunk {
+                source_offset,
+                target_offset,
+                length,
+            });
         }
         Ok(SrvCopyChunkCopy { source_key, chunks })
     }
@@ -443,7 +458,10 @@ impl FsctlData for DfsReferralRequest {
         let mut r = Reader::new(buf, "REQ_GET_DFS_REFERRAL");
         let max_referral_level = r.u16()?;
         let request_file_name = decode_utf16z(buf, 2, "REQ_GET_DFS_REFERRAL")?;
-        Ok(DfsReferralRequest { max_referral_level, request_file_name })
+        Ok(DfsReferralRequest {
+            max_referral_level,
+            request_file_name,
+        })
     }
 }
 
@@ -489,7 +507,11 @@ impl FsctlData for DfsReferralRequestEx {
         } else {
             None
         };
-        Ok(DfsReferralRequestEx { max_referral_level, request_file_name, site_name })
+        Ok(DfsReferralRequestEx {
+            max_referral_level,
+            request_file_name,
+            site_name,
+        })
     }
 }
 
@@ -586,7 +608,14 @@ impl FsctlData for DfsReferralResponse {
                 (DfsReferralTarget::V1 { share_name }, 1) => {
                     put_utf16z(dst, share_name);
                 }
-                (DfsReferralTarget::Target { dfs_path, dfs_alternate_path, network_address }, v @ 2..=4) => {
+                (
+                    DfsReferralTarget::Target {
+                        dfs_path,
+                        dfs_alternate_path,
+                        network_address,
+                    },
+                    v @ 2..=4,
+                ) => {
                     if v == 2 {
                         dst.put_u32_le(r.proximity);
                     }
@@ -599,7 +628,13 @@ impl FsctlData for DfsReferralResponse {
                         dst.put_bytes(0, 16); // ServiceSiteGuid
                     }
                 }
-                (DfsReferralTarget::NameList { special_name, expanded_names }, 3 | 4) => {
+                (
+                    DfsReferralTarget::NameList {
+                        special_name,
+                        expanded_names,
+                    },
+                    3 | 4,
+                ) => {
                     dst.put_u32_le(r.time_to_live);
                     fixups.push((start, dst.len(), vec![special_name.clone()]));
                     dst.put_u16_le(0);
@@ -608,7 +643,11 @@ impl FsctlData for DfsReferralResponse {
                     dst.put_u16_le(0);
                     dst.put_bytes(0, 16);
                 }
-                _ => return Err(ProtoError::InvalidInput("DFS referral target does not match its version")),
+                _ => {
+                    return Err(ProtoError::InvalidInput(
+                        "DFS referral target does not match its version",
+                    ));
+                }
             }
             let v = len_u16(dst.len() - start, "referral too long")?;
             patch_u16(dst, size_pos, v);
@@ -633,7 +672,11 @@ impl FsctlData for DfsReferralResponse {
         let mut referrals = Vec::with_capacity(n.min(64));
         let mut pos = 8usize;
         for _ in 0..n {
-            let entry = buf.get(pos..).ok_or(ProtoError::Truncated { what: W, need: pos, have: buf.len() })?;
+            let entry = buf.get(pos..).ok_or(ProtoError::Truncated {
+                what: W,
+                need: pos,
+                have: buf.len(),
+            })?;
             let mut e = Reader::new(entry, W);
             let version = e.u16()?;
             let size = usize::from(e.u16()?);
@@ -644,7 +687,13 @@ impl FsctlData for DfsReferralResponse {
             }
             let s = |off: u16| decode_utf16z(entry, usize::from(off), W);
             let (proximity, time_to_live, target) = match version {
-                1 => (0, 0, DfsReferralTarget::V1 { share_name: decode_utf16z(entry, 8, W)? }),
+                1 => (
+                    0,
+                    0,
+                    DfsReferralTarget::V1 {
+                        share_name: decode_utf16z(entry, 8, W)?,
+                    },
+                ),
                 2 => {
                     let proximity = e.u32()?;
                     let ttl = e.u32()?;
@@ -652,7 +701,11 @@ impl FsctlData for DfsReferralResponse {
                     (
                         proximity,
                         ttl,
-                        DfsReferralTarget::Target { dfs_path: s(p)?, dfs_alternate_path: s(a)?, network_address: s(n)? },
+                        DfsReferralTarget::Target {
+                            dfs_path: s(p)?,
+                            dfs_alternate_path: s(a)?,
+                            network_address: s(n)?,
+                        },
                     )
                 }
                 3 | 4 => {
@@ -667,7 +720,14 @@ impl FsctlData for DfsReferralResponse {
                             off += name.encode_utf16().count() * 2 + 2;
                             expanded_names.push(name);
                         }
-                        (0, ttl, DfsReferralTarget::NameList { special_name: s(special)?, expanded_names })
+                        (
+                            0,
+                            ttl,
+                            DfsReferralTarget::NameList {
+                                special_name: s(special)?,
+                                expanded_names,
+                            },
+                        )
                     } else {
                         let (p, a, n) = (e.u16()?, e.u16()?, e.u16()?);
                         (
@@ -683,10 +743,21 @@ impl FsctlData for DfsReferralResponse {
                 }
                 _ => return Err(ProtoError::Unsupported("DFS referral version")),
             };
-            referrals.push(DfsReferral { version, server_type, referral_entry_flags, proximity, time_to_live, target });
+            referrals.push(DfsReferral {
+                version,
+                server_type,
+                referral_entry_flags,
+                proximity,
+                time_to_live,
+                target,
+            });
             pos += size;
         }
-        Ok(DfsReferralResponse { path_consumed, header_flags, referrals })
+        Ok(DfsReferralResponse {
+            path_consumed,
+            header_flags,
+            referrals,
+        })
     }
 }
 
@@ -724,7 +795,9 @@ pub fn decode_network_interfaces(buf: &[u8]) -> Result<Vec<NetworkInterfaceInfo>
         return Ok(out);
     }
     loop {
-        let entry = buf.get(pos..).ok_or(ProtoError::malformed(W, "Next out of range"))?;
+        let entry = buf
+            .get(pos..)
+            .ok_or(ProtoError::malformed(W, "Next out of range"))?;
         let mut r = Reader::new(entry, W);
         let next = r.u32()? as usize;
         let if_index = r.u32()?;
@@ -736,7 +809,10 @@ pub fn decode_network_interfaces(buf: &[u8]) -> Result<Vec<NetworkInterfaceInfo>
         let family = s.u16()?;
         let port = u16::from_be_bytes(s.array()?);
         let address = match family {
-            AF_INET => Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(s.array::<4>()?), port))),
+            AF_INET => Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(s.array::<4>()?),
+                port,
+            ))),
             AF_INET6 => {
                 let flow = s.u32()?;
                 let ip = Ipv6Addr::from(s.array::<16>()?);
@@ -745,7 +821,12 @@ pub fn decode_network_interfaces(buf: &[u8]) -> Result<Vec<NetworkInterfaceInfo>
             }
             _ => None,
         };
-        out.push(NetworkInterfaceInfo { if_index, capability, link_speed, address });
+        out.push(NetworkInterfaceInfo {
+            if_index,
+            capability,
+            link_speed,
+            address,
+        });
         if next == 0 {
             return Ok(out);
         }
@@ -759,7 +840,11 @@ pub fn decode_network_interfaces(buf: &[u8]) -> Result<Vec<NetworkInterfaceInfo>
 /// Encode NETWORK_INTERFACE_INFO entries (mock servers, tests).
 pub fn encode_network_interfaces(entries: &[NetworkInterfaceInfo], dst: &mut BytesMut) {
     for (i, e) in entries.iter().enumerate() {
-        let next = if i + 1 < entries.len() { NETWORK_INTERFACE_INFO_LEN as u32 } else { 0 };
+        let next = if i + 1 < entries.len() {
+            NETWORK_INTERFACE_INFO_LEN as u32
+        } else {
+            0
+        };
         dst.put_u32_le(next);
         dst.put_u32_le(e.if_index);
         dst.put_u32_le(e.capability);
@@ -812,15 +897,36 @@ mod tests {
             security_mode: SecurityMode::SIGNING_ENABLED,
             dialects: vec![Dialect::SMB_3_0, Dialect::SMB_3_0_2],
         });
-        rt(ValidateNegotiateInfoResponse { dialect: Dialect::SMB_3_0_2, ..Default::default() });
-        rt(SrvRequestResumeKeyResponse { resume_key: [7; 24], context: Bytes::new() });
+        rt(ValidateNegotiateInfoResponse {
+            dialect: Dialect::SMB_3_0_2,
+            ..Default::default()
+        });
+        rt(SrvRequestResumeKeyResponse {
+            resume_key: [7; 24],
+            context: Bytes::new(),
+        });
         rt(SrvCopyChunkCopy {
             source_key: [1; 24],
-            chunks: vec![SrvCopyChunk { source_offset: 0, target_offset: 10, length: 1 << 20 }],
+            chunks: vec![SrvCopyChunk {
+                source_offset: 0,
+                target_offset: 10,
+                length: 1 << 20,
+            }],
         });
-        rt(SrvCopyChunkResponse { chunks_written: 1, chunk_bytes_written: 0, total_bytes_written: 5 });
-        rt(DfsReferralRequest { max_referral_level: 4, request_file_name: "\\\\dom\\dfs".into() });
-        rt(DfsReferralRequestEx { max_referral_level: 4, request_file_name: "\\\\dom\\dfs".into(), site_name: None });
+        rt(SrvCopyChunkResponse {
+            chunks_written: 1,
+            chunk_bytes_written: 0,
+            total_bytes_written: 5,
+        });
+        rt(DfsReferralRequest {
+            max_referral_level: 4,
+            request_file_name: "\\\\dom\\dfs".into(),
+        });
+        rt(DfsReferralRequestEx {
+            max_referral_level: 4,
+            request_file_name: "\\\\dom\\dfs".into(),
+            site_name: None,
+        });
         rt(DfsReferralRequestEx {
             max_referral_level: 4,
             request_file_name: "\\\\dom\\dfs".into(),
@@ -871,7 +977,9 @@ mod tests {
                     referral_entry_flags: 0,
                     proximity: 0,
                     time_to_live: 0,
-                    target: DfsReferralTarget::V1 { share_name: "\\srv\\s".into() },
+                    target: DfsReferralTarget::V1 {
+                        share_name: "\\srv\\s".into(),
+                    },
                 },
             ],
         });
@@ -890,7 +998,12 @@ mod tests {
                 if_index: 2,
                 capability: 0,
                 link_speed: 1_000_000_000,
-                address: Some(SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 0, 0, 3))),
+                address: Some(SocketAddr::V6(SocketAddrV6::new(
+                    "fe80::1".parse().unwrap(),
+                    0,
+                    0,
+                    3,
+                ))),
             },
         ];
         let mut b = BytesMut::new();

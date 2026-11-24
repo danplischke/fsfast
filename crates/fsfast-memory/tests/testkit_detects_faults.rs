@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fsfast_core::{
-    ByteRange, Capabilities, ErrorKind, FileInfo, FileSystem, FindOptions, IoHints,
-    ReadHandle, ReadOptions, Result, WriteHandle, WriteOptions,
+    ByteRange, Capabilities, ErrorKind, FileInfo, FileSystem, FindOptions, IoHints, ReadHandle,
+    ReadOptions, Result, WriteHandle, WriteOptions,
 };
 use fsfast_memory::MemoryFileSystem;
 use fsfast_testkit::{CheckStatus, SuiteConfig, run_suite};
@@ -33,6 +33,33 @@ enum Fault {
     RmdirIgnoresNotEmpty,
     /// `cat_file` hangs.
     CatHangs,
+    /// `abort` on a write handle publishes the data instead of discarding it.
+    AbortKeepsData,
+    /// `cp_file(p, p)` truncates the file (open destination, then read).
+    CpOntoItselfTruncates,
+}
+
+/// A write handle whose `abort` behaves like `close`.
+#[derive(Debug)]
+struct KeepOnAbort(Box<dyn WriteHandle>);
+
+#[async_trait::async_trait]
+impl WriteHandle for KeepOnAbort {
+    async fn write(&mut self, data: Bytes) -> Result<()> {
+        self.0.write(data).await
+    }
+    async fn flush(&mut self) -> Result<()> {
+        self.0.flush().await
+    }
+    async fn close(&mut self) -> Result<()> {
+        self.0.close().await
+    }
+    async fn abort(&mut self) -> Result<()> {
+        self.0.close().await
+    }
+    fn bytes_written(&self) -> u64 {
+        self.0.bytes_written()
+    }
 }
 
 #[derive(Debug)]
@@ -82,7 +109,11 @@ impl FileSystem for Faulty {
         self.inner.open_read(path, opts).await
     }
     async fn open_write(&self, path: &str, opts: &WriteOptions) -> Result<Box<dyn WriteHandle>> {
-        self.inner.open_write(path, opts).await
+        let w = self.inner.open_write(path, opts).await?;
+        if self.fault == Fault::AbortKeepsData {
+            return Ok(Box::new(KeepOnAbort(w)));
+        }
+        Ok(w)
     }
     async fn cat_file(&self, path: &str, range: ByteRange) -> Result<Bytes> {
         if self.fault == Fault::CatHangs {
@@ -133,6 +164,12 @@ impl FileSystem for Faulty {
         }
     }
     async fn cp_file(&self, src: &str, dst: &str) -> Result<()> {
+        if self.fault == Fault::CpOntoItselfTruncates && src == dst {
+            return self
+                .inner
+                .pipe_file(dst, Bytes::new(), &WriteOptions::default())
+                .await;
+        }
         self.inner.cp_file(src, dst).await
     }
     async fn mv_file(&self, src: &str, dst: &str) -> Result<()> {
@@ -167,7 +204,12 @@ async fn failure_of(fault: Fault, check: &str, cfg: SuiteConfig) -> String {
 
 #[tokio::test]
 async fn corrupted_range_is_located() {
-    let m = failure_of(Fault::CorruptCatRanges, "cat_ranges", SuiteConfig::default()).await;
+    let m = failure_of(
+        Fault::CorruptCatRanges,
+        "cat_ranges",
+        SuiteConfig::default(),
+    )
+    .await;
     // Range #2 is 2000..3000: byte 7 of it is file offset 2007.
     assert!(m.contains("range #2"), "{m}");
     assert!(m.contains("first mismatch at file offset 2007"), "{m}");
@@ -175,7 +217,12 @@ async fn corrupted_range_is_located() {
 
 #[tokio::test]
 async fn ignored_missing_path_in_batch_delete_is_caught() {
-    let m = failure_of(Fault::RmFilesIgnoresMissing, "rm_files_batch", SuiteConfig::default()).await;
+    let m = failure_of(
+        Fault::RmFilesIgnoresMissing,
+        "rm_files_batch",
+        SuiteConfig::default(),
+    )
+    .await;
     assert!(m.contains("expected an error of kind NotFound"), "{m}");
 }
 
@@ -199,14 +246,21 @@ async fn directory_names_must_be_normalised() {
 
 #[tokio::test]
 async fn rmdir_of_non_empty_directory_must_fail() {
-    let m = failure_of(Fault::RmdirIgnoresNotEmpty, "mkdir_rmdir", SuiteConfig::default()).await;
+    let m = failure_of(
+        Fault::RmdirIgnoresNotEmpty,
+        "mkdir_rmdir",
+        SuiteConfig::default(),
+    )
+    .await;
     assert!(m.contains("DirectoryNotEmpty"), "{m}");
 }
 
 #[tokio::test]
 async fn hanging_backend_times_out() {
-    let mut cfg = SuiteConfig::default();
-    cfg.check_timeout = Duration::from_millis(300);
+    let cfg = SuiteConfig {
+        check_timeout: Duration::from_millis(300),
+        ..SuiteConfig::default()
+    };
     let m = failure_of(Fault::CatHangs, "pipe_cat_roundtrip", cfg).await;
     assert!(m.contains("timed out"), "{m}");
 }
@@ -217,7 +271,12 @@ async fn missing_capability_skips_instead_of_failing() {
         inner: MemoryFileSystem::new_isolated(),
         fault: Fault::NoAppend,
     });
-    let report = run_suite(fs, "/faulty", SuiteConfig::default().only(["open_write_append"])).await;
+    let report = run_suite(
+        fs,
+        "/faulty",
+        SuiteConfig::default().only(["open_write_append"]),
+    )
+    .await;
     assert!(report.is_success(), "{report}");
     match &report.outcome("open_write_append").unwrap().status {
         CheckStatus::Skipped(m) => assert!(m.contains("append"), "{m}"),
@@ -231,10 +290,54 @@ async fn report_is_readable() {
         inner: MemoryFileSystem::new_isolated(),
         fault: Fault::CorruptCatRanges,
     });
-    let report = run_suite(fs, "/faulty", SuiteConfig::default().only(["cat_ranges", "info"])).await;
+    let report = run_suite(
+        fs,
+        "/faulty",
+        SuiteConfig::default().only(["cat_ranges", "info"]),
+    )
+    .await;
     let text = report.to_string();
     assert!(text.contains("conformance suite FAILED"), "{text}");
     assert!(text.contains("backend `faulty`"), "{text}");
     assert!(text.contains("1 passed, 1 failed"), "{text}");
     assert!(text.contains("  FAIL cat_ranges"), "{text}");
+}
+
+#[tokio::test]
+async fn aborted_write_must_leave_nothing_behind() {
+    let m = failure_of(
+        Fault::AbortKeepsData,
+        "open_write_abort",
+        SuiteConfig::default(),
+    )
+    .await;
+    assert!(m.contains("aborted.bin") && m.contains("exists("), "{m}");
+}
+
+#[tokio::test]
+async fn copy_onto_itself_must_not_destroy_data() {
+    let m = failure_of(
+        Fault::CpOntoItselfTruncates,
+        "cp_file",
+        SuiteConfig::default(),
+    )
+    .await;
+    assert!(m.contains("src.bin") && m.contains("data mismatch"), "{m}");
+}
+
+/// A misspelt check name in `only` used to skip every check and report
+/// success without testing anything.
+#[tokio::test]
+async fn unknown_check_names_are_a_setup_error() {
+    for cfg in [
+        SuiteConfig::default().only(["cat_ranges", "cat_rnages"]),
+        SuiteConfig::default().skip(["no_such_check"]),
+    ] {
+        let fs = Arc::new(MemoryFileSystem::new_isolated());
+        let report = run_suite(fs, "/names", cfg).await;
+        assert!(!report.is_success(), "{report}");
+        let e = report.setup_error.as_deref().unwrap_or_default();
+        assert!(e.contains("unknown check name"), "{report}");
+        assert!(report.to_string().contains("SETUP FAILED"), "{report}");
+    }
 }

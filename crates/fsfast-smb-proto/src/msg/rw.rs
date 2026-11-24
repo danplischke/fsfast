@@ -22,7 +22,6 @@ bitflags! {
         const UNBUFFERED = 0x01;
         /// Request a compressed response (3.1.1).
         const REQUEST_COMPRESSED = 0x02;
-        const _ = !0;
     }
 }
 
@@ -34,7 +33,6 @@ bitflags! {
         const WRITE_THROUGH = 0x0000_0001;
         /// Bypass the server cache (3.0.2+).
         const UNBUFFERED = 0x0000_0002;
-        const _ = !0;
     }
 }
 
@@ -117,7 +115,10 @@ impl Message for ReadRequest {
             dst.put_u8(0);
         } else {
             dst.put_u16_le((HEADER_LEN + 48) as u16);
-            dst.put_u16_le(len_u16(self.read_channel_info.len(), "read channel info too long")?);
+            dst.put_u16_le(len_u16(
+                self.read_channel_info.len(),
+                "read channel info too long",
+            )?);
             dst.put_slice(&self.read_channel_info);
         }
         Ok(())
@@ -196,9 +197,16 @@ impl Message for ReadResponse {
         let data_remaining = r.u32()?;
         let flags = r.u32()?;
         if len > 0 && off < HEADER_LEN + 16 {
-            return Err(ProtoError::malformed("READ response", "data overlaps the header"));
+            return Err(ProtoError::malformed(
+                "READ response",
+                "data overlaps the header",
+            ));
         }
-        Ok(ReadResponse { data_remaining, flags, data: slice_bytes(msg, off, len, "READ data")? })
+        Ok(ReadResponse {
+            data_remaining,
+            flags,
+            data: slice_bytes(msg, off, len, "READ data")?,
+        })
     }
 }
 
@@ -227,7 +235,9 @@ impl Message for WriteRequest {
 
     fn encode_body(&self, dst: &mut BytesMut) -> Result<()> {
         if !self.data.is_empty() && !self.write_channel_info.is_empty() {
-            return Err(ProtoError::InvalidInput("WRITE with both data and channel info"));
+            return Err(ProtoError::InvalidInput(
+                "WRITE with both data and channel info",
+            ));
         }
         dst.put_u16_le(49);
         dst.put_u16_le(WRITE_REQUEST_DATA_OFFSET);
@@ -241,7 +251,10 @@ impl Message for WriteRequest {
             dst.put_u16_le(0);
         } else {
             dst.put_u16_le(WRITE_REQUEST_DATA_OFFSET);
-            dst.put_u16_le(len_u16(self.write_channel_info.len(), "write channel info too long")?);
+            dst.put_u16_le(len_u16(
+                self.write_channel_info.len(),
+                "write channel info too long",
+            )?);
         }
         dst.put_u32_le(self.flags.bits());
         if !self.write_channel_info.is_empty() {
@@ -326,20 +339,35 @@ mod tests {
         let mut h = Header::request(Command::READ);
         h.flags = HeaderFlags::SERVER_TO_REDIR;
         let data = Bytes::from(vec![0xAB; 100_000]);
-        let m = encode_message(&h, &ReadResponse { data: data.clone(), ..Default::default() }).unwrap();
+        let m = encode_message(
+            &h,
+            &ReadResponse {
+                data: data.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let frame = m.into_contiguous().freeze();
         let raw = RawMessage::parse(frame.clone()).unwrap();
         let r: ReadResponse = raw.decode().unwrap();
         assert_eq!(r.data, data);
         // Same allocation as the frame.
         let base = frame.as_ptr() as usize;
-        assert_eq!(r.data.as_ptr() as usize, base + usize::from(READ_RESPONSE_DATA_OFFSET));
+        assert_eq!(
+            r.data.as_ptr() as usize,
+            base + usize::from(READ_RESPONSE_DATA_OFFSET)
+        );
     }
 
     #[test]
     fn write_request_keeps_payload_separate() {
         let data = Bytes::from(vec![1u8; 70_000]);
-        let w = WriteRequest { offset: 5, file_id: FileId::new(1, 2), data: data.clone(), ..Default::default() };
+        let w = WriteRequest {
+            offset: 5,
+            file_id: FileId::new(1, 2),
+            data: data.clone(),
+            ..Default::default()
+        };
         assert_eq!(w.credit_charge(), 2);
         let m = encode_message(&Header::request(Command::WRITE), &w).unwrap();
         assert_eq!(m.head.len(), HEADER_LEN + 48);
@@ -350,12 +378,21 @@ mod tests {
 
     #[test]
     fn empty_read_and_write() {
-        for w in [WriteRequest::default(), WriteRequest { write_channel_info: Bytes::from_static(b"ci"), ..Default::default() }] {
+        for w in [
+            WriteRequest::default(),
+            WriteRequest {
+                write_channel_info: Bytes::from_static(b"ci"),
+                ..Default::default()
+            },
+        ] {
             let m = encode_message(&Header::request(Command::WRITE), &w).unwrap();
             let raw = RawMessage::parse(m.into_contiguous().freeze()).unwrap();
             assert_eq!(raw.decode::<WriteRequest>().unwrap(), w);
         }
-        let r = ReadRequest { length: 1 << 20, ..Default::default() };
+        let r = ReadRequest {
+            length: 1 << 20,
+            ..Default::default()
+        };
         assert_eq!(r.credit_charge(), 16);
         let m = encode_message(&Header::request(Command::READ), &r).unwrap();
         assert_eq!(m.head.len(), HEADER_LEN + 49);

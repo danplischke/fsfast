@@ -14,7 +14,10 @@ fn opts(mode: WriteMode) -> WriteOptions {
 }
 
 /// Write `chunks` through `w` and close it; abort on failure.
-async fn write_all_close(w: &mut Box<dyn WriteHandle>, chunks: &[Bytes]) -> fsfast_core::Result<()> {
+async fn write_all_close(
+    w: &mut Box<dyn WriteHandle>,
+    chunks: &[Bytes],
+) -> fsfast_core::Result<()> {
     let res = async {
         for c in chunks {
             w.write(c.clone()).await?;
@@ -71,14 +74,26 @@ pub(crate) async fn open_write_stream(ctx: &Ctx) -> CheckResult {
     for (i, c) in chunks.iter().enumerate() {
         if let Err(e) = w.write(c.clone()).await {
             let _ = w.abort().await;
-            fail!("write #{i} ({} bytes) to {p:?} failed: {e} [kind: {:?}]", c.len(), e.kind());
+            fail!(
+                "write #{i} ({} bytes) to {p:?} failed: {e} [kind: {:?}]",
+                c.len(),
+                e.kind()
+            );
         }
         written += c.len() as u64;
-        ensure_eq!(w.bytes_written(), written, "bytes_written() after write #{i}");
+        ensure_eq!(
+            w.bytes_written(),
+            written,
+            "bytes_written() after write #{i}"
+        );
     }
     if let Err(e) = w.close().await {
         let _ = w.abort().await;
-        fail!("close() of {p:?} after {} writes failed: {e} [kind: {:?}]", chunks.len(), e.kind());
+        fail!(
+            "close() of {p:?} after {} writes failed: {e} [kind: {:?}]",
+            chunks.len(),
+            e.kind()
+        );
     }
     w.close().await.ctx("second close() (must be idempotent)")?;
 
@@ -140,7 +155,11 @@ pub(crate) async fn open_write_create_new(ctx: &Ctx) -> CheckResult {
     expect_err(
         format!("pipe_file({p:?}, CreateNew) of an existing file"),
         ctx.fs
-            .pipe_file(&p, Bytes::from_static(b"clobbered"), &opts(WriteMode::CreateNew))
+            .pipe_file(
+                &p,
+                Bytes::from_static(b"clobbered"),
+                &opts(WriteMode::CreateNew),
+            )
             .await,
         &[ErrorKind::AlreadyExists],
     )?;
@@ -151,17 +170,28 @@ pub(crate) async fn open_write_create_new(ctx: &Ctx) -> CheckResult {
         .fs
         .open_write(&fresh, &opts(WriteMode::CreateNew))
         .await
-        .ctx(format_args!("open_write({fresh:?}, CreateNew) of a new file"))?;
-    write_all_close(&mut w, &[Bytes::from_static(b"new "), Bytes::from_static(b"file")])
-        .await
-        .ctx(format_args!("writing {fresh:?}"))?;
+        .ctx(format_args!(
+            "open_write({fresh:?}, CreateNew) of a new file"
+        ))?;
+    write_all_close(
+        &mut w,
+        &[Bytes::from_static(b"new "), Bytes::from_static(b"file")],
+    )
+    .await
+    .ctx(format_args!("writing {fresh:?}"))?;
     ctx.expect_content(&fresh, b"new file").await?;
 
     let fresh2 = ctx.path("fresh2");
     ctx.fs
-        .pipe_file(&fresh2, Bytes::from_static(b"piped"), &opts(WriteMode::CreateNew))
+        .pipe_file(
+            &fresh2,
+            Bytes::from_static(b"piped"),
+            &opts(WriteMode::CreateNew),
+        )
         .await
-        .ctx(format_args!("pipe_file({fresh2:?}, CreateNew) of a new file"))?;
+        .ctx(format_args!(
+            "pipe_file({fresh2:?}, CreateNew) of a new file"
+        ))?;
     ctx.expect_content(&fresh2, b"piped").await?;
 
     if ctx.caps.hierarchical {
@@ -187,9 +217,12 @@ pub(crate) async fn open_write_append(ctx: &Ctx) -> CheckResult {
         .open_write(&p, &opts(WriteMode::Append))
         .await
         .ctx(format_args!("open_write({p:?}, Append)"))?;
-    write_all_close(&mut w, &[Bytes::from_static(b" wor"), Bytes::from_static(b"ld")])
-        .await
-        .ctx(format_args!("appending to {p:?}"))?;
+    write_all_close(
+        &mut w,
+        &[Bytes::from_static(b" wor"), Bytes::from_static(b"ld")],
+    )
+    .await
+    .ctx(format_args!("appending to {p:?}"))?;
     ensure_eq!(w.bytes_written(), 6, "bytes_written() after appending");
     ctx.expect_content(&p, b"hello world").await?;
 
@@ -200,7 +233,7 @@ pub(crate) async fn open_write_append(ctx: &Ctx) -> CheckResult {
         .open_write(&p, &opts(WriteMode::Append))
         .await
         .ctx(format_args!("open_write({p:?}, Append) again"))?;
-    write_all_close(&mut w, &[tail.clone()])
+    write_all_close(&mut w, std::slice::from_ref(&tail))
         .await
         .ctx(format_args!("appending to {p:?} again"))?;
     let mut expected = b"hello world".to_vec();
@@ -213,7 +246,9 @@ pub(crate) async fn open_write_append(ctx: &Ctx) -> CheckResult {
         .fs
         .open_write(&fresh, &opts(WriteMode::Append))
         .await
-        .ctx(format_args!("open_write({fresh:?}, Append) of a missing file"))?;
+        .ctx(format_args!(
+            "open_write({fresh:?}, Append) of a missing file"
+        ))?;
     write_all_close(&mut w, &[Bytes::from_static(b"abc")])
         .await
         .ctx(format_args!("appending to new file {fresh:?}"))?;
@@ -228,13 +263,17 @@ pub(crate) async fn open_write_abort(ctx: &Ctx) -> CheckResult {
         .open_write(&p, &WriteOptions::default())
         .await
         .ctx(format_args!("open_write({p:?})"))?;
-    w.write(data.slice(..100_000)).await.ctx("write before abort")?;
-    w.write(data.slice(100_000..)).await.ctx("write before abort")?;
+    w.write(data.slice(..100_000))
+        .await
+        .ctx("write before abort")?;
+    w.write(data.slice(100_000..))
+        .await
+        .ctx("write before abort")?;
     w.abort().await.ctx(format_args!("abort() of {p:?}"))?;
-    if !ctx.caps.hierarchical {
-        // Object stores make data visible only on close.
-        ctx.expect_missing(&p).await?;
-    }
+    // Nothing of an aborted write to a new path may remain: object stores
+    // make data visible only on close, hierarchical backends must remove the
+    // partial file ("discard the write and clean up partial state").
+    ctx.expect_missing(&p).await?;
 
     // The path is fully usable after an abort.
     ctx.put(&p, Bytes::from_static(b"after")).await?;
@@ -247,8 +286,26 @@ pub(crate) async fn open_write_abort(ctx: &Ctx) -> CheckResult {
             .open_write(&p, &WriteOptions::default())
             .await
             .ctx(format_args!("open_write({p:?}) over an existing object"))?;
-        w.write(Bytes::from_static(b"replacement")).await.ctx("write before abort")?;
+        w.write(Bytes::from_static(b"replacement"))
+            .await
+            .ctx("write before abort")?;
         w.abort().await.ctx(format_args!("abort() of {p:?}"))?;
+        ctx.expect_content(&p, b"after").await?;
+    }
+
+    if ctx.caps.append {
+        // Aborting an append discards the appended data only.
+        let mut w = ctx
+            .fs
+            .open_write(&p, &WriteOptions::default().with_mode(WriteMode::Append))
+            .await
+            .ctx(format_args!("open_write({p:?}, Append)"))?;
+        w.write(data.slice(..1000))
+            .await
+            .ctx("append before abort")?;
+        w.abort()
+            .await
+            .ctx(format_args!("abort() of an append to {p:?}"))?;
         ctx.expect_content(&p, b"after").await?;
     }
     Ok(())
@@ -446,7 +503,10 @@ async fn put_get_inner(ctx: &Ctx, scratch: &LocalScratch) -> CheckResult {
     )?;
     let n = never.clone();
     let left = blocking(move || Ok(n.exists())).await.unwrap_or(false);
-    ensure!(!left, "get_file of a missing remote file left a local file {never:?}");
+    ensure!(
+        !left,
+        "get_file of a missing remote file left a local file {never:?}"
+    );
     let missing_local = scratch.path("no_such_local_file");
     let target = ctx.path("large/never.bin");
     expect_err(

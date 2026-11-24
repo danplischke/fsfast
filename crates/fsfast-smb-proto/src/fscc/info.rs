@@ -44,7 +44,12 @@ macro_rules! fs_class {
 }
 
 fn times(r: &mut Reader<'_>) -> Result<[FileTime; 4]> {
-    Ok([FileTime(r.u64()?), FileTime(r.u64()?), FileTime(r.u64()?), FileTime(r.u64()?)])
+    Ok([
+        FileTime(r.u64()?),
+        FileTime(r.u64()?),
+        FileTime(r.u64()?),
+        FileTime(r.u64()?),
+    ])
 }
 
 /// FileBasicInformation (40 bytes).
@@ -209,7 +214,9 @@ impl InfoClass for FileAccessInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, "FileAccessInformation");
-        Ok(FileAccessInformation { access_flags: AccessMask::from_bits_retain(r.u32()?) })
+        Ok(FileAccessInformation {
+            access_flags: AccessMask::from_bits_retain(r.u32()?),
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -241,7 +248,9 @@ impl InfoClass for FileNameInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, "FileNameInformation");
-        Ok(FileNameInformation { file_name: read_name(&mut r, "FileNameInformation")? })
+        Ok(FileNameInformation {
+            file_name: read_name(&mut r, "FileNameInformation")?,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -281,14 +290,34 @@ impl InfoClass for FileAllInformation {
         let mut r = Reader::new(buf, W);
         let basic = FileBasicInformation::read(&mut r)?;
         let standard = FileStandardInformation::read(&mut r)?;
-        let internal = FileInternalInformation { index_number: r.u64()? };
+        let internal = FileInternalInformation {
+            index_number: r.u64()?,
+        };
         let ea = FileEaInformation { ea_size: r.u32()? };
-        let access = FileAccessInformation { access_flags: AccessMask::from_bits_retain(r.u32()?) };
-        let position = FilePositionInformation { current_byte_offset: r.u64()? };
+        let access = FileAccessInformation {
+            access_flags: AccessMask::from_bits_retain(r.u32()?),
+        };
+        let position = FilePositionInformation {
+            current_byte_offset: r.u64()?,
+        };
         let mode = FileModeInformation { mode: r.u32()? };
-        let alignment = FileAlignmentInformation { alignment_requirement: r.u32()? };
-        let name = FileNameInformation { file_name: read_name(&mut r, W)? };
-        Ok(FileAllInformation { basic, standard, internal, ea, access, position, mode, alignment, name })
+        let alignment = FileAlignmentInformation {
+            alignment_requirement: r.u32()?,
+        };
+        let name = FileNameInformation {
+            file_name: read_name(&mut r, W)?,
+        };
+        Ok(FileAllInformation {
+            basic,
+            standard,
+            internal,
+            ea,
+            access,
+            position,
+            mode,
+            alignment,
+            name,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -343,7 +372,12 @@ impl InfoClass for FileNetworkOpenInformation {
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
-        for t in [self.creation_time, self.last_access_time, self.last_write_time, self.change_time] {
+        for t in [
+            self.creation_time,
+            self.last_access_time,
+            self.last_write_time,
+            self.change_time,
+        ] {
             dst.put_u64_le(t.0);
         }
         dst.put_u64_le(self.allocation_size);
@@ -414,11 +448,20 @@ impl InfoClass for FileRenameInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let (flags, root_directory, file_name) = decode_rename(buf, "FileRenameInformation")?;
-        Ok(FileRenameInformation { replace_if_exists: flags & 0xFF != 0, root_directory, file_name })
+        Ok(FileRenameInformation {
+            replace_if_exists: flags & 0xFF != 0,
+            root_directory,
+            file_name,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
-        encode_rename(dst, u32::from(self.replace_if_exists), self.root_directory, &self.file_name)
+        encode_rename(
+            dst,
+            u32::from(self.replace_if_exists),
+            self.root_directory,
+            &self.file_name,
+        )
     }
 }
 
@@ -439,11 +482,20 @@ impl InfoClass for FileLinkInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let (flags, root_directory, file_name) = decode_rename(buf, "FileLinkInformation")?;
-        Ok(FileLinkInformation { replace_if_exists: flags & 0xFF != 0, root_directory, file_name })
+        Ok(FileLinkInformation {
+            replace_if_exists: flags & 0xFF != 0,
+            root_directory,
+            file_name,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
-        encode_rename(dst, u32::from(self.replace_if_exists), self.root_directory, &self.file_name)
+        encode_rename(
+            dst,
+            u32::from(self.replace_if_exists),
+            self.root_directory,
+            &self.file_name,
+        )
     }
 }
 
@@ -469,7 +521,6 @@ bitflags! {
         const FORCE_RESIZE_TARGET_SR = 0x0000_0080;
         /// Force resize of the source stream.
         const FORCE_RESIZE_SOURCE_SR = 0x0000_0100;
-        const _ = !0;
     }
 }
 
@@ -489,7 +540,11 @@ impl InfoClass for FileRenameInformationEx {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let (flags, root_directory, file_name) = decode_rename(buf, "FileRenameInformationEx")?;
-        Ok(FileRenameInformationEx { flags: RenameFlags::from_bits_retain(flags), root_directory, file_name })
+        Ok(FileRenameInformationEx {
+            flags: RenameFlags::from_bits_retain(flags),
+            root_directory,
+            file_name,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -509,7 +564,9 @@ impl InfoClass for FileDispositionInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, "FileDispositionInformation");
-        Ok(FileDispositionInformation { delete_pending: r.u8()? != 0 })
+        Ok(FileDispositionInformation {
+            delete_pending: r.u8()? != 0,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -532,7 +589,6 @@ bitflags! {
         const ON_CLOSE = 0x0000_0008;
         /// Delete even if read-only.
         const IGNORE_READONLY_ATTRIBUTE = 0x0000_0010;
-        const _ = !0;
     }
 }
 
@@ -548,7 +604,9 @@ impl InfoClass for FileDispositionInformationEx {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, "FileDispositionInformationEx");
-        Ok(FileDispositionInformationEx { flags: DispositionFlags::from_bits_retain(r.u32()?) })
+        Ok(FileDispositionInformationEx {
+            flags: DispositionFlags::from_bits_retain(r.u32()?),
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -586,14 +644,20 @@ impl InfoClass for FileStreamInformation {
             return Ok(FileStreamInformation { entries });
         }
         loop {
-            let rest = buf.get(pos..).ok_or(ProtoError::malformed(W, "entry offset out of range"))?;
+            let rest = buf
+                .get(pos..)
+                .ok_or(ProtoError::malformed(W, "entry offset out of range"))?;
             let mut r = Reader::new(rest, W);
             let next = r.u32()? as usize;
             let name_len = r.u32()? as usize;
             let size = r.u64()?;
             let allocation_size = r.u64()?;
             let name = decode_utf16le(r.bytes(name_len)?, W)?;
-            entries.push(StreamEntry { name, size, allocation_size });
+            entries.push(StreamEntry {
+                name,
+                size,
+                allocation_size,
+            });
             if next == 0 {
                 break;
             }
@@ -640,7 +704,10 @@ impl InfoClass for FileIdInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, "FileIdInformation");
-        Ok(FileIdInformation { volume_serial_number: r.u64()?, file_id: r.array()? })
+        Ok(FileIdInformation {
+            volume_serial_number: r.u64()?,
+            file_id: r.array()?,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -778,7 +845,6 @@ bitflags! {
         const SUPPORTS_BLOCK_REFCOUNTING = 0x0800_0000;
         /// POSIX unlink/rename semantics.
         const SUPPORTS_POSIX_UNLINK_RENAME = 0x0000_0400;
-        const _ = !0;
     }
 }
 
@@ -838,7 +904,12 @@ impl InfoClass for FileFsVolumeInformation {
         let supports_objects = r.u8()? != 0;
         r.skip(1)?;
         let volume_label = decode_utf16le(r.bytes(label_len)?, W)?;
-        Ok(FileFsVolumeInformation { volume_creation_time, volume_serial_number, supports_objects, volume_label })
+        Ok(FileFsVolumeInformation {
+            volume_creation_time,
+            volume_serial_number,
+            supports_objects,
+            volume_label,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -866,7 +937,10 @@ impl InfoClass for FileFsDeviceInformation {
 
     fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, "FileFsDeviceInformation");
-        Ok(FileFsDeviceInformation { device_type: r.u32()?, characteristics: r.u32()? })
+        Ok(FileFsDeviceInformation {
+            device_type: r.u32()?,
+            characteristics: r.u32()?,
+        })
     }
 
     fn encode(&self, dst: &mut BytesMut) -> Result<()> {
@@ -957,24 +1031,50 @@ mod tests {
             directory: true,
         });
         rt(FileAllInformation {
-            name: FileNameInformation { file_name: "\\dir\\file.txt".into() },
+            name: FileNameInformation {
+                file_name: "\\dir\\file.txt".into(),
+            },
             ..Default::default()
         });
-        rt(FileNetworkOpenInformation { end_of_file: 5, ..Default::default() });
-        rt(FileAttributeTagInformation { file_attributes: FileAttributes::REPARSE_POINT, reparse_tag: 0xA000_000C });
-        rt(FileEndOfFileInformation { end_of_file: 1 << 40 });
-        rt(FileRenameInformation { replace_if_exists: true, root_directory: 0, file_name: "a\\b".into() });
+        rt(FileNetworkOpenInformation {
+            end_of_file: 5,
+            ..Default::default()
+        });
+        rt(FileAttributeTagInformation {
+            file_attributes: FileAttributes::REPARSE_POINT,
+            reparse_tag: 0xA000_000C,
+        });
+        rt(FileEndOfFileInformation {
+            end_of_file: 1 << 40,
+        });
+        rt(FileRenameInformation {
+            replace_if_exists: true,
+            root_directory: 0,
+            file_name: "a\\b".into(),
+        });
         rt(FileRenameInformationEx {
             flags: RenameFlags::REPLACE_IF_EXISTS | RenameFlags::POSIX_SEMANTICS,
             root_directory: 0,
             file_name: "x".into(),
         });
-        rt(FileDispositionInformation { delete_pending: true });
-        rt(FileDispositionInformationEx { flags: DispositionFlags::DELETE | DispositionFlags::POSIX_SEMANTICS });
+        rt(FileDispositionInformation {
+            delete_pending: true,
+        });
+        rt(FileDispositionInformationEx {
+            flags: DispositionFlags::DELETE | DispositionFlags::POSIX_SEMANTICS,
+        });
         rt(FileStreamInformation {
             entries: vec![
-                StreamEntry { name: "::$DATA".into(), size: 10, allocation_size: 4096 },
-                StreamEntry { name: ":ads:$DATA".into(), size: 3, allocation_size: 8 },
+                StreamEntry {
+                    name: "::$DATA".into(),
+                    size: 10,
+                    allocation_size: 4096,
+                },
+                StreamEntry {
+                    name: ":ads:$DATA".into(),
+                    size: 3,
+                    allocation_size: 8,
+                },
             ],
         });
         rt(FileFsSizeInformation {
@@ -983,24 +1083,49 @@ mod tests {
             sectors_per_allocation_unit: 8,
             bytes_per_sector: 512,
         });
-        rt(FileFsFullSizeInformation { total_allocation_units: 7, ..Default::default() });
+        rt(FileFsFullSizeInformation {
+            total_allocation_units: 7,
+            ..Default::default()
+        });
         rt(FileFsAttributeInformation {
             file_system_attributes: FsAttributes::CASE_PRESERVED_NAMES,
             maximum_component_name_length: 255,
             file_system_name: "NTFS".into(),
         });
-        rt(FileFsVolumeInformation { volume_label: "vol".into(), ..Default::default() });
-        rt(FileIdInformation { volume_serial_number: 1, file_id: [2; 16] });
-        rt(FileLinkInformation { replace_if_exists: false, root_directory: 0, file_name: "l".into() });
-        rt(FileFsSectorSizeInformation { logical_bytes_per_sector: 512, ..Default::default() });
+        rt(FileFsVolumeInformation {
+            volume_label: "vol".into(),
+            ..Default::default()
+        });
+        rt(FileIdInformation {
+            volume_serial_number: 1,
+            file_id: [2; 16],
+        });
+        rt(FileLinkInformation {
+            replace_if_exists: false,
+            root_directory: 0,
+            file_name: "l".into(),
+        });
+        rt(FileFsSectorSizeInformation {
+            logical_bytes_per_sector: 512,
+            ..Default::default()
+        });
     }
 
     #[test]
     fn rename_layout() {
-        let b = FileRenameInformation { replace_if_exists: true, root_directory: 0, file_name: "ab".into() }
-            .to_bytes()
-            .unwrap();
-        assert_eq!(&b[..], &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, b'a', 0, b'b', 0]);
+        let b = FileRenameInformation {
+            replace_if_exists: true,
+            root_directory: 0,
+            file_name: "ab".into(),
+        }
+        .to_bytes()
+        .unwrap();
+        assert_eq!(
+            &b[..],
+            &[
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, b'a', 0, b'b', 0
+            ]
+        );
     }
 
     #[test]

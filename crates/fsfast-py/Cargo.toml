@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-py"
+description = "PyO3 extension module `fsfast._core`: the Rust side of fsfast's fsspec-compatible Python classes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +9,34 @@ repository.workspace = true
 
 [lib]
 name = "_core"
+# `cdylib` is the Python extension; `rlib` lets the unit tests link the crate.
 crate-type = ["cdylib", "rlib"]
+
+[features]
+# One feature per compiled-in backend. Adding a backend is one line here plus
+# one match arm in `src/registry.rs`.
+default = ["local", "memory"]
+local = ["dep:fsfast-local"]
+memory = ["dep:fsfast-memory"]
+# Set by maturin (see the root pyproject.toml): do not link libpython into the
+# extension module. Left off for `cargo test`, which embeds an interpreter.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+fsfast-local = { workspace = true, optional = true }
+fsfast-memory = { workspace = true, optional = true }
+arc-swap = "1"
+bytes.workspace = true
+futures.workspace = true
+memchr = "2"
+parking_lot.workspace = true
+pyo3 = { version = "0.30", features = ["abi3-py310"] }
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pyo3 = { version = "0.30", features = ["abi3-py310", "auto-initialize"] }
+tokio = { workspace = true, features = ["test-util"] }

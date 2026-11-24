@@ -7,8 +7,8 @@ use super::misc::LeaseState;
 use super::{Message, body_reader, wire_offset};
 use crate::error::{ProtoError, Result};
 use crate::fscc::{
-    AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, FileTime, ImpersonationLevel,
-    OplockLevel, ShareAccess,
+    AccessMask, CreateAction, CreateDisposition, CreateOptions, FileAttributes, FileTime,
+    ImpersonationLevel, OplockLevel, ShareAccess,
 };
 use crate::header::{Command, HEADER_LEN};
 use crate::status::NtStatus;
@@ -100,13 +100,25 @@ impl Lease {
 
     fn encode(&self, dst: &mut BytesMut) {
         match self {
-            Lease::V1 { key, state, flags, duration } => {
+            Lease::V1 {
+                key,
+                state,
+                flags,
+                duration,
+            } => {
                 dst.put_slice(key);
                 dst.put_u32_le(state.bits());
                 dst.put_u32_le(*flags);
                 dst.put_u64_le(*duration);
             }
-            Lease::V2 { key, state, flags, duration, parent_key, epoch } => {
+            Lease::V2 {
+                key,
+                state,
+                flags,
+                duration,
+                parent_key,
+                epoch,
+            } => {
                 dst.put_slice(key);
                 dst.put_u32_le(state.bits());
                 dst.put_u32_le(*flags);
@@ -127,9 +139,21 @@ impl Lease {
         if data.len() >= 52 {
             let parent_key = r.array()?;
             let epoch = r.u16()?;
-            Ok(Lease::V2 { key, state, flags, duration, parent_key, epoch })
+            Ok(Lease::V2 {
+                key,
+                state,
+                flags,
+                duration,
+                parent_key,
+                epoch,
+            })
         } else {
-            Ok(Lease::V1 { key, state, flags, duration })
+            Ok(Lease::V1 {
+                key,
+                state,
+                flags,
+                duration,
+            })
         }
     }
 }
@@ -205,13 +229,21 @@ impl CreateRequestContext {
         match self {
             CreateRequestContext::DurableHandleRequest => dst.put_bytes(0, 16),
             CreateRequestContext::DurableHandleReconnect { file_id } => file_id.put(dst),
-            CreateRequestContext::DurableHandleRequestV2 { timeout, flags, create_guid } => {
+            CreateRequestContext::DurableHandleRequestV2 {
+                timeout,
+                flags,
+                create_guid,
+            } => {
                 dst.put_u32_le(*timeout);
                 dst.put_u32_le(*flags);
                 dst.put_u64_le(0);
                 dst.put_slice(&create_guid.0);
             }
-            CreateRequestContext::DurableHandleReconnectV2 { file_id, create_guid, flags } => {
+            CreateRequestContext::DurableHandleReconnectV2 {
+                file_id,
+                create_guid,
+                flags,
+            } => {
                 file_id.put(dst);
                 dst.put_slice(&create_guid.0);
                 dst.put_u32_le(*flags);
@@ -236,18 +268,32 @@ impl CreateRequestContext {
         Ok(if n == DURABLE_HANDLE_REQUEST && data.len() == 16 {
             CreateRequestContext::DurableHandleRequest
         } else if n == DURABLE_HANDLE_RECONNECT && data.len() == 16 {
-            CreateRequestContext::DurableHandleReconnect { file_id: FileId::read(&mut r)? }
+            CreateRequestContext::DurableHandleReconnect {
+                file_id: FileId::read(&mut r)?,
+            }
         } else if n == DURABLE_HANDLE_REQUEST_V2 && data.len() == 32 {
             let timeout = r.u32()?;
             let flags = r.u32()?;
             r.skip(8)?;
-            CreateRequestContext::DurableHandleRequestV2 { timeout, flags, create_guid: r.guid()? }
+            CreateRequestContext::DurableHandleRequestV2 {
+                timeout,
+                flags,
+                create_guid: r.guid()?,
+            }
         } else if n == DURABLE_HANDLE_RECONNECT_V2 && data.len() == 36 {
             let file_id = FileId::read(&mut r)?;
             let create_guid = r.guid()?;
-            CreateRequestContext::DurableHandleReconnectV2 { file_id, create_guid, flags: r.u32()? }
+            CreateRequestContext::DurableHandleReconnectV2 {
+                file_id,
+                create_guid,
+                flags: r.u32()?,
+            }
         } else if n == QUERY_MAXIMAL_ACCESS && (data.is_empty() || data.len() == 8) {
-            let timestamp = if data.is_empty() { None } else { Some(FileTime(r.u64()?)) };
+            let timestamp = if data.is_empty() {
+                None
+            } else {
+                Some(FileTime(r.u64()?))
+            };
             CreateRequestContext::QueryMaximalAccess { timestamp }
         } else if n == QUERY_ON_DISK_ID && data.is_empty() {
             CreateRequestContext::QueryOnDiskId
@@ -320,11 +366,17 @@ impl CreateResponseContext {
                 dst.put_u32_le(*timeout);
                 dst.put_u32_le(*flags);
             }
-            CreateResponseContext::MaximalAccess { query_status, maximal_access } => {
+            CreateResponseContext::MaximalAccess {
+                query_status,
+                maximal_access,
+            } => {
                 dst.put_u32_le(query_status.0);
                 dst.put_u32_le(maximal_access.bits());
             }
-            CreateResponseContext::OnDiskId { disk_file_id, volume_id } => {
+            CreateResponseContext::OnDiskId {
+                disk_file_id,
+                volume_id,
+            } => {
                 dst.put_u64_le(*disk_file_id);
                 dst.put_u64_le(*volume_id);
                 dst.put_bytes(0, 16);
@@ -341,14 +393,20 @@ impl CreateResponseContext {
         Ok(if n == DURABLE_HANDLE_REQUEST && data.len() == 8 {
             CreateResponseContext::DurableHandleResponse
         } else if n == DURABLE_HANDLE_REQUEST_V2 && data.len() == 8 {
-            CreateResponseContext::DurableHandleResponseV2 { timeout: r.u32()?, flags: r.u32()? }
+            CreateResponseContext::DurableHandleResponseV2 {
+                timeout: r.u32()?,
+                flags: r.u32()?,
+            }
         } else if n == QUERY_MAXIMAL_ACCESS && data.len() == 8 {
             CreateResponseContext::MaximalAccess {
                 query_status: NtStatus(r.u32()?),
                 maximal_access: AccessMask::from_bits_retain(r.u32()?),
             }
         } else if n == QUERY_ON_DISK_ID && data.len() == 32 {
-            CreateResponseContext::OnDiskId { disk_file_id: r.u64()?, volume_id: r.u64()? }
+            CreateResponseContext::OnDiskId {
+                disk_file_id: r.u64()?,
+                volume_id: r.u64()?,
+            }
         } else if n == REQUEST_LEASE && (data.len() == 32 || data.len() == 52) {
             CreateResponseContext::Lease(Lease::decode(&data)?)
         } else {
@@ -406,8 +464,16 @@ fn encode_context_chain<C: ContextItem>(dst: &mut BytesMut, contexts: &[C]) -> R
             // No data: drop the alignment padding after the name.
             dst.truncate(before_pad);
         } else {
-            patch_u16(dst, data_off_pos, len_u16(data_start - start, "create context too long")?);
-            patch_u32(dst, data_off_pos + 2, len_u32(data_len, "create context too long")?);
+            patch_u16(
+                dst,
+                data_off_pos,
+                len_u16(data_start - start, "create context too long")?,
+            );
+            patch_u32(
+                dst,
+                data_off_pos + 2,
+                len_u32(data_len, "create context too long")?,
+            );
         }
         if i + 1 < n {
             pad_to_rel(dst, start, 8);
@@ -434,7 +500,9 @@ fn decode_context_chain(msg: &Bytes, offset: usize, len: usize) -> Result<Vec<(B
     let region = slice_bytes(msg, offset, len, W)?;
     let mut pos = 0usize;
     loop {
-        let rest = region.get(pos..).ok_or(ProtoError::malformed(W, "Next out of range"))?;
+        let rest = region
+            .get(pos..)
+            .ok_or(ProtoError::malformed(W, "Next out of range"))?;
         let mut r = Reader::new(rest, W);
         let next = r.u32()? as usize;
         let name_off = usize::from(r.u16()?);
@@ -541,7 +609,10 @@ impl Message for CreateRequest {
         let name_len = usize::from(r.u16()?);
         let ctx_off = r.u32()? as usize;
         let ctx_len = r.u32()? as usize;
-        let name = decode_utf16le(slice_ref(msg, name_off, name_len, "CREATE name")?, "CREATE name")?;
+        let name = decode_utf16le(
+            slice_ref(msg, name_off, name_len, "CREATE name")?,
+            "CREATE name",
+        )?;
         let contexts = decode_context_chain(msg, ctx_off, ctx_len)?
             .into_iter()
             .map(|(n, d)| CreateRequestContext::decode(n, d))
@@ -606,9 +677,10 @@ impl CreateResponse {
     /// The maximal access, if requested and returned successfully.
     pub fn maximal_access(&self) -> Option<AccessMask> {
         self.contexts.iter().find_map(|c| match c {
-            CreateResponseContext::MaximalAccess { query_status, maximal_access } if query_status.is_success() => {
-                Some(*maximal_access)
-            }
+            CreateResponseContext::MaximalAccess {
+                query_status,
+                maximal_access,
+            } if query_status.is_success() => Some(*maximal_access),
             _ => None,
         })
     }
@@ -629,7 +701,12 @@ impl Message for CreateResponse {
         dst.put_u8(self.oplock_level.0);
         dst.put_u8(self.flags);
         dst.put_u32_le(self.create_action.0);
-        for t in [self.creation_time, self.last_access_time, self.last_write_time, self.change_time] {
+        for t in [
+            self.creation_time,
+            self.last_access_time,
+            self.last_write_time,
+            self.change_time,
+        ] {
             dst.put_u64_le(t.0);
         }
         dst.put_u64_le(self.allocation_size);
@@ -718,7 +795,9 @@ mod tests {
             name: "dir\\file.txt".into(),
             contexts: vec![
                 CreateRequestContext::DurableHandleRequest,
-                CreateRequestContext::DurableHandleReconnect { file_id: FileId::new(1, 2) },
+                CreateRequestContext::DurableHandleReconnect {
+                    file_id: FileId::new(1, 2),
+                },
                 CreateRequestContext::DurableHandleRequestV2 {
                     timeout: 60_000,
                     flags: DHANDLE_FLAG_PERSISTENT,
@@ -730,7 +809,9 @@ mod tests {
                     flags: 0,
                 },
                 CreateRequestContext::QueryMaximalAccess { timestamp: None },
-                CreateRequestContext::QueryMaximalAccess { timestamp: Some(FileTime(77)) },
+                CreateRequestContext::QueryMaximalAccess {
+                    timestamp: Some(FileTime(77)),
+                },
                 CreateRequestContext::QueryOnDiskId,
                 CreateRequestContext::RequestLease(Lease::V1 {
                     key: [1; 16],
@@ -748,15 +829,24 @@ mod tests {
                 }),
                 CreateRequestContext::AllocationSize(1 << 20),
                 CreateRequestContext::TimewarpToken(FileTime(1234)),
-                CreateRequestContext::Raw { name: Bytes::from_static(&[0xAB; 16]), data: Bytes::from_static(b"xyz") },
-                CreateRequestContext::Raw { name: Bytes::from_static(b"ExtA"), data: Bytes::new() },
+                CreateRequestContext::Raw {
+                    name: Bytes::from_static(&[0xAB; 16]),
+                    data: Bytes::from_static(b"xyz"),
+                },
+                CreateRequestContext::Raw {
+                    name: Bytes::from_static(b"ExtA"),
+                    data: Bytes::new(),
+                },
             ],
             ..Default::default()
         };
         assert_eq!(rt(&req), req);
         let empty = CreateRequest::default();
         assert_eq!(rt(&empty), empty);
-        let only_ctx = CreateRequest { contexts: vec![CreateRequestContext::QueryOnDiskId], ..Default::default() };
+        let only_ctx = CreateRequest {
+            contexts: vec![CreateRequestContext::QueryOnDiskId],
+            ..Default::default()
+        };
         assert_eq!(rt(&only_ctx), only_ctx);
     }
 
@@ -770,12 +860,18 @@ mod tests {
             file_id: FileId::new(10, 20),
             contexts: vec![
                 CreateResponseContext::DurableHandleResponse,
-                CreateResponseContext::DurableHandleResponseV2 { timeout: 1, flags: 0 },
+                CreateResponseContext::DurableHandleResponseV2 {
+                    timeout: 1,
+                    flags: 0,
+                },
                 CreateResponseContext::MaximalAccess {
                     query_status: NtStatus::SUCCESS,
                     maximal_access: AccessMask::from_bits_retain(0x001F_01FF),
                 },
-                CreateResponseContext::OnDiskId { disk_file_id: 5, volume_id: 6 },
+                CreateResponseContext::OnDiskId {
+                    disk_file_id: 5,
+                    volume_id: 6,
+                },
                 CreateResponseContext::Lease(Lease::V1 {
                     key: [1; 16],
                     state: LeaseState::READ_CACHING,
@@ -787,7 +883,10 @@ mod tests {
         };
         let d = rt(&resp);
         assert_eq!(d, resp);
-        assert_eq!(d.maximal_access(), Some(AccessMask::from_bits_retain(0x001F_01FF)));
+        assert_eq!(
+            d.maximal_access(),
+            Some(AccessMask::from_bits_retain(0x001F_01FF))
+        );
         assert_eq!(d.lease().unwrap().state(), LeaseState::READ_CACHING);
         assert_eq!(rt(&CreateResponse::default()), CreateResponse::default());
     }

@@ -199,7 +199,11 @@ pub fn encode_message<M: Message>(header: &Header, body: &M) -> Result<EncodedMe
     h.encode(&mut head);
     body.encode_body(&mut head)?;
     let payload = body.payload().filter(|p| !p.is_empty()).cloned();
-    Ok(EncodedMessage { head, payload, padding: 0 })
+    Ok(EncodedMessage {
+        head,
+        payload,
+        padding: 0,
+    })
 }
 
 /// A complete outgoing transport frame: the 4-byte Direct TCP header followed
@@ -231,14 +235,20 @@ impl OutgoingFrame {
             }
         }
         chunks[0] = Bytes::copy_from_slice(&transport_header(total)?);
-        Ok(OutgoingFrame { chunks, remaining: total + 4 })
+        Ok(OutgoingFrame {
+            chunks,
+            remaining: total + 4,
+        })
     }
 
     /// Frame an already contiguous payload (e.g. a TRANSFORM_HEADER message).
     pub fn from_bytes(b: Bytes) -> Result<Self> {
         let hdr = Bytes::copy_from_slice(&transport_header(b.len())?);
         let remaining = b.len() + 4;
-        Ok(OutgoingFrame { chunks: VecDeque::from([hdr, b]), remaining })
+        Ok(OutgoingFrame {
+            chunks: VecDeque::from([hdr, b]),
+            remaining,
+        })
     }
 
     /// Copy the frame into one vector (tests, debugging).
@@ -257,14 +267,20 @@ impl Buf for OutgoingFrame {
     }
 
     fn chunk(&self) -> &[u8] {
-        self.chunks.iter().find(|c| !c.is_empty()).map_or(&[], |c| &c[..])
+        self.chunks
+            .iter()
+            .find(|c| !c.is_empty())
+            .map_or(&[], |c| &c[..])
     }
 
     fn advance(&mut self, mut cnt: usize) {
         assert!(cnt <= self.remaining, "advance past end of OutgoingFrame");
         self.remaining -= cnt;
         while cnt > 0 {
-            let front = self.chunks.front_mut().expect("remaining > 0 implies a chunk");
+            let front = self
+                .chunks
+                .front_mut()
+                .expect("remaining > 0 implies a chunk");
             if cnt >= front.len() {
                 cnt -= front.len();
                 self.chunks.pop_front();
@@ -407,7 +423,10 @@ impl RawMessage {
             });
         }
         if self.header.is_response() != M::RESPONSE {
-            return Err(ProtoError::malformed("SMB2 message", "unexpected message direction"));
+            return Err(ProtoError::malformed(
+                "SMB2 message",
+                "unexpected message direction",
+            ));
         }
         M::decode_body(&self.bytes)
     }

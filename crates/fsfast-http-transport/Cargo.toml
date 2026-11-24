@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-http-transport"
+description = "Shared HTTP client for fsfast's HTTP-based backends (http, s3, gcs, azure, webdav): pooling, proxies, TLS, retries, adaptive concurrency, range helpers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,28 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+bytes.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# rustls (aws-lc-rs provider + OS trust store via rustls-platform-verifier),
+# HTTP/2 via ALPN, streaming request/response bodies. No default features:
+# no native-tls, no automatic decompression (sizes and byte ranges must refer
+# to the bytes on the wire, see docs/adr/0002-http-client.md).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
+httpdate = "1"
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+# Only to recognise TLS failures in error chains (not retried); same version
+# reqwest uses, so no second copy is built.
+rustls = { version = "0.23", default-features = false }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+proptest = "1.5"
+tempfile = "3"
+# A local TLS server for the certificate tests.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio = { workspace = true, features = ["test-util"] }

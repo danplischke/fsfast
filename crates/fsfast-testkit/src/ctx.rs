@@ -98,12 +98,11 @@ impl Ctx {
     /// Assert that `p` does not exist (`exists` is false and `info` fails
     /// with `NotFound`).
     pub async fn expect_missing(&self, p: &str) -> CheckResult {
-        let exists = self
-            .fs
-            .exists(p)
-            .await
-            .ctx(format_args!("exists({p:?})"))?;
-        ensure!(!exists, "exists({p:?}) returned true, expected the path to be gone");
+        let exists = self.fs.exists(p).await.ctx(format_args!("exists({p:?})"))?;
+        ensure!(
+            !exists,
+            "exists({p:?}) returned true, expected the path to be gone"
+        );
         expect_err(
             format!("info({p:?})"),
             self.fs.info(p).await,
@@ -305,12 +304,9 @@ mod tests {
         };
         assert!(m.contains("succeeded with 5"), "{m}");
         let wrong: Result<u32> = Err(fsfast_core::Error::already_exists("p"));
-        let CheckError::Failed(m) = expect_err(
-            "op",
-            wrong,
-            &[ErrorKind::NotFound, ErrorKind::IsADirectory],
-        )
-        .unwrap_err() else {
+        let CheckError::Failed(m) =
+            expect_err("op", wrong, &[ErrorKind::NotFound, ErrorKind::IsADirectory]).unwrap_err()
+        else {
             panic!()
         };
         assert!(m.contains("NotFound or IsADirectory"), "{m}");

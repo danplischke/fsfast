@@ -46,7 +46,9 @@ statuses! {
     SUCCESS = 0x0000_0000, Other, "the operation completed successfully";
     PENDING = 0x0000_0103, Other, "the operation is in progress (interim response)";
     NOTIFY_CLEANUP = 0x0000_010B, Other, "the handle with a change notify request was closed";
+    REPARSE = 0x0000_0104, Other, "the create must be reissued with the reparsed name";
     NOTIFY_ENUM_DIR = 0x0000_010C, Other, "too many changes to report; enumerate the directory";
+    OBJECT_NAME_EXISTS = 0x4000_0000, Other, "the object name already existed (informational)";
     // --- warnings ------------------------------------------------------------
     BUFFER_OVERFLOW = 0x8000_0005, Other, "the data was too large to fit into the buffer";
     NO_MORE_FILES = 0x8000_0006, Other, "no more files were found";
@@ -60,6 +62,7 @@ statuses! {
     INFO_LENGTH_MISMATCH = 0xC000_0004, InvalidInput, "the buffer length does not match the information class";
     INVALID_HANDLE = 0xC000_0008, Io, "the file handle is invalid";
     INVALID_PARAMETER = 0xC000_000D, InvalidInput, "an invalid parameter was passed";
+    INVALID_LOCK_SEQUENCE = 0xC000_001E, InvalidInput, "the lock sequence is invalid";
     NO_SUCH_DEVICE = 0xC000_000E, NotFound, "the device does not exist";
     NO_SUCH_FILE = 0xC000_000F, NotFound, "the file does not exist";
     INVALID_DEVICE_REQUEST = 0xC000_0010, Unsupported, "the request is not valid for this device";
@@ -69,6 +72,7 @@ statuses! {
     ACCESS_DENIED = 0xC000_0022, PermissionDenied, "access is denied";
     BUFFER_TOO_SMALL = 0xC000_0023, InvalidInput, "the buffer is too small for the result";
     OBJECT_TYPE_MISMATCH = 0xC000_0024, InvalidInput, "the object type does not match";
+    DISK_CORRUPT_ERROR = 0xC000_0032, Io, "the disk structure is corrupt";
     OBJECT_NAME_INVALID = 0xC000_0033, InvalidInput, "the object name is invalid";
     OBJECT_NAME_NOT_FOUND = 0xC000_0034, NotFound, "the object name is not found";
     OBJECT_NAME_COLLISION = 0xC000_0035, AlreadyExists, "the object name already exists";
@@ -93,6 +97,7 @@ statuses! {
     PRIVILEGE_NOT_HELD = 0xC000_0061, PermissionDenied, "a required privilege is not held";
     NO_SUCH_USER = 0xC000_0064, PermissionDenied, "the user does not exist";
     WRONG_PASSWORD = 0xC000_006A, PermissionDenied, "the password is wrong";
+    PASSWORD_RESTRICTION = 0xC000_006C, PermissionDenied, "the password does not meet the policy";
     LOGON_FAILURE = 0xC000_006D, PermissionDenied, "unknown user name or bad password";
     ACCOUNT_RESTRICTION = 0xC000_006E, PermissionDenied, "account restrictions prevent logon";
     INVALID_LOGON_HOURS = 0xC000_006F, PermissionDenied, "logon is not allowed at this time";
@@ -106,6 +111,7 @@ statuses! {
     FILE_INVALID = 0xC000_0098, Io, "the file is no longer valid";
     INSUFFICIENT_RESOURCES = 0xC000_009A, Throttled, "insufficient server resources";
     MEDIA_WRITE_PROTECTED = 0xC000_00A2, PermissionDenied, "the media is write protected";
+    DEVICE_NOT_READY = 0xC000_00A3, Io, "the device is not ready";
     BAD_IMPERSONATION_LEVEL = 0xC000_00A5, PermissionDenied, "the impersonation level is not sufficient";
     PIPE_NOT_AVAILABLE = 0xC000_00AC, Throttled, "no pipe instance is available";
     INVALID_PIPE_STATE = 0xC000_00AD, Io, "the pipe is in an invalid state";
@@ -116,7 +122,8 @@ statuses! {
     FILE_FORCED_CLOSED = 0xC000_00B6, Io, "the file was forcibly closed";
     FILE_IS_A_DIRECTORY = 0xC000_00BA, IsADirectory, "the file is a directory";
     NOT_SUPPORTED = 0xC000_00BB, Unsupported, "the request is not supported";
-    BAD_NETWORK_PATH = 0xC000_00BE, ConnectionFailed, "the network path was not found";
+    DUPLICATE_NAME = 0xC000_00BD, AlreadyExists, "a duplicate name exists on the network";
+    BAD_NETWORK_PATH = 0xC000_00BE, NotFound, "the network path was not found";
     NETWORK_BUSY = 0xC000_00BF, Throttled, "the network is busy";
     INVALID_NETWORK_RESPONSE = 0xC000_00C3, Protocol, "the network response was invalid";
     UNEXPECTED_NETWORK_ERROR = 0xC000_00C4, ConnectionFailed, "an unexpected network error occurred";
@@ -129,22 +136,30 @@ statuses! {
     NOT_SAME_DEVICE = 0xC000_00D4, Unsupported, "the target is on a different device";
     FILE_RENAMED = 0xC000_00D5, NotFound, "the file was renamed";
     INVALID_SERVER_STATE = 0xC000_00DC, Io, "the server is in an invalid state";
+    NO_SUCH_DOMAIN = 0xC000_00DF, PermissionDenied, "the domain does not exist";
     INTERNAL_ERROR = 0xC000_00E5, Io, "an internal server error occurred";
+    UNEXPECTED_IO_ERROR = 0xC000_00E9, Io, "an unexpected I/O error occurred";
     OPLOCK_NOT_GRANTED = 0xC000_00E2, Other, "the oplock was not granted";
     INVALID_OPLOCK_PROTOCOL = 0xC000_00E3, Protocol, "invalid oplock acknowledgment";
     PIPE_EMPTY = 0xC000_00D9, Io, "the pipe is empty";
     INVALID_USER_BUFFER = 0xC000_00E8, InvalidInput, "the user buffer is invalid";
     DIRECTORY_NOT_EMPTY = 0xC000_0101, DirectoryNotEmpty, "the directory is not empty";
+    FILE_CORRUPT_ERROR = 0xC000_0102, Io, "the file is corrupt";
     NOT_A_DIRECTORY = 0xC000_0103, NotADirectory, "the file is not a directory";
     NAME_TOO_LONG = 0xC000_0106, InvalidInput, "the name is too long";
     TOO_MANY_OPENED_FILES = 0xC000_011F, Throttled, "too many open files";
     CANCELLED = 0xC000_0120, Cancelled, "the request was cancelled";
     CANNOT_DELETE = 0xC000_0121, PermissionDenied, "the file cannot be deleted";
+    INVALID_COMPUTER_NAME = 0xC000_0122, InvalidInput, "the computer name is invalid";
+    FILE_DELETED = 0xC000_0123, NotFound, "the file was deleted";
     FILE_CLOSED = 0xC000_0128, Io, "the file handle is closed";
+    TIME_DIFFERENCE_AT_DC = 0xC000_0133, PermissionDenied, "the clock differs too much from the domain controller";
     REMOTE_DISCONNECT = 0xC000_013C, ConnectionFailed, "the remote side disconnected";
     INVALID_LEVEL = 0xC000_0148, Unsupported, "the information level is not supported";
     PIPE_BROKEN = 0xC000_014B, ConnectionFailed, "the pipe is broken";
+    LOGON_TYPE_NOT_GRANTED = 0xC000_015B, PermissionDenied, "the logon type is not granted";
     INVALID_DEVICE_STATE = 0xC000_0184, Io, "the device is in an invalid state";
+    IO_DEVICE_ERROR = 0xC000_0185, Io, "an I/O device error occurred";
     TRUSTED_RELATIONSHIP_FAILURE = 0xC000_018D, PermissionDenied, "the trust relationship failed";
     NETLOGON_NOT_STARTED = 0xC000_0192, PermissionDenied, "the netlogon service is not started";
     ACCOUNT_EXPIRED = 0xC000_0193, PermissionDenied, "the account has expired";
@@ -167,6 +182,8 @@ statuses! {
     CONNECTION_ABORTED = 0xC000_0241, ConnectionFailed, "the connection was aborted";
     PATH_NOT_COVERED = 0xC000_0257, Other, "the path is not covered by this server (DFS referral needed)";
     DFS_UNAVAILABLE = 0xC000_026D, Unsupported, "DFS is unavailable on this server";
+    TOO_MANY_LINKS = 0xC000_0265, Io, "too many links to the file";
+    VOLUME_DISMOUNTED = 0xC000_026E, Io, "the volume was dismounted";
     NOT_A_REPARSE_POINT = 0xC000_0275, InvalidInput, "the file is not a reparse point";
     IO_REPARSE_TAG_NOT_HANDLED = 0xC000_0279, Unsupported, "the reparse tag is not handled";
     DIRECTORY_IS_A_REPARSE_POINT = 0xC000_0281, InvalidInput, "the directory is a reparse point";
@@ -174,14 +191,18 @@ statuses! {
     DECRYPTION_FAILED = 0xC000_028B, Protocol, "decryption failed";
     NETWORK_SESSION_EXPIRED = 0xC000_035C, ConnectionFailed, "the session expired; re-authenticate";
     FILE_SYSTEM_LIMITATION = 0xC000_0427, Io, "a file system limitation was hit";
+    REQUEST_OUT_OF_SEQUENCE = 0xC000_042A, Protocol, "the request is out of sequence";
     SERVER_UNAVAILABLE = 0xC000_0466, ConnectionFailed, "the server is unavailable";
     FILE_NOT_AVAILABLE = 0xC000_0467, Throttled, "the file is temporarily unavailable";
+    FILE_TOO_LARGE = 0xC000_0904, Io, "the file is too large";
     VIRUS_INFECTED = 0xC000_0906, PermissionDenied, "the file contains a virus";
+    INVALID_SIGNATURE = 0xC000_A000, Protocol, "the message signature is invalid";
     HASH_NOT_SUPPORTED = 0xC000_A100, Unsupported, "hash generation is not supported";
     HASH_NOT_PRESENT = 0xC000_A101, NotFound, "the hash is not present";
     SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP = 0xC05D_0000, Protocol, "no common preauth integrity hash algorithm";
     SMB_BAD_CLUSTER_DIALECT = 0xC05D_0001, Protocol, "the dialect is not supported by the cluster";
     SMB_GUEST_LOGON_BLOCKED = 0xC05D_0002, PermissionDenied, "guest logons are blocked";
+    SMB_NO_SIGNING_ALGORITHM_OVERLAP = 0xC05D_0003, Protocol, "no common signing algorithm";
 }
 
 impl NtStatus {
@@ -346,7 +367,13 @@ mod tests {
             assert!(seen.insert(s.0), "duplicate {s}");
             assert!(s.name().unwrap().starts_with("STATUS_"));
         }
-        assert_eq!(format!("{:?}", NtStatus::ACCESS_DENIED), "STATUS_ACCESS_DENIED(0xC0000022)");
-        assert_eq!(NtStatus::ACCESS_DENIED.to_string(), "STATUS_ACCESS_DENIED (0xC0000022)");
+        assert_eq!(
+            format!("{:?}", NtStatus::ACCESS_DENIED),
+            "STATUS_ACCESS_DENIED(0xC0000022)"
+        );
+        assert_eq!(
+            NtStatus::ACCESS_DENIED.to_string(),
+            "STATUS_ACCESS_DENIED (0xC0000022)"
+        );
     }
 }

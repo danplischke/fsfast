@@ -100,15 +100,29 @@ fn check_no_extra(extra: &Options, what: &str) -> Result<()> {
     }
 }
 
+/// An error of the local side of `put_file`/`get_file`. Python raises a
+/// plain `OSError(errno)` for errnos such as `EINVAL` and `ENAMETOOLONG`,
+/// which the core mapping would turn into `InvalidInput` (`ValueError`), so
+/// OS errors of that kind (or `Unsupported`) are reported as `Io`.
 fn local_io_error(e: std::io::Error, path: &Path) -> Error {
-    Error::from(e).with_path(path.display().to_string())
+    let os_error = e.raw_os_error().is_some();
+    let err = Error::from(e).with_path(path.display().to_string());
+    match err.kind() {
+        ErrorKind::InvalidInput | ErrorKind::Unsupported if os_error => {
+            err.with_kind(ErrorKind::Io)
+        }
+        _ => err,
+    }
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => Err(Error::new(ErrorKind::Cancelled, format!("blocking task cancelled: {e}"))),
+        Err(e) => Err(Error::new(
+            ErrorKind::Cancelled,
+            format!("blocking task cancelled: {e}"),
+        )),
     }
 }
 
@@ -247,7 +261,11 @@ impl FileSystem for MemoryFileSystem {
         Self::write_mode_check(opts)?;
         let p = strip_protocol(path).into_owned();
         let slot = self.store.inner.write().open_write(&p, opts.mode)?;
-        Ok(Box::new(MemoryWriteHandle::new(self.store.clone(), p, slot)))
+        Ok(Box::new(MemoryWriteHandle::new(
+            self.store.clone(),
+            p,
+            slot,
+        )))
     }
 
     /// fsspec `cat_file`: a zero-copy slice. Directories are `NotFound`.
@@ -417,14 +435,18 @@ mod tests {
     use fsfast_core::Value;
 
     fn opts(pairs: &[(&str, Value)]) -> Options {
-        pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
     }
 
     #[test]
     fn from_options_is_strict() {
         let fs = MemoryFileSystem::from_options(Options::new()).unwrap();
         assert!(fs.is_global());
-        let fs = MemoryFileSystem::from_options(opts(&[("global_store", Value::Bool(false))])).unwrap();
+        let fs =
+            MemoryFileSystem::from_options(opts(&[("global_store", Value::Bool(false))])).unwrap();
         assert!(!fs.is_global());
         MemoryFileSystem::from_options(opts(&[
             ("skip_instance_cache", Value::Bool(true)),
@@ -434,8 +456,9 @@ mod tests {
         let e = MemoryFileSystem::from_options(opts(&[("bogus", Value::Int(1))])).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput);
         assert!(e.to_string().contains("bogus"), "{e}");
-        let e = MemoryFileSystem::from_options(opts(&[("global_store", Value::Str("maybe".into()))]))
-            .unwrap_err();
+        let e =
+            MemoryFileSystem::from_options(opts(&[("global_store", Value::Str("maybe".into()))]))
+                .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput);
     }
 
@@ -449,7 +472,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(b.cat_file(p, ByteRange::Full).await.unwrap(), "shared");
-        assert_eq!(iso.cat_file(p, ByteRange::Full).await.unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(
+            iso.cat_file(p, ByteRange::Full).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
         let iso2 = iso.clone();
         iso.pipe_file("/x", Bytes::from_static(b"1"), &WriteOptions::default())
             .await
@@ -475,13 +501,21 @@ mod tests {
         let fs = MemoryFileSystem::new_isolated();
         let data = Bytes::from(vec![7u8; 1 << 20]);
         let ptr = data.as_ptr();
-        fs.pipe_file("/z", data, &WriteOptions::default()).await.unwrap();
+        fs.pipe_file("/z", data, &WriteOptions::default())
+            .await
+            .unwrap();
         let got = fs.cat_file("/z", ByteRange::Full).await.unwrap();
         assert_eq!(got.as_ptr(), ptr, "cat_file must return the stored buffer");
-        let part = fs.cat_file("/z", ByteRange::Bounded { start: 10, end: 20 }).await.unwrap();
+        let part = fs
+            .cat_file("/z", ByteRange::Bounded { start: 10, end: 20 })
+            .await
+            .unwrap();
         assert_eq!(part.as_ptr(), offset_ptr(ptr, 10));
         fs.cp_file("/z", "/z2").await.unwrap();
-        assert_eq!(fs.cat_file("/z2", ByteRange::Full).await.unwrap().as_ptr(), ptr);
+        assert_eq!(
+            fs.cat_file("/z2", ByteRange::Full).await.unwrap().as_ptr(),
+            ptr
+        );
         let h = fs.open_read("/z", &ReadOptions::default()).await.unwrap();
         assert_eq!(h.read_at(5, 3).await.unwrap().as_ptr(), offset_ptr(ptr, 5));
     }
@@ -513,7 +547,10 @@ mod tests {
         );
 
         // Abort of a new file removes it.
-        let mut w = fs.open_write("/gone", &WriteOptions::default()).await.unwrap();
+        let mut w = fs
+            .open_write("/gone", &WriteOptions::default())
+            .await
+            .unwrap();
         w.write(Bytes::from_static(b"zz")).await.unwrap();
         w.abort().await.unwrap();
         assert!(!fs.exists("/gone").await.unwrap());
@@ -532,19 +569,35 @@ mod tests {
 
         // Dropping without close publishes.
         {
-            let mut w = fs.open_write("/dropped", &WriteOptions::default()).await.unwrap();
+            let mut w = fs
+                .open_write("/dropped", &WriteOptions::default())
+                .await
+                .unwrap();
             w.write(Bytes::from_static(b"kept")).await.unwrap();
         }
-        assert_eq!(fs.cat_file("/dropped", ByteRange::Full).await.unwrap(), "kept");
+        assert_eq!(
+            fs.cat_file("/dropped", ByteRange::Full).await.unwrap(),
+            "kept"
+        );
 
         // A handle whose file was replaced does not clobber the new file.
-        let mut w = fs.open_write("/race", &WriteOptions::default()).await.unwrap();
-        fs.pipe_file("/race", Bytes::from_static(b"winner"), &WriteOptions::default())
+        let mut w = fs
+            .open_write("/race", &WriteOptions::default())
             .await
             .unwrap();
+        fs.pipe_file(
+            "/race",
+            Bytes::from_static(b"winner"),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
         w.write(Bytes::from_static(b"loser")).await.unwrap();
         w.close().await.unwrap();
-        assert_eq!(fs.cat_file("/race", ByteRange::Full).await.unwrap(), "winner");
+        assert_eq!(
+            fs.cat_file("/race", ByteRange::Full).await.unwrap(),
+            "winner"
+        );
     }
 
     #[tokio::test]
@@ -559,10 +612,16 @@ mod tests {
             .unwrap();
         assert_eq!(h.read_at(0, 100).await.unwrap(), "old");
         assert_eq!(h.size(), 3);
-        assert!(matches!(h.info().extra.get("created"), Some(Value::Time(_))));
+        assert!(matches!(
+            h.info().extra.get("created"),
+            Some(Value::Time(_))
+        ));
         let mut ro = ReadOptions::default();
         ro.extra.insert("bogus".into(), Value::Int(1));
-        assert_eq!(fs.open_read("/s", &ro).await.unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            fs.open_read("/s", &ro).await.unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
     }
 
     #[tokio::test]
@@ -573,7 +632,10 @@ mod tests {
         fs.pipe_file("/t", Bytes::from_static(b"x"), &WriteOptions::default())
             .await
             .unwrap();
-        assert_eq!(fs.touch("/t", false).await.unwrap_err().kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            fs.touch("/t", false).await.unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
         fs.touch("/t", true).await.unwrap();
         assert_eq!(fs.info("/t").await.unwrap().size, 0);
     }
@@ -588,7 +650,10 @@ mod tests {
         fs.put_file(&tmp.join("src.bin"), "/up/load/f", &WriteOptions::default())
             .await
             .unwrap();
-        assert_eq!(fs.cat_file("/up/load/f", ByteRange::Full).await.unwrap(), "payload");
+        assert_eq!(
+            fs.cat_file("/up/load/f", ByteRange::Full).await.unwrap(),
+            "payload"
+        );
         // fsspec creates the parents as pseudo-directories.
         fs.rmdir("/up/load").await.unwrap_err();
         assert_eq!(
@@ -607,16 +672,40 @@ mod tests {
             .unwrap();
         assert!(fs.info("/up/dir").await.unwrap().is_dir());
 
-        fs.get_file("/up/load/f", &tmp.join("out/nested/f")).await.unwrap();
+        fs.get_file("/up/load/f", &tmp.join("out/nested/f"))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(tmp.join("out/nested/f")).unwrap(), b"payload");
         fs.get_file("/up", &tmp.join("outdir")).await.unwrap();
         assert!(tmp.join("outdir").is_dir());
         assert_eq!(
-            fs.get_file("/missing", &tmp.join("never")).await.unwrap_err().kind(),
+            fs.get_file("/missing", &tmp.join("never"))
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::NotFound
         );
         assert!(!tmp.join("never").exists());
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Regression: an over-long local name (`ENAMETOOLONG`) was reported as
+    /// `InvalidInput` (Python `ValueError`); fsspec raises `OSError`.
+    #[tokio::test]
+    async fn local_os_errors_keep_python_classes() {
+        let fs = MemoryFileSystem::new_isolated();
+        fs.pipe_file("/f", Bytes::from_static(b"x"), &WriteOptions::default())
+            .await
+            .unwrap();
+        let long = std::env::temp_dir().join("n".repeat(300));
+        let e = fs.get_file("/f", &long).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Io, "{e}");
+        let e = fs
+            .put_file(&long, "/g", &WriteOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Io, "{e}");
+        assert!(!fs.exists("/g").await.unwrap());
     }
 
     #[tokio::test]

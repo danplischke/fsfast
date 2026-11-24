@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a987e5a0c42fd82891112f57f643319a9f487e9fcacfa8187fb1140f5b0b6e27 # shrinks to cap = 1, ops = [AcquireAbort { bytes: 1, hold: 17, after: 0 }, Resize(1)]
+cc c47a7b3479eb7b49812473d4c2fb4cd1369503b866a4c72a6145d0a27e6a4002 # shrinks to cap = 129, ops = [Try { bytes: 1, hold: 1 }, Acquire { bytes: 130, hold: 0 }, Sleep(1), Force { bytes: 25, hold: 1 }, Acquire { bytes: 13, hold: 0 }, Acquire { bytes: 141, hold: 0 }, Resize(26)]

@@ -109,7 +109,6 @@ bitflags! {
         const DFS_OPERATIONS = 0x1000_0000;
         /// The request is a replay of an earlier request (3.x).
         const REPLAY_OPERATION = 0x2000_0000;
-        const _ = !0;
     }
 }
 
@@ -121,7 +120,9 @@ impl HeaderFlags {
 
     /// Replace the priority value (only the low 3 bits of `p` are used).
     pub fn with_priority(self, p: u8) -> Self {
-        Self::from_bits_retain((self.bits() & !Self::PRIORITY_MASK.bits()) | ((u32::from(p) & 7) << 4))
+        Self::from_bits_retain(
+            (self.bits() & !Self::PRIORITY_MASK.bits()) | ((u32::from(p) & 7) << 4),
+        )
     }
 }
 
@@ -145,7 +146,10 @@ pub enum HeaderId {
 
 impl Default for HeaderId {
     fn default() -> Self {
-        HeaderId::Sync { process_id: 0, tree_id: 0 }
+        HeaderId::Sync {
+            process_id: 0,
+            tree_id: 0,
+        }
     }
 }
 
@@ -181,7 +185,10 @@ pub struct Header {
 impl Header {
     /// A request header for `command` with everything else zero.
     pub fn request(command: Command) -> Self {
-        Header { command, ..Default::default() }
+        Header {
+            command,
+            ..Default::default()
+        }
     }
 
     /// A response header for `command`, mirroring a request's ids.
@@ -237,7 +244,10 @@ impl Header {
             HeaderId::Sync { process_id, .. } => process_id,
             HeaderId::Async { .. } => 0,
         };
-        self.id = HeaderId::Sync { process_id, tree_id };
+        self.id = HeaderId::Sync {
+            process_id,
+            tree_id,
+        };
     }
 
     /// `ChannelSequence` of a 3.x request (low 16 bits of the status field).
@@ -275,7 +285,10 @@ impl Header {
         dst.put_u32_le(self.next_command);
         dst.put_u64_le(self.message_id);
         match self.id {
-            HeaderId::Sync { process_id, tree_id } => {
+            HeaderId::Sync {
+                process_id,
+                tree_id,
+            } => {
                 dst.put_u32_le(process_id);
                 dst.put_u32_le(tree_id);
             }
@@ -302,7 +315,10 @@ impl Header {
             return Err(ProtoError::malformed("SMB2 header", "bad protocol id"));
         }
         if r.u16()? != 64 {
-            return Err(ProtoError::malformed("SMB2 header", "structure size is not 64"));
+            return Err(ProtoError::malformed(
+                "SMB2 header",
+                "structure size is not 64",
+            ));
         }
         let credit_charge = r.u16()?;
         let status = NtStatus(r.u32()?);
@@ -314,7 +330,10 @@ impl Header {
         let id = if flags.contains(HeaderFlags::ASYNC_COMMAND) {
             HeaderId::Async { async_id: r.u64()? }
         } else {
-            HeaderId::Sync { process_id: r.u32()?, tree_id: r.u32()? }
+            HeaderId::Sync {
+                process_id: r.u32()?,
+                tree_id: r.u32()?,
+            }
         };
         let session_id = r.u64()?;
         let signature = r.array()?;
@@ -358,7 +377,10 @@ mod tests {
             flags: HeaderFlags::SERVER_TO_REDIR | HeaderFlags::SIGNED,
             next_command: 0x68,
             message_id: 0x0102_0304_0506_0708,
-            id: HeaderId::Sync { process_id: 0xFEFF, tree_id: 7 },
+            id: HeaderId::Sync {
+                process_id: 0xFEFF,
+                tree_id: 7,
+            },
             session_id: 0x1122_3344_5566_7788,
             signature: [9; 16],
         };

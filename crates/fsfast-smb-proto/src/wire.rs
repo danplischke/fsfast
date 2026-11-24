@@ -1,10 +1,10 @@
 //! Little-endian wire helpers shared by every structure in the crate.
 //!
-//! Decoding goes through [`Reader`], a bounds-checked cursor that never
+//! Decoding goes through `Reader`, a bounds-checked cursor that never
 //! panics: every read returns [`ProtoError::Truncated`] when the input is too
 //! short. Variable-length fields that SMB2 locates by `(offset, length)` pairs
 //! relative to the start of the SMB2 header are sliced out of the received
-//! frame with [`slice_bytes`], which is zero-copy (`Bytes::slice`).
+//! frame with `slice_bytes`, which is zero-copy (`Bytes::slice`).
 //!
 //! Encoding writes straight into a [`BytesMut`] with [`BufMut`]; offsets that
 //! are only known later are back-patched with the `patch_*` helpers.
@@ -118,26 +118,48 @@ impl<'a> Reader<'a> {
 /// SMB2 commonly sends `offset = 0` together with `len = 0`; a zero length
 /// always yields an empty buffer regardless of the offset.
 #[inline]
-pub(crate) fn slice_bytes(buf: &Bytes, offset: usize, len: usize, what: &'static str) -> Result<Bytes> {
+pub(crate) fn slice_bytes(
+    buf: &Bytes,
+    offset: usize,
+    len: usize,
+    what: &'static str,
+) -> Result<Bytes> {
     if len == 0 {
         return Ok(Bytes::new());
     }
-    let end = offset.checked_add(len).ok_or(ProtoError::malformed(what, "offset overflow"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or(ProtoError::malformed(what, "offset overflow"))?;
     if end > buf.len() {
-        return Err(ProtoError::Truncated { what, need: end, have: buf.len() });
+        return Err(ProtoError::Truncated {
+            what,
+            need: end,
+            have: buf.len(),
+        });
     }
     Ok(buf.slice(offset..end))
 }
 
 /// Borrowed variant of [`slice_bytes`].
 #[inline]
-pub(crate) fn slice_ref<'a>(buf: &'a [u8], offset: usize, len: usize, what: &'static str) -> Result<&'a [u8]> {
+pub(crate) fn slice_ref<'a>(
+    buf: &'a [u8],
+    offset: usize,
+    len: usize,
+    what: &'static str,
+) -> Result<&'a [u8]> {
     if len == 0 {
         return Ok(&[]);
     }
-    let end = offset.checked_add(len).ok_or(ProtoError::malformed(what, "offset overflow"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or(ProtoError::malformed(what, "offset overflow"))?;
     if end > buf.len() {
-        return Err(ProtoError::Truncated { what, need: end, have: buf.len() });
+        return Err(ProtoError::Truncated {
+            what,
+            need: end,
+            have: buf.len(),
+        });
     }
     Ok(&buf[offset..end])
 }
@@ -205,7 +227,7 @@ pub fn utf16le_vec(s: &str) -> Vec<u8> {
 
 /// Decode UTF-16LE strictly (odd lengths and unpaired surrogates are errors).
 pub fn decode_utf16le(b: &[u8], what: &'static str) -> Result<String> {
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return Err(ProtoError::InvalidUtf16 { what });
     }
     char::decode_utf16(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])))
@@ -223,7 +245,11 @@ pub fn decode_utf16le_lossy(b: &[u8]) -> String {
 
 /// Decode a NUL-terminated UTF-16LE string starting at `offset` in `buf`.
 pub(crate) fn decode_utf16z(buf: &[u8], offset: usize, what: &'static str) -> Result<String> {
-    let s = buf.get(offset..).ok_or(ProtoError::Truncated { what, need: offset, have: buf.len() })?;
+    let s = buf.get(offset..).ok_or(ProtoError::Truncated {
+        what,
+        need: offset,
+        have: buf.len(),
+    })?;
     let mut end = None;
     let mut i = 0;
     while i + 1 < s.len() {
@@ -370,7 +396,14 @@ mod tests {
     fn reader_bounds() {
         let mut r = Reader::new(&[1, 2, 3], "t");
         assert_eq!(r.u16().unwrap(), 0x0201);
-        assert!(matches!(r.u16(), Err(ProtoError::Truncated { need: 4, have: 3, .. })));
+        assert!(matches!(
+            r.u16(),
+            Err(ProtoError::Truncated {
+                need: 4,
+                have: 3,
+                ..
+            })
+        ));
         assert_eq!(r.u8().unwrap(), 3);
         assert_eq!(r.remaining(), 0);
     }
@@ -391,7 +424,10 @@ mod tests {
     #[test]
     fn slices() {
         let b = Bytes::from_static(b"0123456789");
-        assert_eq!(slice_bytes(&b, 2, 3, "x").unwrap(), Bytes::from_static(b"234"));
+        assert_eq!(
+            slice_bytes(&b, 2, 3, "x").unwrap(),
+            Bytes::from_static(b"234")
+        );
         assert!(slice_bytes(&b, 8, 3, "x").is_err());
         assert!(slice_bytes(&b, usize::MAX, 3, "x").is_err());
         assert!(slice_bytes(&b, 999, 0, "x").unwrap().is_empty());
@@ -408,7 +444,8 @@ mod tests {
     #[test]
     fn guid_display() {
         let g = Guid([
-            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
         ]);
         assert_eq!(g.to_string(), "00112233-4455-6677-8899-aabbccddeeff");
         let r = Guid::random();

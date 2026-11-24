@@ -29,8 +29,13 @@ impl Dialect {
     pub const SMB_3_1_1: Dialect = Dialect(0x0311);
 
     /// All dialects this crate speaks, oldest first.
-    pub const ALL: [Dialect; 5] =
-        [Self::SMB_2_0_2, Self::SMB_2_1, Self::SMB_3_0, Self::SMB_3_0_2, Self::SMB_3_1_1];
+    pub const ALL: [Dialect; 5] = [
+        Self::SMB_2_0_2,
+        Self::SMB_2_1,
+        Self::SMB_3_0,
+        Self::SMB_3_0_2,
+        Self::SMB_3_1_1,
+    ];
 
     /// `true` for the SMB 3.x family (AES signing, encryption, KDF).
     pub fn is_smb3(self) -> bool {
@@ -80,11 +85,17 @@ pub struct FileId {
 impl FileId {
     /// The file id that refers to the handle created by a previous request
     /// in a related compound chain ([MS-SMB2] §3.2.4.1.4).
-    pub const RELATED: FileId = FileId { persistent: u64::MAX, volatile: u64::MAX };
+    pub const RELATED: FileId = FileId {
+        persistent: u64::MAX,
+        volatile: u64::MAX,
+    };
 
     /// Build from the two halves.
     pub const fn new(persistent: u64, volatile: u64) -> Self {
-        FileId { persistent, volatile }
+        FileId {
+            persistent,
+            volatile,
+        }
     }
 
     /// `true` for [`FileId::RELATED`].
@@ -106,7 +117,10 @@ impl FileId {
         let mut v = [0u8; 8];
         p.copy_from_slice(&b[..8]);
         v.copy_from_slice(&b[8..]);
-        FileId { persistent: u64::from_le_bytes(p), volatile: u64::from_le_bytes(v) }
+        FileId {
+            persistent: u64::from_le_bytes(p),
+            volatile: u64::from_le_bytes(v),
+        }
     }
 
     pub(crate) fn put(&self, dst: &mut BytesMut) {
@@ -115,7 +129,10 @@ impl FileId {
     }
 
     pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self> {
-        Ok(FileId { persistent: r.u64()?, volatile: r.u64()? })
+        Ok(FileId {
+            persistent: r.u64()?,
+            volatile: r.u64()?,
+        })
     }
 }
 
@@ -137,7 +154,6 @@ bitflags! {
         const SIGNING_ENABLED = 0x0001;
         /// Signing is required.
         const SIGNING_REQUIRED = 0x0002;
-        const _ = !0;
     }
 }
 
@@ -161,7 +177,6 @@ bitflags! {
         const ENCRYPTION = 0x0000_0040;
         /// Server-to-client notifications (3.1.1).
         const NOTIFICATIONS = 0x0000_0080;
-        const _ = !0;
     }
 }
 

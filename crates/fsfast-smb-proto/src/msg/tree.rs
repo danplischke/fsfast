@@ -21,7 +21,6 @@ bitflags! {
         /// A TREE_CONNECT_Request_Extension follows (not produced by this
         /// codec).
         const EXTENSION_PRESENT = 0x0004;
-        const _ = !0;
     }
 }
 
@@ -77,7 +76,6 @@ bitflags! {
         const COMPRESS_DATA = 0x0010_0000;
         /// Isolated transport preferred.
         const ISOLATED_TRANSPORT = 0x0020_0000;
-        const _ = !0;
     }
 }
 
@@ -97,7 +95,6 @@ bitflags! {
         const ASYMMETRIC = 0x0000_0080;
         /// Redirect to owner.
         const REDIRECT_TO_OWNER = 0x0000_0100;
-        const _ = !0;
     }
 }
 
@@ -128,7 +125,10 @@ impl Message for TreeConnectRequest {
         let flags = TreeConnectFlags::from_bits_retain(r.u16()?);
         let off = usize::from(r.u16()?);
         let len = usize::from(r.u16()?);
-        let path = decode_utf16le(slice_ref(msg, off, len, "TREE_CONNECT path")?, "TREE_CONNECT path")?;
+        let path = decode_utf16le(
+            slice_ref(msg, off, len, "TREE_CONNECT path")?,
+            "TREE_CONNECT path",
+        )?;
         Ok(TreeConnectRequest { flags, path })
     }
 }

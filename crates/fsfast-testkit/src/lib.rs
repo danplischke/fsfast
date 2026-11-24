@@ -80,8 +80,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::{FutureExt, StreamExt, stream};
 use fsfast_core::{ErrorKind, FileSystem, FindOptions, path};
+use futures::{FutureExt, StreamExt, stream};
 
 use crate::ctx::{CheckError, Ctx};
 
@@ -171,6 +171,7 @@ pub fn check_names() -> Vec<&'static str> {
 /// Outcome of one check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckStatus {
+    /// Every expectation of the check held.
     Passed,
     /// The message explains what was expected and what happened.
     Failed(String),
@@ -181,8 +182,11 @@ pub enum CheckStatus {
 /// One check's result.
 #[derive(Debug, Clone)]
 pub struct CheckOutcome {
+    /// The check's name (see [`check_names`]).
     pub name: &'static str,
+    /// Whether it passed, failed or was skipped, and why.
     pub status: CheckStatus,
+    /// Wall-clock time the check took (zero when skipped by configuration).
     pub duration: Duration,
 }
 
@@ -245,7 +249,11 @@ fn write_indented(f: &mut fmt::Formatter<'_>, text: &str, indent: &str) -> fmt::
 
 impl fmt::Display for SuiteReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let verdict = if self.is_success() { "PASSED" } else { "FAILED" };
+        let verdict = if self.is_success() {
+            "PASSED"
+        } else {
+            "FAILED"
+        };
         writeln!(
             f,
             "fsfast-testkit conformance suite {verdict}: backend `{}`, run directory `{}`",
@@ -332,6 +340,24 @@ pub async fn run_suite(fs: Arc<dyn FileSystem>, root: &str, cfg: SuiteConfig) ->
     };
     tracing::info!(backend = %report.backend, root = %run_dir, "running fsfast-testkit suite");
 
+    // A misspelt name in `only` would otherwise skip every check and report
+    // success without testing anything.
+    let known = check_names();
+    let unknown: Vec<&str> = cfg
+        .skip
+        .iter()
+        .chain(&cfg.only)
+        .map(String::as_str)
+        .filter(|n| !known.contains(n))
+        .collect();
+    if !unknown.is_empty() {
+        report.setup_error = Some(format!(
+            "unknown check name(s) in SuiteConfig::skip/only: {unknown:?}; known checks: {known:?}"
+        ));
+        report.duration = started.elapsed();
+        return report;
+    }
+
     // The highest ancestor of the run directory that does not exist yet: the
     // suite created it (via makedirs) and removes it again at the end.
     let created_from = if caps.hierarchical {
@@ -395,7 +421,9 @@ pub async fn run_suite(fs: Arc<dyn FileSystem>, root: &str, cfg: SuiteConfig) ->
         report.cleanup_errors.extend(cleanup);
     }
     let order = check_names();
-    report.outcomes.sort_by_key(|o| order.iter().position(|n| *n == o.name));
+    report
+        .outcomes
+        .sort_by_key(|o| order.iter().position(|n| *n == o.name));
 
     if !cfg.keep_files {
         let errs = remove_tree(fs.as_ref(), &run_dir, caps.hierarchical).await;
@@ -416,7 +444,11 @@ pub async fn run_suite(fs: Arc<dyn FileSystem>, root: &str, cfg: SuiteConfig) ->
     report
 }
 
-async fn run_check(ctx: Ctx, name: &'static str, f: checks::CheckFn) -> (CheckOutcome, Vec<String>) {
+async fn run_check(
+    ctx: Ctx,
+    name: &'static str,
+    f: checks::CheckFn,
+) -> (CheckOutcome, Vec<String>) {
     let started = Instant::now();
     tracing::debug!(check = name, dir = %ctx.dir, "starting check");
     let status = match ctx.ensure_dir(&ctx.dir).await {
@@ -573,7 +605,8 @@ mod tests {
         assert_eq!(set.len(), names.len());
         for n in names {
             assert!(
-                n.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                n.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
                 "{n}"
             );
         }
@@ -613,7 +646,10 @@ mod tests {
         assert!(s.contains("      line one\n      line two"), "{s}");
         assert!(s.contains("SKIP c: no append"), "{s}");
         assert!(s.contains("  - b: 1 file(s) left"), "{s}");
-        assert_eq!(report.outcome("c").unwrap().status, CheckStatus::Skipped("no append".into()));
+        assert_eq!(
+            report.outcome("c").unwrap().status,
+            CheckStatus::Skipped("no append".into())
+        );
     }
 
     #[test]

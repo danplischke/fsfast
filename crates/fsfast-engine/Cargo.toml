@@ -1,10 +1,42 @@
 [package]
 name = "fsfast-engine"
+description = "Shared I/O performance layer for fsfast backends: retries, adaptive concurrency, memory budget, parallel ranged reads, readahead file reader, multipart uploads, stats"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Public in-memory mock `ReadHandle` / `PartSink` implementations for tests and
+# benchmarks (also usable from other crates' dev-dependencies).
+testing = []
+
 [dependencies]
 fsfast-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+fastrand = "2"
+futures.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Self dev-dependency: integration tests and benches get the `testing` mocks.
+fsfast-engine = { path = ".", features = ["testing"] }
+criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
+proptest = "1.5"
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "coalesce"
+harness = false
+
+[[bench]]
+name = "file_reader"
+harness = false
+
+[[bench]]
+name = "read_parallel"
+harness = false

@@ -20,7 +20,9 @@ use zeroize::Zeroizing;
 
 use super::gmac::GmacKey;
 use crate::error::{ProtoError, Result};
-use crate::header::{Command, FLAGS_OFFSET, HEADER_LEN, HeaderFlags, MESSAGE_ID_OFFSET, SIGNATURE_OFFSET};
+use crate::header::{
+    Command, FLAGS_OFFSET, HEADER_LEN, HeaderFlags, MESSAGE_ID_OFFSET, SIGNATURE_OFFSET,
+};
 use crate::msg::{EncodedMessage, SigningAlgorithmId};
 use crate::types::Dialect;
 
@@ -61,9 +63,14 @@ impl SigningAlgorithm {
         if dialect.is_3_1_1()
             && let Some(id) = negotiated
         {
-            return Self::from_id(id).ok_or(ProtoError::Unsupported("negotiated signing algorithm"));
+            return Self::from_id(id)
+                .ok_or(ProtoError::Unsupported("negotiated signing algorithm"));
         }
-        Ok(if dialect.is_smb3() { SigningAlgorithm::AesCmac } else { SigningAlgorithm::HmacSha256 })
+        Ok(if dialect.is_smb3() {
+            SigningAlgorithm::AesCmac
+        } else {
+            SigningAlgorithm::HmacSha256
+        })
     }
 }
 
@@ -74,6 +81,9 @@ enum Keyed {
     Gmac(GmacKey),
 }
 
+// One per signature, on the stack for a single MAC pass: boxing the CMAC
+// state would add a heap allocation to every signed message.
+#[allow(clippy::large_enum_variant)]
 enum Running {
     Hmac(Hmac<Sha256>),
     Cmac(Cmac<Aes128>),
@@ -113,24 +123,33 @@ pub struct Signer {
 
 impl std::fmt::Debug for Signer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Signer").field("algorithm", &self.alg).finish_non_exhaustive()
+        f.debug_struct("Signer")
+            .field("algorithm", &self.alg)
+            .finish_non_exhaustive()
     }
 }
 
 impl Signer {
     /// A signer for `alg` with a 16-byte signing key.
     pub fn new(alg: SigningAlgorithm, key: &[u8]) -> Result<Self> {
-        let key: [u8; 16] = key.try_into().map_err(|_| ProtoError::InvalidInput("signing key must be 16 bytes"))?;
+        let key: [u8; 16] = key
+            .try_into()
+            .map_err(|_| ProtoError::InvalidInput("signing key must be 16 bytes"))?;
         let keyed = match alg {
             SigningAlgorithm::HmacSha256 => Keyed::Hmac(
-                <Hmac<Sha256> as KeyInit>::new_from_slice(&key).expect("HMAC accepts any key length"),
+                <Hmac<Sha256> as KeyInit>::new_from_slice(&key)
+                    .expect("HMAC accepts any key length"),
             ),
-            SigningAlgorithm::AesCmac => {
-                Keyed::Cmac(<Cmac<Aes128> as KeyInit>::new_from_slice(&key).expect("16-byte AES key"))
-            }
+            SigningAlgorithm::AesCmac => Keyed::Cmac(
+                <Cmac<Aes128> as KeyInit>::new_from_slice(&key).expect("16-byte AES key"),
+            ),
             SigningAlgorithm::AesGmac => Keyed::Gmac(GmacKey::new(&key)),
         };
-        Ok(Signer { alg, keyed, _key: Zeroizing::new(key) })
+        Ok(Signer {
+            alg,
+            keyed,
+            _key: Zeroizing::new(key),
+        })
     }
 
     /// The algorithm.
@@ -144,7 +163,11 @@ impl Signer {
     pub fn compute(&self, parts: &[&[u8]]) -> Result<[u8; 16]> {
         let first = parts.first().copied().unwrap_or_default();
         if first.len() < HEADER_LEN {
-            return Err(ProtoError::Truncated { what: "signed message", need: HEADER_LEN, have: first.len() });
+            return Err(ProtoError::Truncated {
+                what: "signed message",
+                need: HEADER_LEN,
+                have: first.len(),
+            });
         }
         let mut hdr = [0u8; HEADER_LEN];
         hdr.copy_from_slice(&first[..HEADER_LEN]);
@@ -177,7 +200,11 @@ impl Signer {
     /// Sign a contiguous message buffer in place.
     pub fn sign_in_place(&self, msg: &mut [u8]) -> Result<()> {
         if msg.len() < HEADER_LEN {
-            return Err(ProtoError::Truncated { what: "signed message", need: HEADER_LEN, have: msg.len() });
+            return Err(ProtoError::Truncated {
+                what: "signed message",
+                need: HEADER_LEN,
+                have: msg.len(),
+            });
         }
         set_signed_flag(msg);
         let sig = self.compute(&[msg])?;
@@ -188,9 +215,20 @@ impl Signer {
     /// Verify the signature of a received message (the exact bytes of one
     /// compound member, see [`RawMessage::bytes`](crate::msg::RawMessage::bytes)).
     /// The comparison is constant time.
+    ///
+    /// Do not call this for messages that arrived inside a TRANSFORM_HEADER:
+    /// they are authenticated by the AEAD tag and their signature is not
+    /// verified ([MS-SMB2] §3.2.5.1.3). Servers may still set
+    /// `SMB2_FLAGS_SIGNED` on them without a valid signature (Samba does
+    /// on the encrypted `STATUS_ACCESS_DENIED` it returns for an
+    /// unencrypted request on an encryption-required share).
     pub fn verify(&self, msg: &[u8]) -> Result<()> {
         if msg.len() < HEADER_LEN {
-            return Err(ProtoError::Truncated { what: "signed message", need: HEADER_LEN, have: msg.len() });
+            return Err(ProtoError::Truncated {
+                what: "signed message",
+                need: HEADER_LEN,
+                have: msg.len(),
+            });
         }
         let expected = self.compute(&[msg])?;
         if bool::from(expected.ct_eq(&msg[SIGNATURE_OFFSET..HEADER_LEN])) {
@@ -235,9 +273,16 @@ mod tests {
 
     #[test]
     fn sign_verify_all_algorithms() {
-        for alg in [SigningAlgorithm::HmacSha256, SigningAlgorithm::AesCmac, SigningAlgorithm::AesGmac] {
+        for alg in [
+            SigningAlgorithm::HmacSha256,
+            SigningAlgorithm::AesCmac,
+            SigningAlgorithm::AesGmac,
+        ] {
             let s = Signer::new(alg, &[3u8; 16]).unwrap();
-            let w = WriteRequest { data: Bytes::from(vec![9u8; 1000]), ..Default::default() };
+            let w = WriteRequest {
+                data: Bytes::from(vec![9u8; 1000]),
+                ..Default::default()
+            };
             let mut h = Header::request(Command::WRITE);
             h.message_id = 77;
             let mut m = encode_message(&h, &w).unwrap();
@@ -272,11 +317,21 @@ mod tests {
     #[test]
     fn algorithm_selection() {
         use SigningAlgorithm::*;
-        assert_eq!(SigningAlgorithm::for_dialect(Dialect::SMB_2_1, None).unwrap(), HmacSha256);
-        assert_eq!(SigningAlgorithm::for_dialect(Dialect::SMB_3_0_2, None).unwrap(), AesCmac);
-        assert_eq!(SigningAlgorithm::for_dialect(Dialect::SMB_3_1_1, None).unwrap(), AesCmac);
         assert_eq!(
-            SigningAlgorithm::for_dialect(Dialect::SMB_3_1_1, Some(SigningAlgorithmId::AES_GMAC)).unwrap(),
+            SigningAlgorithm::for_dialect(Dialect::SMB_2_1, None).unwrap(),
+            HmacSha256
+        );
+        assert_eq!(
+            SigningAlgorithm::for_dialect(Dialect::SMB_3_0_2, None).unwrap(),
+            AesCmac
+        );
+        assert_eq!(
+            SigningAlgorithm::for_dialect(Dialect::SMB_3_1_1, None).unwrap(),
+            AesCmac
+        );
+        assert_eq!(
+            SigningAlgorithm::for_dialect(Dialect::SMB_3_1_1, Some(SigningAlgorithmId::AES_GMAC))
+                .unwrap(),
             AesGmac
         );
         assert!(Signer::new(AesCmac, &[0; 15]).is_err());

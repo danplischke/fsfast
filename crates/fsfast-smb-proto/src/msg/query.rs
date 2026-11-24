@@ -8,7 +8,9 @@ use crate::error::Result;
 use crate::fscc::{DirectoryEntries, FileInfoClass, InfoClass, InfoType};
 use crate::header::{Command, HEADER_LEN, credit_charge_for};
 use crate::types::FileId;
-use crate::wire::{decode_utf16le, len_u16, len_u32, put_utf16le, slice_bytes, slice_ref, utf16le_len};
+use crate::wire::{
+    decode_utf16le, len_u16, len_u32, put_utf16le, slice_bytes, slice_ref, utf16le_len,
+};
 
 bitflags! {
     /// QUERY_DIRECTORY `Flags`.
@@ -22,7 +24,6 @@ bitflags! {
         const INDEX_SPECIFIED = 0x04;
         /// Restart with a new search pattern.
         const REOPEN = 0x10;
-        const _ = !0;
     }
 }
 
@@ -54,7 +55,11 @@ impl Message for QueryDirectoryRequest {
         dst.put_u8(self.flags.bits());
         dst.put_u32_le(self.file_index);
         self.file_id.put(dst);
-        dst.put_u16_le(if name_len == 0 { 0 } else { (HEADER_LEN + 32) as u16 });
+        dst.put_u16_le(if name_len == 0 {
+            0
+        } else {
+            (HEADER_LEN + 32) as u16
+        });
         dst.put_u16_le(name_len);
         dst.put_u32_le(self.output_buffer_length);
         if name_len == 0 {
@@ -74,7 +79,10 @@ impl Message for QueryDirectoryRequest {
         let off = usize::from(r.u16()?);
         let len = usize::from(r.u16()?);
         let output_buffer_length = r.u32()?;
-        let file_name = decode_utf16le(slice_ref(msg, off, len, "search pattern")?, "search pattern")?;
+        let file_name = decode_utf16le(
+            slice_ref(msg, off, len, "search pattern")?,
+            "search pattern",
+        )?;
         Ok(QueryDirectoryRequest {
             file_information_class,
             flags,
@@ -94,7 +102,11 @@ impl Message for QueryDirectoryRequest {
 /// body shared by QUERY_DIRECTORY, QUERY_INFO and CHANGE_NOTIFY.
 pub(crate) fn encode_buffer_response(dst: &mut BytesMut, buf: &Bytes) -> Result<()> {
     dst.put_u16_le(9);
-    dst.put_u16_le(if buf.is_empty() { 0 } else { (HEADER_LEN + 8) as u16 });
+    dst.put_u16_le(if buf.is_empty() {
+        0
+    } else {
+        (HEADER_LEN + 8) as u16
+    });
     dst.put_u32_le(len_u32(buf.len(), "output buffer too long")?);
     if buf.is_empty() {
         dst.put_u8(0);
@@ -134,7 +146,9 @@ impl Message for QueryDirectoryResponse {
     }
 
     fn decode_body(msg: &Bytes) -> Result<Self> {
-        Ok(QueryDirectoryResponse { output_buffer: decode_buffer_response(msg, "QUERY_DIRECTORY response")? })
+        Ok(QueryDirectoryResponse {
+            output_buffer: decode_buffer_response(msg, "QUERY_DIRECTORY response")?,
+        })
     }
 }
 
@@ -189,7 +203,11 @@ impl Message for QueryInfoRequest {
         dst.put_u8(self.info_type.0);
         dst.put_u8(self.file_info_class);
         dst.put_u32_le(self.output_buffer_length);
-        dst.put_u16_le(if self.input_buffer.is_empty() { 0 } else { (HEADER_LEN + 40) as u16 });
+        dst.put_u16_le(if self.input_buffer.is_empty() {
+            0
+        } else {
+            (HEADER_LEN + 40) as u16
+        });
         dst.put_u16_le(0);
         dst.put_u32_le(len_u32(self.input_buffer.len(), "input buffer too long")?);
         dst.put_u32_le(self.additional_information);
@@ -249,7 +267,9 @@ impl Message for QueryInfoResponse {
     }
 
     fn decode_body(msg: &Bytes) -> Result<Self> {
-        Ok(QueryInfoResponse { output_buffer: decode_buffer_response(msg, "QUERY_INFO response")? })
+        Ok(QueryInfoResponse {
+            output_buffer: decode_buffer_response(msg, "QUERY_INFO response")?,
+        })
     }
 }
 

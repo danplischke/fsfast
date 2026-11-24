@@ -53,7 +53,10 @@ pub enum CompressionTransform {
 }
 
 fn has_original_size(alg: CompressionAlgorithm) -> bool {
-    !matches!(alg, CompressionAlgorithm::NONE | CompressionAlgorithm::PATTERN_V1)
+    !matches!(
+        alg,
+        CompressionAlgorithm::NONE | CompressionAlgorithm::PATTERN_V1
+    )
 }
 
 impl CompressionTransform {
@@ -91,23 +94,37 @@ impl CompressionTransform {
             if has_original_size(algorithm) {
                 // Length covers the OriginalPayloadSize field too.
                 original_payload_size = Some(p.u32()?);
-                length = length.checked_sub(4).ok_or(ProtoError::malformed(W, "payload length too small"))?;
+                length = length
+                    .checked_sub(4)
+                    .ok_or(ProtoError::malformed(W, "payload length too small"))?;
             }
             let data_start = pos + p.pos();
             let data = slice_bytes(frame, data_start, length, W)?;
-            payloads.push(CompressedPayload { algorithm, flags, original_payload_size, data });
+            payloads.push(CompressedPayload {
+                algorithm,
+                flags,
+                original_payload_size,
+                data,
+            });
             pos = data_start + length;
         }
-        Ok(CompressionTransform::Chained { original_compressed_segment_size, payloads })
+        Ok(CompressionTransform::Chained {
+            original_compressed_segment_size,
+            payloads,
+        })
     }
 
     /// The decompressed size announced by the header.
     pub fn original_size(&self) -> u32 {
         match self {
-            CompressionTransform::Unchained { original_compressed_segment_size, .. }
-            | CompressionTransform::Chained { original_compressed_segment_size, .. } => {
-                *original_compressed_segment_size
+            CompressionTransform::Unchained {
+                original_compressed_segment_size,
+                ..
             }
+            | CompressionTransform::Chained {
+                original_compressed_segment_size,
+                ..
+            } => *original_compressed_segment_size,
         }
     }
 
@@ -118,7 +135,10 @@ impl CompressionTransform {
         let size = self.original_size() as usize;
         // Bound the allocation by the protocol's frame limit.
         if size > crate::framing::MAX_TRANSPORT_FRAME_LEN {
-            return Err(ProtoError::malformed(W, "decompressed size exceeds the frame limit"));
+            return Err(ProtoError::malformed(
+                W,
+                "decompressed size exceeds the frame limit",
+            ));
         }
         let mut out = BytesMut::with_capacity(size);
         let append = |alg: CompressionAlgorithm, data: &[u8], out: &mut BytesMut| -> Result<()> {
@@ -130,11 +150,18 @@ impl CompressionTransform {
                     r.skip(3)?;
                     let reps = r.u32()? as usize;
                     if out.len().saturating_add(reps) > size {
-                        return Err(ProtoError::malformed(W, "pattern exceeds the original size"));
+                        return Err(ProtoError::malformed(
+                            W,
+                            "pattern exceeds the original size",
+                        ));
                     }
                     out.put_bytes(pattern, reps);
                 }
-                _ => return Err(ProtoError::Unsupported("SMB compression algorithm (MS-XCA) not implemented")),
+                _ => {
+                    return Err(ProtoError::Unsupported(
+                        "SMB compression algorithm (MS-XCA) not implemented",
+                    ));
+                }
             }
             if out.len() > size {
                 return Err(ProtoError::malformed(W, "data exceeds the original size"));
@@ -142,7 +169,12 @@ impl CompressionTransform {
             Ok(())
         };
         match self {
-            CompressionTransform::Unchained { algorithm, uncompressed, compressed, .. } => {
+            CompressionTransform::Unchained {
+                algorithm,
+                uncompressed,
+                compressed,
+                ..
+            } => {
                 append(CompressionAlgorithm::NONE, uncompressed, &mut out)?;
                 append(*algorithm, compressed, &mut out)?;
             }
@@ -153,7 +185,10 @@ impl CompressionTransform {
             }
         }
         if out.len() != size {
-            return Err(ProtoError::malformed(W, "decompressed size does not match the header"));
+            return Err(ProtoError::malformed(
+                W,
+                "decompressed size does not match the header",
+            ));
         }
         Ok(out)
     }
@@ -163,7 +198,12 @@ impl CompressionTransform {
     pub fn encode(&self, dst: &mut BytesMut) -> Result<()> {
         dst.put_slice(&COMPRESSION_PROTOCOL_ID);
         match self {
-            CompressionTransform::Unchained { original_compressed_segment_size, algorithm, uncompressed, compressed } => {
+            CompressionTransform::Unchained {
+                original_compressed_segment_size,
+                algorithm,
+                uncompressed,
+                compressed,
+            } => {
                 dst.put_u32_le(*original_compressed_segment_size);
                 dst.put_u16_le(algorithm.0);
                 dst.put_u16_le(0);
@@ -171,11 +211,18 @@ impl CompressionTransform {
                 dst.put_slice(uncompressed);
                 dst.put_slice(compressed);
             }
-            CompressionTransform::Chained { original_compressed_segment_size, payloads } => {
+            CompressionTransform::Chained {
+                original_compressed_segment_size,
+                payloads,
+            } => {
                 dst.put_u32_le(*original_compressed_segment_size);
                 for (i, p) in payloads.iter().enumerate() {
                     dst.put_u16_le(p.algorithm.0);
-                    let flags = if i == 0 { p.flags | COMPRESSION_FLAG_CHAINED } else { p.flags };
+                    let flags = if i == 0 {
+                        p.flags | COMPRESSION_FLAG_CHAINED
+                    } else {
+                        p.flags
+                    };
                     dst.put_u16_le(flags);
                     match (has_original_size(p.algorithm), p.original_payload_size) {
                         (true, Some(n)) => {
@@ -183,7 +230,11 @@ impl CompressionTransform {
                             dst.put_u32_le(n);
                         }
                         (false, None) => dst.put_u32_le(len_u32(p.data.len(), "payload too long")?),
-                        _ => return Err(ProtoError::InvalidInput("OriginalPayloadSize does not match the algorithm")),
+                        _ => {
+                            return Err(ProtoError::InvalidInput(
+                                "OriginalPayloadSize does not match the algorithm",
+                            ));
+                        }
                     }
                     dst.put_slice(&p.data);
                 }

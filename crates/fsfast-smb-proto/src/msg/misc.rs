@@ -18,7 +18,6 @@ bitflags! {
     pub struct CloseFlags: u16 {
         /// Return the file's attributes in the response.
         const POSTQUERY_ATTRIB = 0x0001;
-        const _ = !0;
     }
 }
 
@@ -47,7 +46,10 @@ impl Message for CloseRequest {
         let mut r = body_reader(msg, "CLOSE request", 24)?;
         let flags = CloseFlags::from_bits_retain(r.u16()?);
         r.skip(4)?;
-        Ok(CloseRequest { flags, file_id: FileId::read(&mut r)? })
+        Ok(CloseRequest {
+            flags,
+            file_id: FileId::read(&mut r)?,
+        })
     }
 }
 
@@ -81,7 +83,12 @@ impl Message for CloseResponse {
         dst.put_u16_le(60);
         dst.put_u16_le(self.flags.bits());
         dst.put_u32_le(0);
-        for t in [self.creation_time, self.last_access_time, self.last_write_time, self.change_time] {
+        for t in [
+            self.creation_time,
+            self.last_access_time,
+            self.last_write_time,
+            self.change_time,
+        ] {
             dst.put_u64_le(t.0);
         }
         dst.put_u64_le(self.allocation_size);
@@ -129,7 +136,9 @@ impl Message for FlushRequest {
     fn decode_body(msg: &Bytes) -> Result<Self> {
         let mut r = body_reader(msg, "FLUSH request", 24)?;
         r.skip(6)?;
-        Ok(FlushRequest { file_id: FileId::read(&mut r)? })
+        Ok(FlushRequest {
+            file_id: FileId::read(&mut r)?,
+        })
     }
 }
 
@@ -167,7 +176,6 @@ bitflags! {
         const UNLOCK = 0x0000_0004;
         /// Fail immediately instead of waiting.
         const FAIL_IMMEDIATELY = 0x0000_0010;
-        const _ = !0;
     }
 }
 
@@ -200,7 +208,9 @@ impl Message for LockRequest {
 
     fn encode_body(&self, dst: &mut BytesMut) -> Result<()> {
         if self.locks.is_empty() {
-            return Err(ProtoError::InvalidInput("LOCK request needs at least one lock"));
+            return Err(ProtoError::InvalidInput(
+                "LOCK request needs at least one lock",
+            ));
         }
         dst.put_u16_le(48);
         dst.put_u16_le(len_u16(self.locks.len(), "too many locks")?);
@@ -226,9 +236,17 @@ impl Message for LockRequest {
             let length = r.u64()?;
             let flags = LockFlags::from_bits_retain(r.u32()?);
             r.skip(4)?;
-            locks.push(LockElement { offset, length, flags });
+            locks.push(LockElement {
+                offset,
+                length,
+                flags,
+            });
         }
-        Ok(LockRequest { lock_sequence, file_id, locks })
+        Ok(LockRequest {
+            lock_sequence,
+            file_id,
+            locks,
+        })
     }
 }
 
@@ -289,7 +307,6 @@ bitflags! {
         const HANDLE_CACHING = 0x0000_0002;
         /// Write caching.
         const WRITE_CACHING = 0x0000_0004;
-        const _ = !0;
     }
 }
 
@@ -426,11 +443,20 @@ impl BreakMessage {
     /// MessageId (`u64::MAX` marks unsolicited notifications).
     pub fn decode(raw: &RawMessage) -> Result<Self> {
         if raw.command() != Command::OPLOCK_BREAK {
-            return Err(ProtoError::UnexpectedCommand { expected: Command::OPLOCK_BREAK, actual: raw.command() });
+            return Err(ProtoError::UnexpectedCommand {
+                expected: Command::OPLOCK_BREAK,
+                actual: raw.command(),
+            });
         }
         let ss = match raw.body() {
             [a, b, ..] => u16::from_le_bytes([*a, *b]),
-            _ => return Err(ProtoError::Truncated { what: "OPLOCK_BREAK", need: 66, have: raw.bytes().len() }),
+            _ => {
+                return Err(ProtoError::Truncated {
+                    what: "OPLOCK_BREAK",
+                    need: 66,
+                    have: raw.bytes().len(),
+                });
+            }
         };
         let unsolicited = raw.header().message_id == crate::header::UNSOLICITED_MESSAGE_ID;
         Ok(match (ss, unsolicited) {
@@ -438,7 +464,12 @@ impl BreakMessage {
             (24, false) => BreakMessage::OplockResponse(raw.decode()?),
             (44, _) => BreakMessage::LeaseNotification(raw.decode()?),
             (36, _) => BreakMessage::LeaseResponse(raw.decode()?),
-            _ => return Err(ProtoError::malformed("OPLOCK_BREAK", "unknown StructureSize")),
+            _ => {
+                return Err(ProtoError::malformed(
+                    "OPLOCK_BREAK",
+                    "unknown StructureSize",
+                ));
+            }
         })
     }
 }

@@ -8,7 +8,10 @@ use crate::ctx::{CheckResult, Context, Ctx, expect_err};
 pub(crate) async fn rm_file(ctx: &Ctx) -> CheckResult {
     let f = ctx.path("victim");
     ctx.put(&f, Bytes::from_static(b"bye")).await?;
-    ctx.fs.rm_file(&f).await.ctx(format_args!("rm_file({f:?})"))?;
+    ctx.fs
+        .rm_file(&f)
+        .await
+        .ctx(format_args!("rm_file({f:?})"))?;
     ctx.expect_missing(&f).await?;
     expect_err(
         format!("rm_file({f:?}) of an already deleted file"),
@@ -58,15 +61,25 @@ pub(crate) async fn rm_files_batch(ctx: &Ctx) -> CheckResult {
     }
 
     let none = ctx.fs.rm_files(&[]).await;
-    ensure!(none.is_empty(), "rm_files([]) returned {} results", none.len());
+    ensure!(
+        none.is_empty(),
+        "rm_files([]) returned {} results",
+        none.len()
+    );
 
     // A larger batch, to exercise native batching / concurrency.
-    let many: Vec<String> = (0..120).map(|i| ctx.path(&format!("many/{i:04}"))).collect();
+    let many: Vec<String> = (0..120)
+        .map(|i| ctx.path(&format!("many/{i:04}")))
+        .collect();
     for p in &many {
         ctx.put(p, Bytes::from_static(b"m")).await?;
     }
     let results = ctx.fs.rm_files(&many).await;
-    ensure_eq!(results.len(), many.len(), "rm_files: number of results for a large batch");
+    ensure_eq!(
+        results.len(),
+        many.len(),
+        "rm_files: number of results for a large batch"
+    );
     for (p, r) in many.iter().zip(results) {
         r.ctx(format_args!("rm_files({p:?})"))?;
     }
@@ -75,7 +88,12 @@ pub(crate) async fn rm_files_batch(ctx: &Ctx) -> CheckResult {
         .find(&ctx.path("many"), &FindOptions::default())
         .await
         .ctx("find after rm_files")?;
-    ensure!(left.is_empty(), "{} files left after rm_files, e.g. {:?}", left.len(), left[0].name);
+    ensure!(
+        left.is_empty(),
+        "{} files left after rm_files, e.g. {:?}",
+        left.len(),
+        left[0].name
+    );
     Ok(())
 }
 
@@ -96,11 +114,16 @@ pub(crate) async fn cp_file(ctx: &Ctx) -> CheckResult {
     // Overwrite a larger existing destination: it must be truncated.
     let big = ctx.path("big.bin");
     ctx.put(&big, ctx.pattern(&big, 10_000)).await?;
-    ctx.fs
-        .cp_file(&src, &big)
-        .await
-        .ctx(format_args!("cp_file({src:?}, {big:?}) over an existing file"))?;
+    ctx.fs.cp_file(&src, &big).await.ctx(format_args!(
+        "cp_file({src:?}, {big:?}) over an existing file"
+    ))?;
     ctx.expect_content(&big, &data).await?;
+
+    // Onto itself: may succeed or fail (fsspec's local filesystem raises
+    // SameFileError, S3 refuses), but must never truncate or corrupt the
+    // file (a naive "open destination for writing, then read source").
+    let _ = ctx.fs.cp_file(&src, &src).await;
+    ctx.expect_content(&src, &data).await?;
 
     // Into a sub-directory.
     let nested = ctx.path("sub/dir/copy.bin");
@@ -147,10 +170,9 @@ pub(crate) async fn mv_file(ctx: &Ctx) -> CheckResult {
     let src2 = ctx.path("src2.bin");
     let data2 = ctx.pattern(&src2, 77);
     ctx.put(&src2, data2.clone()).await?;
-    ctx.fs
-        .mv_file(&src2, &dst)
-        .await
-        .ctx(format_args!("mv_file({src2:?}, {dst:?}) over an existing file"))?;
+    ctx.fs.mv_file(&src2, &dst).await.ctx(format_args!(
+        "mv_file({src2:?}, {dst:?}) over an existing file"
+    ))?;
     ctx.expect_missing(&src2).await?;
     ctx.expect_content(&dst, &data2).await?;
 
@@ -181,14 +203,16 @@ pub(crate) async fn mv_file(ctx: &Ctx) -> CheckResult {
 
 pub(crate) async fn touch(ctx: &Ctx) -> CheckResult {
     let p = ctx.path("touched");
-    ctx.fs.touch(&p, true).await.ctx(format_args!("touch({p:?}, truncate=true)"))?;
-    ctx.expect_file(&p, 0).await?;
-
-    ctx.put(&p, Bytes::from_static(b"some data")).await?;
     ctx.fs
         .touch(&p, true)
         .await
-        .ctx(format_args!("touch({p:?}, truncate=true) of a non-empty file"))?;
+        .ctx(format_args!("touch({p:?}, truncate=true)"))?;
+    ctx.expect_file(&p, 0).await?;
+
+    ctx.put(&p, Bytes::from_static(b"some data")).await?;
+    ctx.fs.touch(&p, true).await.ctx(format_args!(
+        "touch({p:?}, truncate=true) of a non-empty file"
+    ))?;
     ctx.expect_file(&p, 0).await?;
     ctx.expect_content(&p, b"").await?;
 
@@ -208,9 +232,8 @@ pub(crate) async fn touch(ctx: &Ctx) -> CheckResult {
 
     // Without truncation a missing file is created empty.
     let fresh = ctx.path("fresh");
-    ctx.fs
-        .touch(&fresh, false)
-        .await
-        .ctx(format_args!("touch({fresh:?}, truncate=false) of a missing file"))?;
+    ctx.fs.touch(&fresh, false).await.ctx(format_args!(
+        "touch({fresh:?}, truncate=false) of a missing file"
+    ))?;
     ctx.expect_file(&fresh, 0).await
 }

@@ -44,7 +44,7 @@ pub fn fill(seed: u64, offset: u64, buf: &mut [u8]) {
     let mut pos = offset;
     let mut i = 0;
     // Unaligned head, one byte at a time.
-    while i < buf.len() && pos % 8 != 0 {
+    while i < buf.len() && !pos.is_multiple_of(8) {
         buf[i] = byte_at(seed, pos);
         i += 1;
         pos += 1;

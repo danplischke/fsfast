@@ -12,7 +12,8 @@ use sha2::Sha256;
 /// `b"SMBSigningKey\0"`), so the input contains two zero bytes in a row.
 pub fn sp800_108_hmac_sha256(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
     let l_bits = (out.len() as u32).wrapping_mul(8).to_be_bytes();
-    let base = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    let base =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts keys of any length");
     for (i, chunk) in out.chunks_mut(32).enumerate() {
         let mut mac = base.clone();
         mac.update(&(i as u32 + 1).to_be_bytes());
@@ -51,6 +52,8 @@ mod tests {
     }
 
     fn hex(s: &[u8]) -> Vec<u8> {
-        s.chunks(2).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap()).collect()
+        s.chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
     }
 }

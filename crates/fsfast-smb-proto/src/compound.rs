@@ -48,7 +48,9 @@ pub struct CompoundBuilder {
 impl CompoundBuilder {
     /// An empty chain.
     pub fn new() -> Self {
-        CompoundBuilder { msgs: Vec::with_capacity(4) }
+        CompoundBuilder {
+            msgs: Vec::with_capacity(4),
+        }
     }
 
     /// Number of messages so far.
@@ -74,7 +76,9 @@ impl CompoundBuilder {
     /// chain, which can never be related.
     pub fn push_related<M: Message>(&mut self, mut header: Header, body: &M) -> Result<&mut Self> {
         if self.msgs.is_empty() {
-            return Err(ProtoError::InvalidInput("the first request of a compound cannot be related"));
+            return Err(ProtoError::InvalidInput(
+                "the first request of a compound cannot be related",
+            ));
         }
         header.flags.insert(HeaderFlags::RELATED_OPERATIONS);
         let m = encode_message(&header, body)?;
@@ -130,12 +134,18 @@ impl Iterator for CompoundIter {
             return Some(Ok(RawMessage::from_parts(header, self.frame.slice(pos..))));
         }
         if next < HEADER_LEN || next > rest.len() {
-            return Some(Err(ProtoError::malformed("compound response", "NextCommand out of range")));
+            return Some(Err(ProtoError::malformed(
+                "compound response",
+                "NextCommand out of range",
+            )));
         }
         if next < rest.len() {
             self.pos = Some(pos + next);
         }
-        Some(Ok(RawMessage::from_parts(header, self.frame.slice(pos..pos + next))))
+        Some(Ok(RawMessage::from_parts(
+            header,
+            self.frame.slice(pos..pos + next),
+        )))
     }
 }
 
@@ -151,7 +161,10 @@ pub fn split_compound(frame: Bytes) -> CompoundIter {
 /// set (cheap check without a full header decode).
 pub fn is_related(msg: &[u8]) -> bool {
     msg.get(FLAGS_OFFSET..FLAGS_OFFSET + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & HeaderFlags::RELATED_OPERATIONS.bits() != 0)
+        .map(|b| {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & HeaderFlags::RELATED_OPERATIONS.bits()
+                != 0
+        })
         .unwrap_or(false)
 }
 
@@ -172,18 +185,39 @@ mod tests {
         let mut b = CompoundBuilder::new();
         assert!(b.push_related(h, &EchoRequest).is_err());
         h.message_id = 1;
-        b.push(h, &CreateRequest { name: "x".into(), ..Default::default() }).unwrap();
+        b.push(
+            h,
+            &CreateRequest {
+                name: "x".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         h.message_id = 2;
-        b.push_related(h, &QueryInfoRequest::for_class::<FileNetworkOpenInformation>(FileId::RELATED, 56))
-            .unwrap();
+        b.push_related(
+            h,
+            &QueryInfoRequest::for_class::<FileNetworkOpenInformation>(FileId::RELATED, 56),
+        )
+        .unwrap();
         h.message_id = 3;
         b.push_related(
             h,
-            &WriteRequest { file_id: FileId::RELATED, data: Bytes::from_static(b"abc"), ..Default::default() },
+            &WriteRequest {
+                file_id: FileId::RELATED,
+                data: Bytes::from_static(b"abc"),
+                ..Default::default()
+            },
         )
         .unwrap();
         h.message_id = 4;
-        b.push_related(h, &CloseRequest { file_id: FileId::RELATED, ..Default::default() }).unwrap();
+        b.push_related(
+            h,
+            &CloseRequest {
+                file_id: FileId::RELATED,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let msgs = b.finish();
         assert_eq!(msgs.len(), 4);
         // The WRITE keeps its payload separate and pads after it.
@@ -193,9 +227,16 @@ mod tests {
         for m in &msgs {
             m.write_to(&mut frame);
         }
-        let parts: Vec<RawMessage> = split_compound(frame.freeze()).collect::<Result<_>>().unwrap();
+        let parts: Vec<RawMessage> = split_compound(frame.freeze())
+            .collect::<Result<_>>()
+            .unwrap();
         assert_eq!(parts.len(), 4);
-        assert!(!parts[0].header().flags.contains(HeaderFlags::RELATED_OPERATIONS));
+        assert!(
+            !parts[0]
+                .header()
+                .flags
+                .contains(HeaderFlags::RELATED_OPERATIONS)
+        );
         for (i, p) in parts.iter().enumerate() {
             assert_eq!(p.header().message_id, i as u64 + 1);
             assert_eq!(p.bytes().len(), msgs[i].len());

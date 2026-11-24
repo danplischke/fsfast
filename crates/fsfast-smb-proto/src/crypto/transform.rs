@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aes::cipher::{BlockCipherEncrypt, InnerIvInit, StreamCipher};
 use aes::{Aes128, Aes256};
 use aes_gcm::aead::consts::{U11, U16};
 use aes_gcm::aead::inout::InOutBuf;
@@ -17,6 +18,9 @@ use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use bytes::{BufMut, BytesMut};
 use ccm::Ccm;
+use ghash::GHash;
+use ghash::universal_hash::UniversalHash;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::error::{ProtoError, Result};
@@ -126,7 +130,13 @@ impl TransformHeader {
         r.skip(2)?;
         let flags = r.u16()?;
         let session_id = r.u64()?;
-        Ok(TransformHeader { signature, nonce, original_message_size, flags, session_id })
+        Ok(TransformHeader {
+            signature,
+            nonce,
+            original_message_size,
+            flags,
+            session_id,
+        })
     }
 }
 
@@ -139,13 +149,21 @@ enum Aead {
 
 /// A keyed SMB cipher for one direction of one session.
 ///
-/// Nonces are generated as a random per-key prefix followed by a 64-bit
-/// counter, so they never repeat for the lifetime of the key (random 96-bit
-/// nonces would only be unique with high probability). The counter is
-/// atomic, so one `SmbCipher` can be shared by concurrent senders.
+/// Nonces are a random per-instance prefix (32 bits for GCM, 24 bits for
+/// CCM) followed by a 64-bit counter that starts at a random value below
+/// 2^63 and only ever increments, so one instance never repeats a nonce
+/// (it fails instead of wrapping). The random counter start also keeps
+/// nonces apart when several instances exist for the same key, even if
+/// their prefixes collide. Still, create exactly one encrypting
+/// `SmbCipher` per session and share it: the counter is atomic, so
+/// concurrent senders and all channels of a multichannel session (which
+/// share `Session.EncryptionKey`) can use the same instance.
 pub struct SmbCipher {
     cipher: Cipher,
     aead: Aead,
+    /// Expanded AES key and GHASH key for [`SmbCipher::decrypt_into_parts`]
+    /// (GCM only; the `aes-gcm` crate does not expose its internals).
+    gcm: Option<Box<GcmParts>>,
     nonce_prefix: [u8; 4],
     counter: AtomicU64,
     _key: Zeroizing<Vec<u8>>,
@@ -153,7 +171,9 @@ pub struct SmbCipher {
 
 impl std::fmt::Debug for SmbCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SmbCipher").field("cipher", &self.cipher).finish_non_exhaustive()
+        f.debug_struct("SmbCipher")
+            .field("cipher", &self.cipher)
+            .finish_non_exhaustive()
     }
 }
 
@@ -161,18 +181,51 @@ impl SmbCipher {
     /// Key a cipher. `key` must be [`Cipher::key_len`] bytes.
     pub fn new(cipher: Cipher, key: &[u8]) -> Result<Self> {
         if key.len() != cipher.key_len() {
-            return Err(ProtoError::InvalidInput("encryption key length does not match the cipher"));
+            return Err(ProtoError::InvalidInput(
+                "encryption key length does not match the cipher",
+            ));
         }
         let bad = |_| ProtoError::InvalidInput("bad encryption key");
         let aead = match cipher {
-            Cipher::Aes128Ccm => Aead::Ccm128(Box::new(Aes128Ccm::new_from_slice(key).map_err(bad)?)),
-            Cipher::Aes128Gcm => Aead::Gcm128(Box::new(Aes128Gcm::new_from_slice(key).map_err(bad)?)),
-            Cipher::Aes256Ccm => Aead::Ccm256(Box::new(Aes256Ccm::new_from_slice(key).map_err(bad)?)),
-            Cipher::Aes256Gcm => Aead::Gcm256(Box::new(Aes256Gcm::new_from_slice(key).map_err(bad)?)),
+            Cipher::Aes128Ccm => {
+                Aead::Ccm128(Box::new(Aes128Ccm::new_from_slice(key).map_err(bad)?))
+            }
+            Cipher::Aes128Gcm => {
+                Aead::Gcm128(Box::new(Aes128Gcm::new_from_slice(key).map_err(bad)?))
+            }
+            Cipher::Aes256Ccm => {
+                Aead::Ccm256(Box::new(Aes256Ccm::new_from_slice(key).map_err(bad)?))
+            }
+            Cipher::Aes256Gcm => {
+                Aead::Gcm256(Box::new(Aes256Gcm::new_from_slice(key).map_err(bad)?))
+            }
         };
+        let gcm = match cipher {
+            Cipher::Aes128Gcm => Some(Box::new(GcmParts::A128(GcmKey::new(
+                <Aes128 as aes::cipher::KeyInit>::new_from_slice(key).map_err(bad)?,
+            )))),
+            Cipher::Aes256Gcm => Some(Box::new(GcmParts::A256(GcmKey::new(
+                <Aes256 as aes::cipher::KeyInit>::new_from_slice(key).map_err(bad)?,
+            )))),
+            Cipher::Aes128Ccm | Cipher::Aes256Ccm => None,
+        };
+        let mut seed = [0u8; 12];
+        super::random_bytes(&mut seed);
         let mut nonce_prefix = [0u8; 4];
-        super::random_bytes(&mut nonce_prefix);
-        Ok(SmbCipher { cipher, aead, nonce_prefix, counter: AtomicU64::new(1), _key: Zeroizing::new(key.to_vec()) })
+        nonce_prefix.copy_from_slice(&seed[..4]);
+        let mut start = [0u8; 8];
+        start.copy_from_slice(&seed[4..]);
+        // Below 2^63, so exhausting the counter takes at least 2^63
+        // messages; never 0.
+        let start = (u64::from_le_bytes(start) >> 1).max(1);
+        Ok(SmbCipher {
+            cipher,
+            aead,
+            gcm,
+            nonce_prefix,
+            counter: AtomicU64::new(start),
+            _key: Zeroizing::new(key.to_vec()),
+        })
     }
 
     /// The cipher.
@@ -182,10 +235,13 @@ impl SmbCipher {
 
     /// The next unique nonce (zero-padded to 16 bytes).
     pub fn next_nonce(&self) -> Result<[u8; 16]> {
-        let c = self.counter.fetch_add(1, Ordering::Relaxed);
-        if c == u64::MAX {
-            return Err(ProtoError::InvalidInput("nonce space exhausted; re-key the session"));
-        }
+        // `fetch_update` with `checked_add` never wraps: once the counter
+        // reaches u64::MAX every later call fails, instead of `fetch_add`
+        // silently restarting at 0 and reusing nonces.
+        let c = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(1))
+            .map_err(|_| ProtoError::InvalidInput("nonce space exhausted; re-key the session"))?;
         let mut n = [0u8; 16];
         match self.cipher.nonce_len() {
             11 => {
@@ -215,13 +271,18 @@ impl SmbCipher {
 
     /// Encrypt with an explicit nonce (only the first 11/12 bytes are used;
     /// the rest must be zero). Deterministic; for tests and interop vectors.
-    pub fn encrypt_with_nonce(&self, session_id: u64, nonce: &[u8; 16], parts: &[&[u8]]) -> Result<BytesMut> {
+    pub fn encrypt_with_nonce(
+        &self,
+        session_id: u64,
+        nonce: &[u8; 16],
+        parts: &[&[u8]],
+    ) -> Result<BytesMut> {
         if nonce[self.cipher.nonce_len()..].iter().any(|&b| b != 0) {
             return Err(ProtoError::InvalidInput("nonce padding must be zero"));
         }
         let len: usize = parts.iter().map(|p| p.len()).sum();
-        let original_message_size =
-            u32::try_from(len).map_err(|_| ProtoError::InvalidInput("message too large to encrypt"))?;
+        let original_message_size = u32::try_from(len)
+            .map_err(|_| ProtoError::InvalidInput("message too large to encrypt"))?;
         let hdr = TransformHeader {
             signature: [0; 16],
             nonce: *nonce,
@@ -261,7 +322,10 @@ impl SmbCipher {
         let hdr = self.check_header(frame)?;
         let ct = &frame[TRANSFORM_HEADER_LEN..];
         if out.len() < ct.len() {
-            return Err(ProtoError::BufferTooSmall { need: ct.len(), have: out.len() });
+            return Err(ProtoError::BufferTooSmall {
+                need: ct.len(),
+                have: out.len(),
+            });
         }
         let dst = &mut out[..ct.len()];
         let buf = InOutBuf::new(ct, dst).expect("equal lengths");
@@ -275,6 +339,47 @@ impl SmbCipher {
         Ok((hdr, ct.len()))
     }
 
+    /// Verify and decrypt a transform message into several caller buffers,
+    /// filled in order, without modifying `frame`. Returns the header and
+    /// the plaintext length; buffer space beyond it is left untouched.
+    ///
+    /// This is how a READ response lands directly in the caller's memory:
+    /// pass a small scratch buffer for the SMB2 header and READ response
+    /// body (`OriginalMessageSize - DataLength`, normally 80 bytes) and the
+    /// destination slice for the data.
+    ///
+    /// With AES-GCM the tag is verified over the ciphertext *before* any
+    /// plaintext is written, and the plaintext is produced in one pass
+    /// straight into the outputs. AES-CCM authenticates the plaintext, so it
+    /// decrypts into a scratch buffer and copies (one extra copy). Either
+    /// way the outputs are untouched when authentication fails.
+    pub fn decrypt_into_parts(
+        &self,
+        frame: &[u8],
+        outputs: &mut [&mut [u8]],
+    ) -> Result<(TransformHeader, usize)> {
+        let hdr = self.check_header(frame)?;
+        let ct = &frame[TRANSFORM_HEADER_LEN..];
+        let have: usize = outputs.iter().map(|o| o.len()).sum();
+        if have < ct.len() {
+            return Err(ProtoError::BufferTooSmall {
+                need: ct.len(),
+                have,
+            });
+        }
+        let aad = &frame[AAD_OFFSET..TRANSFORM_HEADER_LEN];
+        match self.gcm.as_deref() {
+            Some(GcmParts::A128(k)) => k.open_into(&hdr, aad, ct, outputs)?,
+            Some(GcmParts::A256(k)) => k.open_into(&hdr, aad, ct, outputs)?,
+            None => {
+                let mut scratch = Zeroizing::new(vec![0u8; ct.len()]);
+                self.decrypt_into(frame, &mut scratch)?;
+                scatter(&scratch, outputs);
+            }
+        }
+        Ok((hdr, ct.len()))
+    }
+
     fn seal(&self, nonce: &[u8; 16], aad: &[u8], buf: InOutBuf<'_, '_, u8>) -> Result<[u8; 16]> {
         let n = &nonce[..self.cipher.nonce_len()];
         match &self.aead {
@@ -285,7 +390,13 @@ impl SmbCipher {
         }
     }
 
-    fn open(&self, nonce: &[u8; 16], aad: &[u8], buf: InOutBuf<'_, '_, u8>, tag: &[u8; 16]) -> Result<()> {
+    fn open(
+        &self,
+        nonce: &[u8; 16],
+        aad: &[u8],
+        buf: InOutBuf<'_, '_, u8>,
+        tag: &[u8; 16],
+    ) -> Result<()> {
         let n = &nonce[..self.cipher.nonce_len()];
         match &self.aead {
             Aead::Ccm128(a) => open_with(&**a, n, aad, buf, tag),
@@ -298,12 +409,103 @@ impl SmbCipher {
     fn check_header(&self, frame: &[u8]) -> Result<TransformHeader> {
         let hdr = TransformHeader::decode(frame)?;
         if hdr.flags != TRANSFORM_FLAG_ENCRYPTED {
-            return Err(ProtoError::malformed("TRANSFORM_HEADER", "flags must be 0x0001"));
+            return Err(ProtoError::malformed(
+                "TRANSFORM_HEADER",
+                "flags must be 0x0001",
+            ));
         }
         if hdr.original_message_size as usize != frame.len() - TRANSFORM_HEADER_LEN {
-            return Err(ProtoError::malformed("TRANSFORM_HEADER", "OriginalMessageSize does not match the frame"));
+            return Err(ProtoError::malformed(
+                "TRANSFORM_HEADER",
+                "OriginalMessageSize does not match the frame",
+            ));
         }
         Ok(hdr)
+    }
+}
+
+/// Copy `src` into consecutive output buffers.
+fn scatter(mut src: &[u8], outputs: &mut [&mut [u8]]) {
+    for out in outputs.iter_mut() {
+        if src.is_empty() {
+            break;
+        }
+        let n = out.len().min(src.len());
+        out[..n].copy_from_slice(&src[..n]);
+        src = &src[n..];
+    }
+}
+
+enum GcmParts {
+    A128(GcmKey<Aes128>),
+    A256(GcmKey<Aes256>),
+}
+
+/// AES-GCM with a 96-bit nonce, decomposed into GHASH and CTR so that
+/// authentication and decryption can run against non-contiguous outputs
+/// (NIST SP 800-38D §7.2).
+struct GcmKey<C> {
+    aes: C,
+    ghash: GHash,
+}
+
+impl<C: BlockCipherEncrypt<BlockSize = aes::cipher::consts::U16> + Clone> GcmKey<C> {
+    fn new(aes: C) -> Self {
+        let mut h = ghash::Block::default();
+        aes.encrypt_block(&mut h);
+        GcmKey {
+            ghash: GHash::new(&h),
+            aes,
+        }
+    }
+
+    fn open_into(
+        &self,
+        hdr: &TransformHeader,
+        aad: &[u8],
+        ct: &[u8],
+        outputs: &mut [&mut [u8]],
+    ) -> Result<()> {
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&hdr.nonce[..12]);
+        // Tag = E(K, J0) xor GHASH(H, A || C || len(A) || len(C)).
+        let mut g = self.ghash.clone();
+        g.update_padded(aad);
+        g.update_padded(ct);
+        let mut lens = ghash::Block::default();
+        lens[..8].copy_from_slice(&((aad.len() as u64) * 8).to_be_bytes());
+        lens[8..].copy_from_slice(&((ct.len() as u64) * 8).to_be_bytes());
+        g.update(std::slice::from_ref(&lens));
+        let s = g.finalize();
+        let mut j0 = ghash::Block::default();
+        j0[..12].copy_from_slice(&nonce);
+        j0[15] = 1;
+        self.aes.encrypt_block(&mut j0);
+        let mut tag = [0u8; 16];
+        for (t, (a, b)) in tag.iter_mut().zip(s.iter().zip(j0.iter())) {
+            *t = a ^ b;
+        }
+        if !bool::from(tag.ct_eq(&hdr.signature)) {
+            return Err(ProtoError::DecryptFailed);
+        }
+        // Authentic: decrypt with the counter starting at inc32(J0).
+        let mut iv = ghash::Block::default();
+        iv[..12].copy_from_slice(&nonce);
+        iv[15] = 2;
+        let core = ctr::CtrCore::<C, ctr::flavors::Ctr32BE>::inner_iv_init(self.aes.clone(), &iv);
+        let mut ctr = ctr::Ctr32BE::<C>::from_core(core);
+        let mut src = ct;
+        for out in outputs.iter_mut() {
+            if src.is_empty() {
+                break;
+            }
+            let n = out.len().min(src.len());
+            // Equal lengths by construction; a 32-bit block counter covers
+            // 64 GiB, far beyond the 16 MiB frame limit.
+            ctr.apply_keystream_b2b(&src[..n], &mut out[..n]);
+            src = &src[n..];
+        }
+        Ok(())
     }
 }
 
@@ -313,8 +515,11 @@ fn seal_with<A: AeadInOut<TagSize = U16>>(
     aad: &[u8],
     buf: InOutBuf<'_, '_, u8>,
 ) -> Result<[u8; 16]> {
-    let nonce = aes_gcm::aead::Nonce::<A>::try_from(nonce).expect("nonce length matches the cipher");
-    let tag = a.encrypt_inout_detached(&nonce, aad, buf).map_err(|_| ProtoError::InvalidInput("message too large to encrypt"))?;
+    let nonce =
+        aes_gcm::aead::Nonce::<A>::try_from(nonce).expect("nonce length matches the cipher");
+    let tag = a
+        .encrypt_inout_detached(&nonce, aad, buf)
+        .map_err(|_| ProtoError::InvalidInput("message too large to encrypt"))?;
     let mut t = [0u8; 16];
     t.copy_from_slice(&tag);
     Ok(t)
@@ -327,9 +532,11 @@ fn open_with<A: AeadInOut<TagSize = U16>>(
     buf: InOutBuf<'_, '_, u8>,
     tag: &[u8; 16],
 ) -> Result<()> {
-    let nonce = aes_gcm::aead::Nonce::<A>::try_from(nonce).expect("nonce length matches the cipher");
+    let nonce =
+        aes_gcm::aead::Nonce::<A>::try_from(nonce).expect("nonce length matches the cipher");
     let tag = aes_gcm::aead::Tag::<A>::from(*tag);
-    a.decrypt_inout_detached(&nonce, aad, buf, &tag).map_err(|_| ProtoError::DecryptFailed)
+    a.decrypt_inout_detached(&nonce, aad, buf, &tag)
+        .map_err(|_| ProtoError::DecryptFailed)
 }
 
 #[cfg(test)]
@@ -337,7 +544,12 @@ mod tests {
     use super::*;
 
     fn all() -> [Cipher; 4] {
-        [Cipher::Aes128Ccm, Cipher::Aes128Gcm, Cipher::Aes256Ccm, Cipher::Aes256Gcm]
+        [
+            Cipher::Aes128Ccm,
+            Cipher::Aes128Gcm,
+            Cipher::Aes256Ccm,
+            Cipher::Aes256Gcm,
+        ]
     }
 
     #[test]
@@ -362,10 +574,60 @@ mod tests {
             for idx in [TRANSFORM_HEADER_LEN + 3, 5, 44] {
                 let mut bad = frame.clone();
                 bad[idx] ^= 0x80;
-                assert!(dec.decrypt_in_place(bad.clone()).is_err(), "{c:?} idx {idx}");
+                assert!(
+                    dec.decrypt_in_place(bad.clone()).is_err(),
+                    "{c:?} idx {idx}"
+                );
                 let mut out = vec![0xEEu8; msg.len()];
                 assert!(dec.decrypt_into(&bad, &mut out).is_err());
-                assert!(out.iter().all(|&b| b == 0), "plaintext must be wiped on failure");
+                assert!(
+                    out.iter().all(|&b| b == 0),
+                    "plaintext must be wiped on failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decrypt_into_parts_all_ciphers_and_splits() {
+        for c in all() {
+            let key: Vec<u8> = (0..c.key_len() as u8).collect();
+            let k = SmbCipher::new(c, &key).unwrap();
+            for len in [0usize, 1, 15, 16, 17, 80, 81, 1000, 4096 + 80] {
+                let msg: Vec<u8> = (0..len).map(|i| (i * 7 % 256) as u8).collect();
+                let frame = k.encrypt(9, &[&msg]).unwrap();
+                for split in [0usize, 1, 16, 33, 80, len / 2, len] {
+                    let split = split.min(len);
+                    let mut head = vec![0xEEu8; split];
+                    let mut data = vec![0xEEu8; len - split + 3];
+                    let (h, n) = k
+                        .decrypt_into_parts(&frame, &mut [&mut head, &mut data])
+                        .unwrap();
+                    assert_eq!((h.session_id, n), (9, len));
+                    assert_eq!(head, &msg[..split], "{c:?} len {len} split {split}");
+                    assert_eq!(&data[..len - split], &msg[split..]);
+                    assert_eq!(&data[len - split..], &[0xEE; 3], "spare space untouched");
+                }
+                // Too small.
+                let mut small = vec![0u8; len.saturating_sub(1)];
+                if len > 0 {
+                    assert!(matches!(
+                        k.decrypt_into_parts(&frame, &mut [&mut small]),
+                        Err(ProtoError::BufferTooSmall { .. })
+                    ));
+                }
+                // Tampering is detected before anything reaches the outputs.
+                let mut bad = frame.to_vec();
+                let i = bad.len() - 1;
+                bad[i] ^= 1;
+                let mut out = vec![0xEEu8; len];
+                if len > 0 {
+                    assert_eq!(
+                        k.decrypt_into_parts(&bad, &mut [&mut out]),
+                        Err(ProtoError::DecryptFailed)
+                    );
+                    assert!(out.iter().all(|&b| b == 0xEE), "{c:?}");
+                }
             }
         }
     }
@@ -383,13 +645,54 @@ mod tests {
     }
 
     #[test]
+    fn nonces_unique_across_instances_even_if_prefixes_collide() {
+        // Two SmbCiphers for one key (e.g. one per channel of a
+        // multichannel session, or rebuilt after re-authentication) pick
+        // random prefixes; CCM's 24-bit prefix collides with probability
+        // 2^-24 per pair. Even then the nonce sequences must not overlap.
+        for c in all() {
+            let key = vec![7u8; c.key_len()];
+            let mut a = SmbCipher::new(c, &key).unwrap();
+            let mut b = SmbCipher::new(c, &key).unwrap();
+            a.nonce_prefix = [1, 2, 3, 4];
+            b.nonce_prefix = [1, 2, 3, 4];
+            let seen: std::collections::HashSet<[u8; 16]> =
+                (0..1000).map(|_| a.next_nonce().unwrap()).collect();
+            assert_eq!(seen.len(), 1000);
+            for _ in 0..1000 {
+                assert!(
+                    !seen.contains(&b.next_nonce().unwrap()),
+                    "{c:?} nonce reuse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nonce_exhaustion_is_permanent() {
+        let c = SmbCipher::new(Cipher::Aes128Gcm, &[0; 16]).unwrap();
+        c.counter.store(u64::MAX - 1, Ordering::Relaxed);
+        let last = c.next_nonce().unwrap();
+        assert_eq!(&last[4..12], &(u64::MAX - 1).to_le_bytes());
+        // Once exhausted the counter must not wrap around and hand out
+        // nonces that were already used.
+        for _ in 0..3 {
+            assert!(c.next_nonce().is_err());
+            assert!(c.encrypt(1, &[b"x"]).is_err());
+        }
+    }
+
+    #[test]
     fn header_checks() {
         let c = SmbCipher::new(Cipher::Aes128Gcm, &[0; 16]).unwrap();
         let mut f = c.encrypt(1, &[b"hello"]).unwrap();
         f.truncate(f.len() - 1);
         assert!(c.decrypt_in_place(f).is_err());
         assert!(SmbCipher::new(Cipher::Aes256Gcm, &[0; 16]).is_err());
-        assert_eq!(Cipher::from_id(Cipher::Aes256Ccm.id()), Some(Cipher::Aes256Ccm));
+        assert_eq!(
+            Cipher::from_id(Cipher::Aes256Ccm.id()),
+            Some(Cipher::Aes256Ccm)
+        );
         assert_eq!(Cipher::from_id(CipherId(0)), None);
     }
 }

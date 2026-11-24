@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4dbc3e1aafe3def2f26fd43c39e6bcbcd4b2eecfd9392c45f92aa4836e8f775c # shrinks to size = 2637, mode = Blocks(BlockCacheConfig { block_size: Some(124), max_blocks: 3, prefetch: false }), request = 137, conc = 5, max_ra = 1926, budget_bytes = 1202, ops = [ClearFault, Read(Some(66)), SetFault(1299), Sleep(5), Read(Some(86)), ClearFault, ClearFault, Read(Some(94)), CancelRead(None, 1), Seek(End(-3598)), Seek(Current(-68)), Read(None), SetFault(1551), Seek(Start(2078)), Read(Some(283)), CancelRead(Some(2668), 8), CancelRead(None, 3), Read(None), ReadInto(5), Sleep(4), ReadInto(293), Read(Some(216)), CancelReadInto(1675, 12), ClearFault, Read(Some(266)), CancelRead(None, 1), CancelReadInto(1369, 13), ReadInto(365), ReadInto(272), Seek(Start(1670)), Seek(Current(-182))]

@@ -82,13 +82,34 @@ struct Layout {
 
 fn layout(class: FileInfoClass) -> Option<Layout> {
     Some(match class {
-        FileInfoClass::DIRECTORY => Layout { fixed: 64, full: true },
-        FileInfoClass::FULL_DIRECTORY => Layout { fixed: 68, full: true },
-        FileInfoClass::BOTH_DIRECTORY => Layout { fixed: 94, full: true },
-        FileInfoClass::ID_BOTH_DIRECTORY => Layout { fixed: 104, full: true },
-        FileInfoClass::ID_FULL_DIRECTORY => Layout { fixed: 80, full: true },
-        FileInfoClass::ID_EXTD_DIRECTORY => Layout { fixed: 88, full: true },
-        FileInfoClass::NAMES => Layout { fixed: 12, full: false },
+        FileInfoClass::DIRECTORY => Layout {
+            fixed: 64,
+            full: true,
+        },
+        FileInfoClass::FULL_DIRECTORY => Layout {
+            fixed: 68,
+            full: true,
+        },
+        FileInfoClass::BOTH_DIRECTORY => Layout {
+            fixed: 94,
+            full: true,
+        },
+        FileInfoClass::ID_BOTH_DIRECTORY => Layout {
+            fixed: 104,
+            full: true,
+        },
+        FileInfoClass::ID_FULL_DIRECTORY => Layout {
+            fixed: 80,
+            full: true,
+        },
+        FileInfoClass::ID_EXTD_DIRECTORY => Layout {
+            fixed: 88,
+            full: true,
+        },
+        FileInfoClass::NAMES => Layout {
+            fixed: 12,
+            full: false,
+        },
         _ => return None,
     })
 }
@@ -117,7 +138,14 @@ impl DirectoryEntries {
     pub fn new(class: FileInfoClass, buf: Bytes) -> Result<Self> {
         let l = layout(class).ok_or(ProtoError::Unsupported("directory information class"))?;
         let pos = (!buf.is_empty()).then_some(0);
-        Ok(DirectoryEntries { class, fixed: l.fixed, full: l.full, buf, pos, pending_error: None })
+        Ok(DirectoryEntries {
+            class,
+            fixed: l.fixed,
+            full: l.full,
+            buf,
+            pos,
+            pending_error: None,
+        })
     }
 
     /// The information class being decoded.
@@ -130,10 +158,17 @@ impl DirectoryEntries {
         let rest = &self.buf[pos..];
         let mut r = Reader::new(rest, W);
         if rest.len() < self.fixed {
-            return Err(ProtoError::Truncated { what: W, need: pos + self.fixed, have: self.buf.len() });
+            return Err(ProtoError::Truncated {
+                what: W,
+                need: pos + self.fixed,
+                have: self.buf.len(),
+            });
         }
         let next = r.u32()? as usize;
-        let mut e = DirEntry { file_index: r.u32()?, ..Default::default() };
+        let mut e = DirEntry {
+            file_index: r.u32()?,
+            ..Default::default()
+        };
         let name_len;
         if self.full {
             e.creation_time = FileTime(r.u64()?);
@@ -153,8 +188,9 @@ impl DirectoryEntries {
                     r.skip(1)?;
                     let short_start = pos + r.pos();
                     r.skip(24)?;
-                    e.short_name =
-                        Some(Utf16Name::from_wire(self.buf.slice(short_start..short_start + short_len)));
+                    e.short_name = Some(Utf16Name::from_wire(
+                        self.buf.slice(short_start..short_start + short_len),
+                    ));
                     if self.class == FileInfoClass::ID_BOTH_DIRECTORY {
                         r.skip(2)?;
                         e.file_id = Some(r.u64()?);
@@ -180,7 +216,11 @@ impl DirectoryEntries {
         let name_end = name_start
             .checked_add(name_len)
             .filter(|&end| end <= self.buf.len())
-            .ok_or(ProtoError::Truncated { what: W, need: name_start.saturating_add(name_len), have: self.buf.len() })?;
+            .ok_or(ProtoError::Truncated {
+                what: W,
+                need: name_start.saturating_add(name_len),
+                have: self.buf.len(),
+            })?;
         e.file_name = Utf16Name::from_wire(self.buf.slice(name_start..name_end));
         Ok((e, next))
     }
@@ -203,8 +243,10 @@ impl Iterator for DirectoryEntries {
                     match pos.checked_add(next) {
                         Some(n) if next >= self.fixed && n < self.buf.len() => self.pos = Some(n),
                         _ => {
-                            self.pending_error =
-                                Some(ProtoError::malformed("directory entry", "NextEntryOffset out of range"))
+                            self.pending_error = Some(ProtoError::malformed(
+                                "directory entry",
+                                "NextEntryOffset out of range",
+                            ))
                         }
                     }
                 }
@@ -217,7 +259,11 @@ impl Iterator for DirectoryEntries {
 
 /// Encode `entries` as a QUERY_DIRECTORY output buffer of `class`
 /// (entries 8-byte aligned). Used by mock servers and tests.
-pub fn encode_directory_entries(class: FileInfoClass, entries: &[DirEntry], dst: &mut BytesMut) -> Result<()> {
+pub fn encode_directory_entries(
+    class: FileInfoClass,
+    entries: &[DirEntry],
+    dst: &mut BytesMut,
+) -> Result<()> {
     let l = layout(class).ok_or(ProtoError::Unsupported("directory information class"))?;
     let base = dst.len();
     for (i, e) in entries.iter().enumerate() {
@@ -226,7 +272,12 @@ pub fn encode_directory_entries(class: FileInfoClass, entries: &[DirEntry], dst:
         dst.put_u32_le(e.file_index);
         let name_len = len_u32(e.file_name.len(), "file name too long")?;
         if l.full {
-            for t in [e.creation_time, e.last_access_time, e.last_write_time, e.change_time] {
+            for t in [
+                e.creation_time,
+                e.last_access_time,
+                e.last_write_time,
+                e.change_time,
+            ] {
                 dst.put_u64_le(t.0);
             }
             dst.put_u64_le(e.end_of_file);
@@ -238,7 +289,11 @@ pub fn encode_directory_entries(class: FileInfoClass, entries: &[DirEntry], dst:
                 FileInfoClass::FULL_DIRECTORY => dst.put_u32_le(e.ea_size),
                 FileInfoClass::BOTH_DIRECTORY | FileInfoClass::ID_BOTH_DIRECTORY => {
                     dst.put_u32_le(e.ea_size);
-                    let short = e.short_name.as_ref().map(|s| &s.as_bytes()[..s.len().min(24)]).unwrap_or(&[]);
+                    let short = e
+                        .short_name
+                        .as_ref()
+                        .map(|s| &s.as_bytes()[..s.len().min(24)])
+                        .unwrap_or(&[]);
                     dst.put_u8(short.len() as u8);
                     dst.put_u8(0);
                     dst.put_slice(short);
@@ -318,7 +373,10 @@ mod tests {
             }
             FileInfoClass::NAMES => {
                 for e in [&mut a, &mut b] {
-                    *e = DirEntry { file_name: e.file_name.clone(), ..Default::default() };
+                    *e = DirEntry {
+                        file_name: e.file_name.clone(),
+                        ..Default::default()
+                    };
                 }
             }
             _ => {}
@@ -368,10 +426,17 @@ mod tests {
     #[test]
     fn bad_next_offset_reports_error() {
         let mut b = BytesMut::new();
-        encode_directory_entries(FileInfoClass::DIRECTORY, &sample(FileInfoClass::DIRECTORY), &mut b).unwrap();
+        encode_directory_entries(
+            FileInfoClass::DIRECTORY,
+            &sample(FileInfoClass::DIRECTORY),
+            &mut b,
+        )
+        .unwrap();
         // Point the first entry's NextEntryOffset at itself (+1).
         patch_u32(&mut b, 0, 1);
-        let items: Vec<_> = DirectoryEntries::new(FileInfoClass::DIRECTORY, b.freeze()).unwrap().collect();
+        let items: Vec<_> = DirectoryEntries::new(FileInfoClass::DIRECTORY, b.freeze())
+            .unwrap()
+            .collect();
         assert_eq!(items.len(), 2);
         assert!(items[0].is_ok());
         assert!(items[1].is_err());
@@ -380,6 +445,11 @@ mod tests {
     #[test]
     fn unsupported_class() {
         assert!(DirectoryEntries::new(FileInfoClass::BASIC, Bytes::new()).is_err());
-        assert_eq!(DirectoryEntries::new(FileInfoClass::DIRECTORY, Bytes::new()).unwrap().count(), 0);
+        assert_eq!(
+            DirectoryEntries::new(FileInfoClass::DIRECTORY, Bytes::new())
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

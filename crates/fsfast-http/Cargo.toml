@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-http"
+description = "fsspec-compatible HTTP(S) filesystem for fsfast"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,26 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+fsfast-http-transport.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# fsspec's link regexes need Unicode `\s`.
+regex = "1"
+# Decoding index pages in non-UTF-8 charsets, as aiohttp's `text()` does.
+encoding_rs = "0.8"
+httpdate = "1"
+
+[dev-dependencies]
+fsfast-testkit.workspace = true
+fsfast-local.workspace = true
+parking_lot.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+proptest = "1.5"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

@@ -77,7 +77,9 @@ pub fn derive_session_keys(
     session_key[..n].copy_from_slice(&full_session_key[..n]);
 
     if dialect.is_3_1_1() {
-        let h = preauth_hash.ok_or(ProtoError::InvalidInput("SMB 3.1.1 key derivation needs the preauth hash"))?;
+        let h = preauth_hash.ok_or(ProtoError::InvalidInput(
+            "SMB 3.1.1 key derivation needs the preauth hash",
+        ))?;
         let signing_key = kdf16(session_key.as_ref(), b"SMBSigningKey\0", h);
         let application_key = kdf16(session_key.as_ref(), b"SMBAppKey\0", h);
         let (kdk, len): (&[u8], usize) = match cipher {
@@ -95,8 +97,18 @@ pub fn derive_session_keys(
         let signing_key = kdf16(session_key.as_ref(), b"SMB2AESCMAC\0", b"SmbSign\0");
         let application_key = kdf16(session_key.as_ref(), b"SMB2APP\0", b"SmbRpc\0");
         Ok(SessionKeys {
-            encryption_key: Some(kdf_vec(session_key.as_ref(), b"SMB2AESCCM\0", b"ServerIn \0", 16)),
-            decryption_key: Some(kdf_vec(session_key.as_ref(), b"SMB2AESCCM\0", b"ServerOut\0", 16)),
+            encryption_key: Some(kdf_vec(
+                session_key.as_ref(),
+                b"SMB2AESCCM\0",
+                b"ServerIn \0",
+                16,
+            )),
+            decryption_key: Some(kdf_vec(
+                session_key.as_ref(),
+                b"SMB2AESCCM\0",
+                b"ServerOut\0",
+                16,
+            )),
             signing_key,
             application_key,
             session_key,
@@ -128,9 +140,18 @@ mod tests {
         let k = derive_session_keys(Dialect::SMB_2_0_2, &[1u8; 8], None, None).unwrap();
         assert_eq!(&k.session_key[8..], &[0u8; 8]);
         assert!(derive_session_keys(Dialect::SMB_3_1_1, &[1u8; 16], None, None).is_err());
-        let k = derive_session_keys(Dialect::SMB_3_1_1, &[1u8; 16], Some(&[0; 64]), Some(Cipher::Aes256Gcm)).unwrap();
+        let k = derive_session_keys(
+            Dialect::SMB_3_1_1,
+            &[1u8; 16],
+            Some(&[0; 64]),
+            Some(Cipher::Aes256Gcm),
+        )
+        .unwrap();
         assert_eq!(k.encryption_key.as_ref().unwrap().len(), 32);
         let sv = k.server_view();
-        assert_eq!(sv.encryption_key.as_ref().unwrap().as_slice(), k.decryption_key.as_ref().unwrap().as_slice());
+        assert_eq!(
+            sv.encryption_key.as_ref().unwrap().as_slice(),
+            k.decryption_key.as_ref().unwrap().as_slice()
+        );
     }
 }

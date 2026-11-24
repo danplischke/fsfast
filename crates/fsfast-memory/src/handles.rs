@@ -53,7 +53,10 @@ impl ReadHandle for MemoryReadHandle {
     /// Slicing is free, so no coalescing: every range is an independent
     /// zero-copy slice.
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        Ok(ranges.iter().map(|r| clamped_slice(&self.data, r)).collect())
+        Ok(ranges
+            .iter()
+            .map(|r| clamped_slice(&self.data, r))
+            .collect())
     }
 }
 
@@ -139,7 +142,11 @@ impl MemoryWriteHandle {
         }
         let data = self.assemble();
         self.base = data.clone();
-        let committed = self.store.inner.write().commit(&self.path, self.generation, data);
+        let committed = self
+            .store
+            .inner
+            .write()
+            .commit(&self.path, self.generation, data);
         match committed {
             Some(g) => self.generation = g,
             None => tracing::debug!(

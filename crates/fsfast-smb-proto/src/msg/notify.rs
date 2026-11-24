@@ -42,7 +42,6 @@ bitflags! {
         const STREAM_SIZE = 0x0000_0400;
         /// Stream write changes.
         const STREAM_WRITE = 0x0000_0800;
-        const _ = !0;
     }
 }
 
@@ -79,7 +78,12 @@ impl Message for ChangeNotifyRequest {
         let output_buffer_length = r.u32()?;
         let file_id = FileId::read(&mut r)?;
         let completion_filter = CompletionFilter::from_bits_retain(r.u32()?);
-        Ok(ChangeNotifyRequest { flags, output_buffer_length, file_id, completion_filter })
+        Ok(ChangeNotifyRequest {
+            flags,
+            output_buffer_length,
+            file_id,
+            completion_filter,
+        })
     }
 
     fn credit_charge(&self) -> u16 {
@@ -131,7 +135,9 @@ pub fn decode_notify_information(buf: &[u8]) -> Result<Vec<FileNotifyInformation
         return Ok(out);
     }
     loop {
-        let rest = buf.get(pos..).ok_or(ProtoError::malformed(W, "entry offset out of range"))?;
+        let rest = buf
+            .get(pos..)
+            .ok_or(ProtoError::malformed(W, "entry offset out of range"))?;
         let mut r = Reader::new(rest, W);
         let next = r.u32()? as usize;
         let action = FileAction(r.u32()?);
@@ -149,7 +155,10 @@ pub fn decode_notify_information(buf: &[u8]) -> Result<Vec<FileNotifyInformation
 }
 
 /// Encode a FILE_NOTIFY_INFORMATION chain (entries 4-byte aligned).
-pub fn encode_notify_information(entries: &[FileNotifyInformation], dst: &mut BytesMut) -> Result<()> {
+pub fn encode_notify_information(
+    entries: &[FileNotifyInformation],
+    dst: &mut BytesMut,
+) -> Result<()> {
     let base = dst.len();
     for (i, e) in entries.iter().enumerate() {
         let start = dst.len();
@@ -189,7 +198,9 @@ impl Message for ChangeNotifyResponse {
     }
 
     fn decode_body(msg: &Bytes) -> Result<Self> {
-        Ok(ChangeNotifyResponse { output_buffer: decode_buffer_response(msg, "CHANGE_NOTIFY response")? })
+        Ok(ChangeNotifyResponse {
+            output_buffer: decode_buffer_response(msg, "CHANGE_NOTIFY response")?,
+        })
     }
 }
 
@@ -200,8 +211,14 @@ mod tests {
     #[test]
     fn notify_chain_round_trip() {
         let entries = vec![
-            FileNotifyInformation { action: FileAction::ADDED, file_name: "a.txt".into() },
-            FileNotifyInformation { action: FileAction::RENAMED_NEW_NAME, file_name: "dir\\b".into() },
+            FileNotifyInformation {
+                action: FileAction::ADDED,
+                file_name: "a.txt".into(),
+            },
+            FileNotifyInformation {
+                action: FileAction::RENAMED_NEW_NAME,
+                file_name: "dir\\b".into(),
+            },
         ];
         let mut b = BytesMut::new();
         encode_notify_information(&entries, &mut b).unwrap();

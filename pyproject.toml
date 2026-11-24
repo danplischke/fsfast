@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fsfast"
+description = "Rust implementations of fsspec filesystems: drop-in replacements, tuned for speed"
+readme = "README.md"
+license = { text = "Apache-2.0 OR MIT" }
+requires-python = ">=3.10"
+dependencies = ["fsspec>=2024.6.0"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: System :: Filesystems",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Repository = "https://github.com/danplischke/fsfast"
+
+[tool.maturin]
+python-source = "python"
+module-name = "fsfast._core"
+manifest-path = "crates/fsfast-py/Cargo.toml"
+# abi3 (CPython 3.10+) comes from pyo3's `abi3-py310` feature in the crate.
+features = ["extension-module"]
+profile = "release"
+include = [{ path = "python/fsfast/py.typed", format = ["sdist", "wheel"] }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"

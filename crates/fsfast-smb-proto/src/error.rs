@@ -4,7 +4,7 @@
 //! malformed input, failed integrity checks and authentication failures.
 //! [`ProtoError`] is cheap to construct (no allocation on the hot decode paths)
 //! and converts into [`fsfast_core::Error`] with the most precise
-//! [`ErrorKind`](fsfast_core::ErrorKind).
+//! [`ErrorKind`].
 
 use fsfast_core::{Detail, Error, ErrorKind};
 
@@ -123,10 +123,8 @@ impl From<ProtoError> for Error {
                 let kind = other.kind();
                 // Integrity failures must never be retried blindly: they
                 // indicate tampering or a key mismatch, not a transient fault.
-                let retryable = !matches!(
-                    other,
-                    ProtoError::BadSignature | ProtoError::DecryptFailed
-                );
+                let retryable =
+                    !matches!(other, ProtoError::BadSignature | ProtoError::DecryptFailed);
                 let e = Error::new(kind, other.to_string());
                 if retryable {
                     e

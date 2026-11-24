@@ -62,6 +62,12 @@ pub mod status;
 pub mod types;
 pub mod wire;
 
+#[cfg(test)]
+mod reference_tests;
+#[cfg(test)]
+#[rustfmt::skip]
+mod reference_vectors;
+
 pub use error::{ProtoError, Result};
 pub use header::{Command, Header, HeaderFlags, HeaderId};
 pub use status::NtStatus;

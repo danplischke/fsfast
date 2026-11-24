@@ -19,7 +19,10 @@ impl GmacKey {
         let aes = Aes128::new(key.into());
         let mut h = ghash::Block::default();
         aes.encrypt_block(&mut h);
-        GmacKey { aes, ghash: GHash::new(&h) }
+        GmacKey {
+            aes,
+            ghash: GHash::new(&h),
+        }
     }
 
     /// Start a MAC computation with a 96-bit nonce.
@@ -28,7 +31,13 @@ impl GmacKey {
         j0[..12].copy_from_slice(nonce);
         j0[15] = 1;
         self.aes.encrypt_block(&mut j0);
-        Gmac { ghash: self.ghash.clone(), ek_j0: j0.into(), buf: [0; 16], buf_len: 0, aad_len: 0 }
+        Gmac {
+            ghash: self.ghash.clone(),
+            ek_j0: j0.into(),
+            buf: [0; 16],
+            buf_len: 0,
+            aad_len: 0,
+        }
     }
 }
 
@@ -81,8 +90,8 @@ impl Gmac {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::Aes128Gcm;
     use aes_gcm::aead::AeadInOut;
-    use aes_gcm::{Aes128Gcm, KeyInit as _};
 
     #[test]
     fn matches_aes_gcm_with_empty_plaintext() {
@@ -92,7 +101,9 @@ mod tests {
         let gcm = Aes128Gcm::new((&key).into());
         for len in [0usize, 1, 15, 16, 17, 31, 64, 100, 1000] {
             let aad: Vec<u8> = (0..len).map(|i| i as u8).collect();
-            let expected = gcm.encrypt_inout_detached((&nonce).into(), &aad, (&mut [][..]).into()).unwrap();
+            let expected = gcm
+                .encrypt_inout_detached((&nonce).into(), &aad, (&mut [][..]).into())
+                .unwrap();
             // Feed in awkward split points.
             for split in [0, 1, 7, 16, 33] {
                 let split = split.min(len);
@@ -100,7 +111,11 @@ mod tests {
                 g.update(&aad[..split]);
                 g.update(&[]);
                 g.update(&aad[split..]);
-                assert_eq!(g.finalize().as_slice(), expected.as_slice(), "len {len} split {split}");
+                assert_eq!(
+                    g.finalize().as_slice(),
+                    expected.as_slice(),
+                    "len {len} split {split}"
+                );
             }
         }
     }

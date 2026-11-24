@@ -7,7 +7,16 @@
 //! extra keys and their Python types, and error kinds.
 //!
 //! Gated on `FSFAST_TEST_FSSPEC_PYTHON`, the path of a Python interpreter with
-//! fsspec installed (e.g. `.venv/bin/python`).
+//! fsspec installed (e.g. `.venv/bin/python`). `FSFAST_TEST_DIFF_SEEDS` sets
+//! the number of random sequences (default 6); `FSFAST_TEST_DIFF_KEEP` keeps
+//! the generated script and operations.
+//!
+//! Excluded by design (both sides apply the same rule): `mv` where the two
+//! implementations intentionally differ — moving *into* an existing directory
+//! (fsfast's `mv_file` takes the final destination) — and directory moves in
+//! degenerate states (a path that is both a file and a directory, a path
+//! below a file, `//` names in the tree), where fsspec's non-atomic recursive
+//! copy + rm fails half-way while fsfast moves the tree atomically.
 
 use std::fmt::Write as _;
 use std::process::Command;
@@ -78,7 +87,22 @@ for line in open(sys.argv[1], encoding="utf-8"):
             # fsfast's mv_file takes the final destination; fsspec's mv moves
             # *into* an existing directory. Skip the cases where they differ
             # by design (the Rust side applies the same rule).
-            if src == "" or dst.startswith(src + "/") or (src != dst and fs.exists(dst)
+            # Also skipped: directory trees holding degenerate "//" names,
+            # which fsspec's non-atomic recursive copy + rm leaves half-moved.
+            # Likewise moves entangled with a path that is both a file and a
+            # directory (fsspec lets pipe() write over an implied directory).
+            def below_file(p):
+                while len(p) > 1:
+                    p = fs._parent(p)
+                    if fs.isfile(p):
+                        return True
+                return False
+            def entangled(p):
+                return fs.isfile(p) and fs.isdir(p)
+            tree = fs.find(src, withdirs=True) if fs.isdir(src) else []
+            degenerate = any("//" in p or entangled(p) for p in tree) \
+                or below_file(src) or below_file(dst) or entangled(src)
+            if src == "" or dst.startswith(src + "/") or degenerate or (src != dst and fs.exists(dst)
                     and (fs.isdir(dst) or fs.isdir(src))):
                 r = "skip"
             else:
@@ -146,7 +170,11 @@ fn info(i: &FileInfo) -> String {
 fn listing(entries: &[FileInfo]) -> String {
     let mut v: Vec<String> = entries.iter().map(info).collect();
     v.sort();
-    if v.is_empty() { "-".into() } else { v.join(" ") }
+    if v.is_empty() {
+        "-".into()
+    } else {
+        v.join(" ")
+    }
 }
 
 async fn run_rust(fs: &MemoryFileSystem, op: &[&str]) -> String {
@@ -169,7 +197,11 @@ async fn run_rust(fs: &MemoryFileSystem, op: &[&str]) -> String {
                 "ok".into()
             }
             "cat" => {
-                let r = ByteRange::from_fsspec(Some(a[1].parse().unwrap()), Some(a[2].parse().unwrap()), None)?;
+                let r = ByteRange::from_fsspec(
+                    Some(a[1].parse().unwrap()),
+                    Some(a[2].parse().unwrap()),
+                    None,
+                )?;
                 let b = fs.cat_file(a[0], r).await?;
                 format!("ok {}", String::from_utf8_lossy(&b))
             }
@@ -177,12 +209,23 @@ async fn run_rust(fs: &MemoryFileSystem, op: &[&str]) -> String {
             "ls" => format!("ok {}", listing(&fs.ls(a[0]).await?)),
             "find" => {
                 let opts = FindOptions {
-                    maxdepth: if a[1] == "-" { None } else { Some(a[1].parse().unwrap()) },
+                    maxdepth: if a[1] == "-" {
+                        None
+                    } else {
+                        Some(a[1].parse().unwrap())
+                    },
                     withdirs: a[2] == "1",
                 };
                 format!("ok {}", listing(&fs.find(a[0], &opts).await?))
             }
-            "exists" => format!("ok {}", if fs.exists(a[0]).await? { "True" } else { "False" }),
+            "exists" => format!(
+                "ok {}",
+                if fs.exists(a[0]).await? {
+                    "True"
+                } else {
+                    "False"
+                }
+            ),
             "mkdir" => {
                 fs.mkdir(a[0], a[1] == "1").await?;
                 "ok".into()
@@ -209,8 +252,47 @@ async fn run_rust(fs: &MemoryFileSystem, op: &[&str]) -> String {
                 let is_dir = |p: String| async move {
                     fs.info(&p).await.map(|i| i.is_dir()).unwrap_or(false)
                 };
+                // `ls` of a file returns just that file (files win in ls,
+                // directories win in info).
+                let is_file = |p: String| async move {
+                    fs.ls(&p)
+                        .await
+                        .is_ok_and(|v| v.len() == 1 && v[0].name == p && v[0].is_file())
+                };
+                let below_file = |p: String| async move {
+                    let mut p = p;
+                    while p.len() > 1 {
+                        p = fsfast_memory::paths::parent(&p);
+                        if is_file(fsfast_memory::strip_protocol(&p).into_owned()).await {
+                            return true;
+                        }
+                    }
+                    false
+                };
+                let entangled =
+                    |p: String| async move { is_file(p.clone()).await && is_dir(p).await };
+                let tree = if is_dir(src.clone()).await {
+                    fs.find(
+                        &src,
+                        &FindOptions {
+                            maxdepth: None,
+                            withdirs: true,
+                        },
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                };
+                let mut degenerate = below_file(src.clone()).await
+                    || below_file(dst.clone()).await
+                    || entangled(src.clone()).await;
+                for e in &tree {
+                    degenerate =
+                        degenerate || e.name.contains("//") || entangled(e.name.clone()).await;
+                }
                 if src.is_empty()
                     || dst.starts_with(&format!("{src}/"))
+                    || degenerate
                     || (src != dst
                         && fs.exists(&dst).await?
                         && (is_dir(dst.clone()).await || is_dir(src.clone()).await))
@@ -254,7 +336,24 @@ async fn run_rust(fs: &MemoryFileSystem, op: &[&str]) -> String {
 }
 
 const UNIVERSE: &[&str] = &[
-    "", "/a", "/a/b", "/a/b/c", "/a/d", "/a/b-x", "/e", "/e/f", "/g/h/i", "a/b/", "/a//b", "memory://e/f",
+    "",
+    "/a",
+    "/a/b",
+    "/a/b/c",
+    "/a/d",
+    "/a/b-x",
+    "/e",
+    "/e/f",
+    "/g/h/i",
+    "a/b/",
+    "/a//b",
+    "memory://e/f",
+    // Characters that are special in URLs or shells, non-ASCII, a long name.
+    // (No glob characters `*?[`: fsspec's generic `mv` expands them as
+    // patterns, which is the Python layer's job, not `mv_file`'s.)
+    "/sp ace/#q=%20x",
+    "memory://ünï/名前",
+    "/a/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
 ];
 
 fn random_ops(seed: u64, n: usize) -> Vec<String> {
@@ -353,7 +452,8 @@ fn edge_cases() -> Vec<String> {
 }
 
 async fn compare(python: &str, name: &str, ops: &[String]) {
-    let dir = std::env::temp_dir().join(format!("fsfast-memory-diff-{}-{name}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("fsfast-memory-diff-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("diff.py");
     let ops_file = dir.join("ops.tsv");
@@ -365,25 +465,50 @@ async fn compare(python: &str, name: &str, ops: &[String]) {
         .arg(&ops_file)
         .output()
         .expect("run python");
-    std::fs::remove_dir_all(&dir).unwrap();
-    assert!(out.status.success(), "python failed: {}", String::from_utf8_lossy(&out.stderr));
+    // FSFAST_TEST_DIFF_KEEP keeps the script and operations for debugging.
+    if std::env::var_os("FSFAST_TEST_DIFF_KEEP").is_none() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    } else {
+        eprintln!("kept {}", dir.display());
+    }
+    assert!(
+        out.status.success(),
+        "python failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let expected = String::from_utf8(out.stdout).unwrap();
 
     let fs = MemoryFileSystem::new_isolated();
     let mut mismatches = String::new();
     let mut count = 0;
+    let mut history: Vec<String> = Vec::new();
     for (line, want) in ops.iter().zip(expected.lines()) {
         let fields: Vec<&str> = line.split('\t').collect();
         let got = run_rust(&fs, &fields).await;
         if got != want {
             count += 1;
+            if count == 1 {
+                // State drifts surface after the operation that caused them.
+                let _ = writeln!(mismatches, "  context before the first difference:");
+                for h in &history[history.len().saturating_sub(12)..] {
+                    let _ = writeln!(mismatches, "    {h}");
+                }
+            }
             if count <= 10 {
-                let _ = writeln!(mismatches, "  op:     {line:?}\n  fsspec: {want}\n  fsfast: {got}");
+                let _ = writeln!(
+                    mismatches,
+                    "  op:     {line:?}\n  fsspec: {want}\n  fsfast: {got}"
+                );
             }
         }
+        history.push(got);
     }
     assert_eq!(expected.lines().count(), ops.len(), "python output length");
-    assert!(count == 0, "{name}: {count} of {} results differ from fsspec:\n{mismatches}", ops.len());
+    assert!(
+        count == 0,
+        "{name}: {count} of {} results differ from fsspec:\n{mismatches}",
+        ops.len()
+    );
 }
 
 fn python() -> Option<String> {
@@ -405,7 +530,12 @@ async fn edge_cases_match_fsspec() {
 #[tokio::test]
 async fn random_sequences_match_fsspec() {
     let Some(py) = python() else { return };
-    for seed in 1..=6u64 {
+    // FSFAST_TEST_DIFF_SEEDS widens the sweep (default 6 sequences).
+    let seeds: u64 = std::env::var("FSFAST_TEST_DIFF_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    for seed in 1..=seeds {
         compare(&py, &format!("seed{seed}"), &random_ops(seed * 7919, 400)).await;
     }
 }

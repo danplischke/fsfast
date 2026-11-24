@@ -142,11 +142,15 @@ pub fn make_path_posix(
 /// `_strip_protocol` NT branch: `C:` drives, `//server/share` UNC roots.
 fn windows_drive(path: &str) -> (&str, &str) {
     if char_at(path, 1) == Some(':') {
-        let split = path.char_indices().nth(2).map(|(i, _)| i).unwrap_or(path.len());
+        let split = path
+            .char_indices()
+            .nth(2)
+            .map(|(i, _)| i)
+            .unwrap_or(path.len());
         return path.split_at(split);
     }
-    if path.starts_with("//") {
-        let Some(i1) = path[2..].find('/').map(|i| i + 2) else {
+    if let Some(rest) = path.strip_prefix("//") {
+        let Some(i1) = rest.find('/').map(|i| i + 2) else {
             return (path, "");
         };
         let Some(i2) = path[i1 + 1..].find('/').map(|i| i + i1 + 1) else {
@@ -176,7 +180,11 @@ pub fn strip_protocol_with(
     match style {
         PathStyle::Posix => {
             let t = p.trim_end_matches('/');
-            if t.is_empty() { "/".to_owned() } else { t.to_owned() }
+            if t.is_empty() {
+                "/".to_owned()
+            } else {
+                t.to_owned()
+            }
         }
         PathStyle::Windows => {
             let (drive, rest) = windows_drive(&p);
@@ -249,11 +257,21 @@ mod tests {
     use proptest::prelude::*;
 
     fn posix(p: &str) -> String {
-        strip_protocol_with(p, PathStyle::Posix, &|| "/work/dir".to_owned(), Some("/home/me"))
+        strip_protocol_with(
+            p,
+            PathStyle::Posix,
+            &|| "/work/dir".to_owned(),
+            Some("/home/me"),
+        )
     }
 
     fn nt(p: &str) -> String {
-        strip_protocol_with(p, PathStyle::Windows, &|| "C:\\Users\\me".to_owned(), Some("C:\\Users\\me"))
+        strip_protocol_with(
+            p,
+            PathStyle::Windows,
+            &|| "C:\\Users\\me".to_owned(),
+            Some("C:\\Users\\me"),
+        )
     }
 
     #[test]
@@ -314,7 +332,10 @@ mod tests {
         assert_eq!(parent_with("/", PathStyle::Posix), "/");
         assert_eq!(parent_with("C:/x/y", PathStyle::Windows), "C:/x");
         assert_eq!(parent_with("C:/x", PathStyle::Windows), "C:/");
-        assert_eq!(parent_with("//srv/share/x", PathStyle::Windows), "//srv/share");
+        assert_eq!(
+            parent_with("//srv/share/x", PathStyle::Windows),
+            "//srv/share"
+        );
     }
 
     #[test]
@@ -327,7 +348,10 @@ mod tests {
     #[test]
     fn native_fast_path_borrows() {
         if PathStyle::native() == PathStyle::Posix {
-            assert!(matches!(strip_protocol("/abs/path"), Cow::Borrowed("/abs/path")));
+            assert!(matches!(
+                strip_protocol("/abs/path"),
+                Cow::Borrowed("/abs/path")
+            ));
             assert!(matches!(strip_protocol("/"), Cow::Borrowed("/")));
             assert_eq!(strip_protocol("/abs/path/"), "/abs/path");
         }

@@ -15,7 +15,6 @@ bitflags! {
     pub struct SessionSetupRequestFlags: u8 {
         /// Bind an existing session to a new channel (multichannel).
         const BINDING = 0x01;
-        const _ = !0;
     }
 }
 
@@ -29,7 +28,6 @@ bitflags! {
         const IS_NULL = 0x0002;
         /// The server requires encryption for this session (3.x).
         const ENCRYPT_DATA = 0x0004;
-        const _ = !0;
     }
 }
 
@@ -60,8 +58,15 @@ impl Message for SessionSetupRequest {
         dst.put_u8(self.security_mode.bits() as u8);
         dst.put_u32_le(self.capabilities.bits());
         dst.put_u32_le(self.channel);
-        dst.put_u16_le(if self.security_buffer.is_empty() { 0 } else { (HEADER_LEN + 24) as u16 });
-        dst.put_u16_le(len_u16(self.security_buffer.len(), "security buffer too long")?);
+        dst.put_u16_le(if self.security_buffer.is_empty() {
+            0
+        } else {
+            (HEADER_LEN + 24) as u16
+        });
+        dst.put_u16_le(len_u16(
+            self.security_buffer.len(),
+            "security buffer too long",
+        )?);
         dst.put_u64_le(self.previous_session_id);
         dst.put_slice(&self.security_buffer);
         Ok(())
@@ -103,8 +108,15 @@ impl Message for SessionSetupResponse {
     fn encode_body(&self, dst: &mut BytesMut) -> Result<()> {
         dst.put_u16_le(9);
         dst.put_u16_le(self.session_flags.bits());
-        dst.put_u16_le(if self.security_buffer.is_empty() { 0 } else { (HEADER_LEN + 8) as u16 });
-        dst.put_u16_le(len_u16(self.security_buffer.len(), "security buffer too long")?);
+        dst.put_u16_le(if self.security_buffer.is_empty() {
+            0
+        } else {
+            (HEADER_LEN + 8) as u16
+        });
+        dst.put_u16_le(len_u16(
+            self.security_buffer.len(),
+            "security buffer too long",
+        )?);
         dst.put_slice(&self.security_buffer);
         Ok(())
     }

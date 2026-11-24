@@ -52,8 +52,16 @@ impl FileTime {
     /// the representable range (times before 1601 become 1601-01-01).
     pub fn from_system_time(t: SystemTime) -> FileTime {
         match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => FileTime(UNIX_EPOCH_FILETIME.saturating_add(duration_to_ticks(d)).min(i64::MAX as u64)),
-            Err(e) => FileTime(UNIX_EPOCH_FILETIME.saturating_sub(duration_to_ticks(e.duration())).max(1)),
+            Ok(d) => FileTime(
+                UNIX_EPOCH_FILETIME
+                    .saturating_add(duration_to_ticks(d))
+                    .min(i64::MAX as u64),
+            ),
+            Err(e) => FileTime(
+                UNIX_EPOCH_FILETIME
+                    .saturating_sub(duration_to_ticks(e.duration()))
+                    .max(1),
+            ),
         }
     }
 
@@ -68,12 +76,22 @@ impl FileTime {
         if self.0 == 0 || self.0 >= 1 << 63 {
             return None;
         }
-        Some((self.0 as f64 - UNIX_EPOCH_FILETIME as f64) / TICKS_PER_SEC as f64)
+        // Subtract in the integer domain and split into whole seconds and a
+        // sub-second remainder: present-day FILETIMEs (~1.3e17) exceed f64's
+        // 53-bit mantissa, so converting before subtracting loses up to a
+        // microsecond. Both parts below are exact in f64 and the result
+        // matches the correctly rounded `(ft - epoch) / 10**7`.
+        let d = self.0 as i64 - UNIX_EPOCH_FILETIME as i64;
+        let ticks = TICKS_PER_SEC as i64;
+        Some(d.div_euclid(ticks) as f64 + d.rem_euclid(ticks) as f64 / TICKS_PER_SEC as f64)
     }
 }
 
 fn ticks_to_duration(ticks: u64) -> Duration {
-    Duration::new(ticks / TICKS_PER_SEC, ((ticks % TICKS_PER_SEC) * 100) as u32)
+    Duration::new(
+        ticks / TICKS_PER_SEC,
+        ((ticks % TICKS_PER_SEC) * 100) as u32,
+    )
 }
 
 fn duration_to_ticks(d: Duration) -> u64 {
@@ -139,7 +157,6 @@ bitflags! {
         const UNPINNED = 0x0010_0000;
         /// Recall on data access.
         const RECALL_ON_DATA_ACCESS = 0x0040_0000;
-        const _ = !0;
     }
 }
 
@@ -195,7 +212,6 @@ bitflags! {
         const FILE_ADD_SUBDIRECTORY = 0x0000_0004;
         /// Directory alias of `FILE_EXECUTE`.
         const FILE_TRAVERSE = 0x0000_0020;
-        const _ = !0;
     }
 }
 
@@ -209,7 +225,6 @@ bitflags! {
         const WRITE = 0x0000_0002;
         /// Allow concurrent delete/rename.
         const DELETE = 0x0000_0004;
-        const _ = !0;
     }
 }
 
@@ -259,7 +274,6 @@ bitflags! {
         const OPEN_NO_RECALL = 0x0040_0000;
         /// Open for free-space query.
         const OPEN_FOR_FREE_SPACE_QUERY = 0x0080_0000;
-        const _ = !0;
     }
 }
 
@@ -506,6 +520,32 @@ mod tests {
         let old = UNIX_EPOCH - Duration::new(86_400 * 365, 500);
         let ft = FileTime::from_system_time(old);
         assert_eq!(ft.to_system_time(), Some(old));
-        assert!((FileTime(UNIX_EPOCH_FILETIME + 15_000_000).to_unix_f64().unwrap() - 1.5).abs() < 1e-9);
+        assert!(
+            (FileTime(UNIX_EPOCH_FILETIME + 15_000_000)
+                .to_unix_f64()
+                .unwrap()
+                - 1.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn to_unix_f64_is_correctly_rounded() {
+        // Expected values are Python's `(ft - 116444736000000000) / 10**7`
+        // (int / int true division, correctly rounded), which is what
+        // smbclient-style code computes. Converting both operands to f64
+        // before subtracting loses up to ~1 µs on present-day timestamps.
+        for (ft, expected) in [
+            (137_112_505_144_773_943u64, 2066776914.4773943f64),
+            (131_695_698_339_729_451, 1525096233.9729452),
+            (133_867_658_884_173_557, 1742292288.4173558),
+            (131_548_284_331_643_096, 1510354833.1643095),
+            (137_533_121_096_607_578, 2108838509.6607578),
+            (139_926_782_207_195_097, 2348204620.7195096),
+            (100_000_000_000_000_007, -1644473599.9999993),
+        ] {
+            assert_eq!(FileTime(ft).to_unix_f64(), Some(expected), "{ft}");
+        }
     }
 }

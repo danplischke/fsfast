@@ -8,7 +8,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use super::{EncodedMessage, body_reader};
 use crate::error::{ProtoError, Result};
 use crate::header::{HEADER_LEN, Header};
-use crate::wire::{Reader, decode_utf16le, len_u16, len_u32, pad_to, padding, put_utf16le, slice_ref, utf16le_len};
+use crate::wire::{
+    Reader, decode_utf16le, len_u16, len_u32, pad_to, padding, put_utf16le, slice_ref, utf16le_len,
+};
 
 /// `ErrorId` of the default error context.
 pub const ERROR_ID_DEFAULT: u32 = 0x0000_0000;
@@ -45,7 +47,8 @@ pub struct ErrorResponse {
 impl ErrorResponse {
     /// Encode the body.
     pub fn encode_body(&self, dst: &mut BytesMut) -> Result<()> {
-        let n = u8::try_from(self.error_contexts.len()).map_err(|_| ProtoError::InvalidInput("too many error contexts"))?;
+        let n = u8::try_from(self.error_contexts.len())
+            .map_err(|_| ProtoError::InvalidInput("too many error contexts"))?;
         dst.put_u16_le(9);
         dst.put_u8(n);
         dst.put_u8(0);
@@ -83,7 +86,10 @@ impl ErrorResponse {
         let data_start = HEADER_LEN + 8;
         let data = crate::wire::slice_bytes(msg, data_start, byte_count, W)?;
         if n == 0 {
-            return Ok(ErrorResponse { error_contexts: Vec::new(), error_data: data });
+            return Ok(ErrorResponse {
+                error_contexts: Vec::new(),
+                error_data: data,
+            });
         }
         let mut error_contexts = Vec::with_capacity(n);
         let mut pos = 0usize;
@@ -95,10 +101,16 @@ impl ErrorResponse {
             let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
             let error_id = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
             let cdata = crate::wire::slice_bytes(&data, pos + 8, len, W)?;
-            error_contexts.push(ErrorContext { error_id, data: cdata });
+            error_contexts.push(ErrorContext {
+                error_id,
+                data: cdata,
+            });
             pos += 8 + len;
         }
-        Ok(ErrorResponse { error_contexts, error_data: Bytes::new() })
+        Ok(ErrorResponse {
+            error_contexts,
+            error_data: Bytes::new(),
+        })
     }
 
     /// The status-specific data: the raw error data, or the data of the
@@ -139,7 +151,11 @@ pub fn encode_error_message(header: &Header, err: &ErrorResponse) -> Result<Enco
     let mut head = BytesMut::with_capacity(HEADER_LEN + 16);
     header.encode(&mut head);
     err.encode_body(&mut head)?;
-    Ok(EncodedMessage { head, payload: None, padding: 0 })
+    Ok(EncodedMessage {
+        head,
+        payload: None,
+        padding: 0,
+    })
 }
 
 /// Symbolic link error response ([MS-SMB2] §2.2.2.2.1).
@@ -172,7 +188,10 @@ impl SymlinkErrorResponse {
         }
         let reparse_tag = r.u32()?;
         if reparse_tag != crate::fscc::reparse_tag::SYMLINK {
-            return Err(ProtoError::malformed(W, "reparse tag is not IO_REPARSE_TAG_SYMLINK"));
+            return Err(ProtoError::malformed(
+                W,
+                "reparse tag is not IO_REPARSE_TAG_SYMLINK",
+            ));
         }
         let _reparse_data_length = r.u16()?;
         let unparsed_path_length = r.u16()?;
@@ -184,13 +203,21 @@ impl SymlinkErrorResponse {
         let path_buffer = r.rest();
         let substitute_name = decode_utf16le(slice_ref(path_buffer, sub_off, sub_len, W)?, W)?;
         let print_name = decode_utf16le(slice_ref(path_buffer, print_off, print_len, W)?, W)?;
-        Ok(SymlinkErrorResponse { unparsed_path_length, substitute_name, print_name, flags })
+        Ok(SymlinkErrorResponse {
+            unparsed_path_length,
+            substitute_name,
+            print_name,
+            flags,
+        })
     }
 
     /// Encode (mock servers, tests). The print name precedes the substitute
     /// name in the path buffer, as Windows does.
     pub fn encode(&self, dst: &mut BytesMut) -> Result<()> {
-        let sub_len = len_u16(utf16le_len(&self.substitute_name), "substitute name too long")?;
+        let sub_len = len_u16(
+            utf16le_len(&self.substitute_name),
+            "substitute name too long",
+        )?;
         let print_len = len_u16(utf16le_len(&self.print_name), "print name too long")?;
         let path_len = usize::from(sub_len) + usize::from(print_len);
         let reparse_data_len = len_u16(12 + path_len, "symlink too long")?;
@@ -248,7 +275,10 @@ impl ShareRedirect {
             });
         }
         let resource_name = decode_utf16le(slice_ref(buf, name_off, name_len, W)?, W)?;
-        Ok(ShareRedirect { ip_addresses, resource_name })
+        Ok(ShareRedirect {
+            ip_addresses,
+            resource_name,
+        })
     }
 
     /// Encode (mock servers, tests).
@@ -292,7 +322,10 @@ mod tests {
         let mut h = Header::request(Command::CREATE);
         h.flags = HeaderFlags::SERVER_TO_REDIR;
         h.status = NtStatus::STOPPED_ON_SYMLINK;
-        let m = encode_error_message(&h, e).unwrap().into_contiguous().freeze();
+        let m = encode_error_message(&h, e)
+            .unwrap()
+            .into_contiguous()
+            .freeze();
         let raw = RawMessage::parse(m).unwrap();
         assert!(raw.is_error_response());
         raw.decode_error().unwrap()
@@ -308,13 +341,19 @@ mod tests {
         };
         let mut b = BytesMut::new();
         s.encode(&mut b).unwrap();
-        let e = ErrorResponse { error_contexts: vec![], error_data: b.clone().freeze() };
+        let e = ErrorResponse {
+            error_contexts: vec![],
+            error_data: b.clone().freeze(),
+        };
         let d = rt(&e);
         assert_eq!(d, e);
         assert_eq!(d.symlink().unwrap(), s);
         // 3.1.1 form with a default context.
         let e2 = ErrorResponse {
-            error_contexts: vec![ErrorContext { error_id: ERROR_ID_DEFAULT, data: b.freeze() }],
+            error_contexts: vec![ErrorContext {
+                error_id: ERROR_ID_DEFAULT,
+                data: b.freeze(),
+            }],
             error_data: Bytes::new(),
         };
         let d2 = rt(&e2);
@@ -333,15 +372,24 @@ mod tests {
         sr.encode(&mut b).unwrap();
         let e = ErrorResponse {
             error_contexts: vec![
-                ErrorContext { error_id: ERROR_ID_DEFAULT, data: Bytes::from_static(b"abc") },
-                ErrorContext { error_id: ERROR_ID_SHARE_REDIRECT, data: b.freeze() },
+                ErrorContext {
+                    error_id: ERROR_ID_DEFAULT,
+                    data: Bytes::from_static(b"abc"),
+                },
+                ErrorContext {
+                    error_id: ERROR_ID_SHARE_REDIRECT,
+                    data: b.freeze(),
+                },
             ],
             error_data: Bytes::new(),
         };
         let d = rt(&e);
         assert_eq!(d, e);
         assert_eq!(d.share_redirect().unwrap().unwrap(), sr);
-        let small = ErrorResponse { error_contexts: vec![], error_data: Bytes::from_static(&[0x10, 0, 0, 0]) };
+        let small = ErrorResponse {
+            error_contexts: vec![],
+            error_data: Bytes::from_static(&[0x10, 0, 0, 0]),
+        };
         assert_eq!(rt(&small).required_buffer_size(), Some(16));
     }
 }

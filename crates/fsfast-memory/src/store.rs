@@ -594,7 +594,8 @@ mod tests {
     }
 
     fn put(s: &mut Inner, p: &str, data: &'static [u8]) {
-        s.put(p, Bytes::from_static(data), WriteMode::Overwrite).unwrap();
+        s.put(p, Bytes::from_static(data), WriteMode::Overwrite)
+            .unwrap();
     }
 
     #[test]
@@ -630,7 +631,10 @@ mod tests {
         s.mkdir("/z/b/q", true).unwrap();
         s.mkdir("/z/p/q/r", true).unwrap();
         let l = s.ls("/z").unwrap();
-        assert_eq!(names(&l), ["/z/0", "/z/1", "/z/a", "/z/b", "/z/b-x", "/z/p"]);
+        assert_eq!(
+            names(&l),
+            ["/z/0", "/z/1", "/z/a", "/z/b", "/z/b-x", "/z/p"]
+        );
         assert!(l[3].is_dir() && l[4].is_file() && l[5].is_dir());
         // An empty pseudo-directory lists as empty.
         s.mkdir("/emp", false).unwrap();
@@ -655,7 +659,10 @@ mod tests {
         s.mkdir("/q/r", false).unwrap();
         assert!(s.pseudo_dirs.contains("/q/r") && !s.pseudo_dirs.contains("/q"));
         assert!(s.info("/q").unwrap().is_dir());
-        assert_eq!(s.mkdir("/q/r", true).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            s.mkdir("/q/r", true).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
         // An implied directory is not "existing" for mkdir/makedirs.
         put(&mut s, "/i/j", b"x");
         s.makedirs("/i", false).unwrap();
@@ -664,14 +671,23 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::NotADirectory);
         assert_eq!(e.path(), Some("/i/j"));
         let e = s.mkdir("/i/j/k/l", true).unwrap_err();
-        assert_eq!((e.kind(), e.path()), (ErrorKind::NotADirectory, Some("/i/j")));
+        assert_eq!(
+            (e.kind(), e.path()),
+            (ErrorKind::NotADirectory, Some("/i/j"))
+        );
         s.mkdir("/i/j/k/l", false).unwrap();
         // The root exists.
-        assert_eq!(s.mkdir("", true).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            s.mkdir("", true).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
         s.makedirs("", true).unwrap();
         // makedirs over a file with exist_ok is silently accepted by fsspec.
         s.makedirs("/i/j", true).unwrap();
-        assert_eq!(s.makedirs("/i/j", false).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            s.makedirs("/i/j", false).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
     }
 
     #[test]
@@ -696,12 +712,20 @@ mod tests {
         let mut s = Inner::default();
         put(&mut s, "/a/b/c", b"x");
         let e = s.open_read("/a/b/c/d").unwrap_err();
-        assert_eq!((e.kind(), e.path()), (ErrorKind::AlreadyExists, Some("/a/b/c")));
+        assert_eq!(
+            (e.kind(), e.path()),
+            (ErrorKind::AlreadyExists, Some("/a/b/c"))
+        );
         s.mkdir("/pd", true).unwrap();
-        assert_eq!(s.open_read("/pd").unwrap_err().kind(), ErrorKind::IsADirectory);
+        assert_eq!(
+            s.open_read("/pd").unwrap_err().kind(),
+            ErrorKind::IsADirectory
+        );
         assert_eq!(s.open_read("/a").unwrap_err().kind(), ErrorKind::NotFound); // implied dir
         assert_eq!(
-            s.open_write("/pd", WriteMode::CreateNew).unwrap_err().kind(),
+            s.open_write("/pd", WriteMode::CreateNew)
+                .unwrap_err()
+                .kind(),
             ErrorKind::AlreadyExists
         );
         assert_eq!(
@@ -709,7 +733,9 @@ mod tests {
             ErrorKind::IsADirectory
         );
         assert_eq!(
-            s.open_write("/a/b/c", WriteMode::CreateNew).unwrap_err().kind(),
+            s.open_write("/a/b/c", WriteMode::CreateNew)
+                .unwrap_err()
+                .kind(),
             ErrorKind::AlreadyExists
         );
         // Writing over an implied directory is allowed by fsspec.
@@ -722,17 +748,24 @@ mod tests {
         let mut s = Inner::default();
         let slot = s.open_write("/w", WriteMode::Overwrite).unwrap();
         assert!(s.is_file("/w"));
-        let g = s.commit("/w", slot.generation, Bytes::from_static(b"abc")).unwrap();
+        let g = s
+            .commit("/w", slot.generation, Bytes::from_static(b"abc"))
+            .unwrap();
         assert_eq!(&s.files["/w"].data[..], b"abc");
         // A stale generation does not commit.
-        assert!(s.commit("/w", slot.generation, Bytes::from_static(b"zzz")).is_none());
+        assert!(
+            s.commit("/w", slot.generation, Bytes::from_static(b"zzz"))
+                .is_none()
+        );
         s.abort("/w", g, None);
         assert!(!s.is_file("/w"));
 
         put(&mut s, "/ap", b"hi");
         let slot = s.open_write("/ap", WriteMode::Append).unwrap();
         assert_eq!(&slot.base[..], b"hi");
-        let g = s.commit("/ap", slot.generation, Bytes::from_static(b"hi!!")).unwrap();
+        let g = s
+            .commit("/ap", slot.generation, Bytes::from_static(b"hi!!"))
+            .unwrap();
         s.abort("/ap", g, slot.restore);
         assert_eq!(&s.files["/ap"].data[..], b"hi");
     }
@@ -742,16 +775,39 @@ mod tests {
         let mut s = Inner::default();
         put(&mut s, "/a/b/c", b"x");
         s.mkdir("/q/r", false).unwrap();
-        let all = FindOptions { maxdepth: None, withdirs: true };
-        assert_eq!(names(&s.find("", &all).unwrap()), ["/a", "/a/b", "/a/b/c", "/q", "/q/r"]);
-        assert_eq!(names(&s.find("/a", &all).unwrap()), ["/a", "/a/b", "/a/b/c"]);
+        let all = FindOptions {
+            maxdepth: None,
+            withdirs: true,
+        };
+        assert_eq!(
+            names(&s.find("", &all).unwrap()),
+            ["/a", "/a/b", "/a/b/c", "/q", "/q/r"]
+        );
+        assert_eq!(
+            names(&s.find("/a", &all).unwrap()),
+            ["/a", "/a/b", "/a/b/c"]
+        );
         assert_eq!(names(&s.find("/a/b/c", &all).unwrap()), ["/a/b/c"]);
         assert!(s.find("/zzz", &all).unwrap().is_empty());
-        let d1 = FindOptions { maxdepth: Some(1), withdirs: true };
+        let d1 = FindOptions {
+            maxdepth: Some(1),
+            withdirs: true,
+        };
         assert_eq!(names(&s.find("", &d1).unwrap()), ["/a", "/q"]);
-        let files2 = FindOptions { maxdepth: Some(2), withdirs: false };
+        let files2 = FindOptions {
+            maxdepth: Some(2),
+            withdirs: false,
+        };
         assert!(s.find("", &files2).unwrap().is_empty());
-        let e = s.find("", &FindOptions { maxdepth: Some(0), withdirs: false }).unwrap_err();
+        let e = s
+            .find(
+                "",
+                &FindOptions {
+                    maxdepth: Some(0),
+                    withdirs: false,
+                },
+            )
+            .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput);
     }
 
@@ -761,14 +817,20 @@ mod tests {
         put(&mut s, "/f", b"data");
         s.cp_file("/f", "/g").unwrap();
         assert_eq!(&s.files["/g"].data[..], b"data");
-        assert_eq!(s.cp_file("/nope", "/x").unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(
+            s.cp_file("/nope", "/x").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
         s.mkdir("/d", true).unwrap();
         s.cp_file("/d", "/d2").unwrap();
         assert!(s.pseudo_dirs.contains("/d2"));
 
         s.mv("/g", "/h").unwrap();
         assert!(!s.is_file("/g") && s.is_file("/h"));
-        assert_eq!(s.mv("/h", "/d").unwrap_err().kind(), ErrorKind::IsADirectory);
+        assert_eq!(
+            s.mv("/h", "/d").unwrap_err().kind(),
+            ErrorKind::IsADirectory
+        );
         assert_eq!(s.mv("/nope", "/x").unwrap_err().kind(), ErrorKind::NotFound);
 
         // Directory trees move as a whole; implied directories become pseudo.
@@ -780,8 +842,14 @@ mod tests {
         for d in ["/u", "/u/x", "/u/x/y", "/u/empty"] {
             assert!(s.pseudo_dirs.contains(d), "{d}");
         }
-        assert_eq!(s.mv("/u", "/u/inner").unwrap_err().kind(), ErrorKind::InvalidInput);
-        assert_eq!(s.mv("/u", "/f").unwrap_err().kind(), ErrorKind::NotADirectory);
+        assert_eq!(
+            s.mv("/u", "/u/inner").unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            s.mv("/u", "/f").unwrap_err().kind(),
+            ErrorKind::NotADirectory
+        );
         assert_eq!(s.mv("/u", "/d").unwrap(), ()); // empty pseudo dir is replaced
         assert!(s.is_file("/d/x/y/z"));
     }
@@ -791,10 +859,12 @@ mod tests {
         let mut s = Inner::default();
         put(&mut s, "/a", b"hi");
         let created = s.files["/a"].created;
-        s.put("/a", Bytes::from_static(b"!!"), WriteMode::Append).unwrap();
+        s.put("/a", Bytes::from_static(b"!!"), WriteMode::Append)
+            .unwrap();
         assert_eq!(&s.files["/a"].data[..], b"hi!!");
         assert_eq!(s.files["/a"].created, created);
-        s.put("/new", Bytes::from_static(b"x"), WriteMode::Append).unwrap();
+        s.put("/new", Bytes::from_static(b"x"), WriteMode::Append)
+            .unwrap();
         assert_eq!(&s.files["/new"].data[..], b"x");
     }
 
@@ -817,7 +887,9 @@ mod tests {
         Mv(usize, usize),
     }
 
-    const UNIVERSE: [&str; 8] = ["/a", "/a/b", "/a/b/c", "/a/d", "/e", "/e/f", "/g/h/i", "/a/b/j"];
+    const UNIVERSE: [&str; 8] = [
+        "/a", "/a/b", "/a/b/c", "/a/d", "/e", "/e/f", "/g/h/i", "/a/b/j",
+    ];
 
     fn op() -> impl Strategy<Value = Op> {
         let i = 0..UNIVERSE.len();
