@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-s3"
+description = "s3fs-compatible Amazon S3 (and S3-compatible) filesystem for fsfast"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,34 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+fsfast-http-transport.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+# `process` runs `credential_process` helpers without blocking the runtime.
+tokio = { workspace = true, features = ["process"] }
+tracing.workspace = true
+# SigV4 (HMAC-SHA256, payload SHA-256 with SHA-NI), Content-MD5 and SSE-C
+# key digests: the RustCrypto versions fsfast-smb-proto already builds.
+sha2 = "0.11"
+hmac = "0.13"
+md-5 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+httpdate = "1"
+# credential_process / ECS / IMDS JSON documents.
+serde_json = "1"
+# Secrets are wiped from memory when dropped.
+zeroize = "1"
+# s3fs's access-point / outposts ARN patterns in split_path.
+regex = "1"
+
+[dev-dependencies]
+fsfast-testkit.workspace = true
+hex = "0.4"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+proptest = "1.5"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "process"] }

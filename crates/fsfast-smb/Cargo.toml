@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-smb"
+description = "fsspec-compatible SMB 2/3 filesystem for fsfast: pipelined, compounding SMB client on fsfast-smb-proto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,17 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+fsfast-smb-proto.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+fsfast-testkit.workspace = true
+proptest = "1.5"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
