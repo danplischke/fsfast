@@ -93,6 +93,8 @@ impl RustFileSystem {
         let slot = crate::runtime::runtime();
         let mut fut = Box::pin(fut);
         let first = py.detach(|| {
+            // Detached, so waiting for a pending fork is fine here.
+            let _gate = crate::gate::enter();
             let _ctx = slot.handle().enter();
             fut.as_mut()
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
@@ -959,7 +961,13 @@ impl RustFileSystem {
     /// Drop cached listings/metadata for `path` (and parents), or all.
     #[pyo3(signature = (path=None))]
     fn invalidate_cache(&self, py: Python<'_>, path: Option<&str>) -> PyResult<()> {
-        raise(py, self.inner.fs())?.invalidate_cache(path);
+        let fs = raise(py, self.inner.fs())?;
+        // Backend caches have locks: run inside the fork gate, detached so
+        // that waiting for a pending fork is allowed.
+        py.detach(|| {
+            let _gate = crate::gate::enter();
+            fs.invalidate_cache(path);
+        });
         Ok(())
     }
 

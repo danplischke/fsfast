@@ -60,11 +60,11 @@ class FsfastFile(io.RawIOBase):
         size: int | None = None,
         **kwargs: Any,
     ) -> None:
-        if mode not in {"rb"} | _WRITE_MODES:
-            raise NotImplementedError("File mode not supported")
         self.path = path
         self.fs = fs
         self.mode = mode
+        if mode not in {"rb"} | _WRITE_MODES:
+            raise NotImplementedError("File mode not supported")
         explicit_block = block_size if isinstance(block_size, int) and block_size > 0 else None
         self.blocksize = explicit_block or self.DEFAULT_BLOCK_SIZE
         self.autocommit = autocommit
@@ -78,6 +78,9 @@ class FsfastFile(io.RawIOBase):
         self._writer: Any = None
         self._target = path
         self._committed = False
+        #: Position of the first byte this handle writes (see
+        #: ``FsfastFileSystem._append_tell_from_end``).
+        self._tell_base = 0
         rfs = fs._rfs
         if mode == "rb":
             self._reader = rfs.open_read(
@@ -93,6 +96,13 @@ class FsfastFile(io.RawIOBase):
             if not autocommit and mode == "wb":
                 # Deferred write: a hidden sibling renamed into place at commit.
                 self._target = fs._transaction_temp_path(path)
+            if mode == "ab" and fs._append_tell_from_end:
+                try:
+                    found = rfs.info(path)
+                except FileNotFoundError:
+                    found = None
+                if found is not None and found["type"] == "file":
+                    self._tell_base = found["size"]
             self._writer = rfs.open_write(self._target, mode, block_size=explicit_block)
 
     # ------------------------------------------------------------------
@@ -171,15 +181,19 @@ class FsfastFile(io.RawIOBase):
         return self._reader
 
     def read(self, length: int | None = -1) -> bytes:  # type: ignore[override]
-        """Read ``length`` bytes (all remaining if negative or ``None``)."""
+        """Read ``length`` bytes (all remaining if ``-1`` or ``None``; other
+        negative values read everything too, or raise ``ValueError`` where
+        the reference implementation's files are CPython file objects)."""
         length = -1 if length is None else int(length)
         reader = self._check_read()
         if length == 0:
             return b""
+        if length < -1 and self.fs._strict_negative_read:
+            raise ValueError("read length must be non-negative or -1")
         return reader.read(length if length > 0 else None)
 
     def read1(self, size: int = -1) -> bytes:
-        return self.read(size)
+        return self.read(size if size >= 0 else -1)
 
     def readall(self) -> bytes:
         return self.read(-1)
@@ -254,7 +268,7 @@ class FsfastFile(io.RawIOBase):
             raise ValueError("I/O operation on closed file.")
         if self._reader is not None:
             return self._reader.tell()
-        return self._writer.bytes_written
+        return self._tell_base + self._writer.bytes_written
 
     # ------------------------------------------------------------------
     # writing

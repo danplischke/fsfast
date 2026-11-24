@@ -68,6 +68,15 @@ struct ReaderState {
     reader: FileReader,
     /// Data at `[tell(), tell() + pending.len())`.
     pending: Bytes,
+    /// Chunks a delimiter scan fetched after `pending` (they follow it in the
+    /// file). Kept as a list so that a long line costs one copy at the end
+    /// instead of one copy of everything so far per chunk; stored here, not
+    /// in the scan's locals, so that a cancelled scan loses nothing. Empty
+    /// outside [`ReaderState::read_until`] unless a scan was cancelled;
+    /// [`ReaderState::settle`] folds it into `pending`.
+    scan: Vec<Bytes>,
+    /// Total length of `scan`.
+    scan_len: usize,
     /// The reader's configuration, to rebuild it in a forked child.
     cfg: ReaderConfig,
     /// [`fork_generation`] the reader's background work belongs to.
@@ -79,6 +88,8 @@ impl ReaderState {
         ReaderState {
             reader,
             pending: Bytes::new(),
+            scan: Vec::new(),
+            scan_len: 0,
             cfg,
             generation: fork_generation(),
         }
@@ -116,10 +127,89 @@ impl ReaderState {
     }
 
     fn tell(&self) -> u64 {
-        self.reader.tell() - self.pending.len() as u64
+        self.reader.tell() - (self.pending.len() + self.scan_len) as u64
+    }
+
+    /// Fold the chunks of a cancelled delimiter scan into `pending` (a no-op
+    /// unless a scan was cancelled), so that every other operation only has
+    /// to look at `pending`.
+    fn settle(&mut self) {
+        if self.scan.is_empty() {
+            return;
+        }
+        let mut all = BytesMut::with_capacity(self.pending.len() + self.scan_len);
+        all.extend_from_slice(&self.pending);
+        for c in self.scan.drain(..) {
+            all.extend_from_slice(&c);
+        }
+        self.scan_len = 0;
+        self.pending = all.freeze();
+    }
+
+    /// Remove and return the first `n` bytes of `pending` followed by
+    /// `scan` (at most all of them); the rest stays in `pending`. Copies
+    /// only when the bytes span several chunks.
+    fn take_buffered(&mut self, n: usize) -> Bytes {
+        if self.scan.is_empty() {
+            let n = n.min(self.pending.len());
+            return self.pending.split_to(n);
+        }
+        if self.pending.is_empty() && self.scan.len() == 1 {
+            let mut only = self.scan.pop().expect("one chunk");
+            self.scan_len = 0;
+            let out = only.split_to(n.min(only.len()));
+            self.pending = only;
+            return out;
+        }
+        let total = self.pending.len() + self.scan_len;
+        let n = n.min(total);
+        let mut out = BytesMut::with_capacity(n);
+        let mut rest: Vec<Bytes> = Vec::new();
+        let chunks = std::iter::once(std::mem::take(&mut self.pending)).chain(self.scan.drain(..));
+        for mut c in chunks {
+            let k = (n - out.len()).min(c.len());
+            if k > 0 {
+                out.extend_from_slice(&c.split_to(k));
+            }
+            if !c.is_empty() {
+                rest.push(c);
+            }
+        }
+        self.scan_len = 0;
+        // The cut lies in the last chunk for every caller, so `rest` is one
+        // slice of it (no copy); fold anything else.
+        self.pending = match rest.len() {
+            0 => Bytes::new(),
+            1 => rest.pop().expect("one chunk"),
+            _ => {
+                let mut all = BytesMut::with_capacity(total - n);
+                for c in &rest {
+                    all.extend_from_slice(c);
+                }
+                all.freeze()
+            }
+        };
+        out.freeze()
+    }
+
+    /// The last `k` buffered bytes (`pending` then `scan`), for finding a
+    /// delimiter that straddles a chunk boundary.
+    fn buffered_tail(&self, k: usize) -> Vec<u8> {
+        let mut parts: Vec<&[u8]> = Vec::new();
+        let mut need = k;
+        for c in self.scan.iter().rev().chain(std::iter::once(&self.pending)) {
+            if need == 0 {
+                break;
+            }
+            let t = need.min(c.len());
+            parts.push(&c[c.len() - t..]);
+            need -= t;
+        }
+        parts.iter().rev().flat_map(|p| p.iter().copied()).collect()
     }
 
     fn seek(&mut self, to: SeekFrom) -> Result<u64> {
+        self.settle();
         let target = match to {
             SeekFrom::Start(n) => n,
             _ => unreachable!("seek targets are resolved to absolute positions"),
@@ -138,6 +228,7 @@ impl ReaderState {
     /// `read(n)` (`None`: to EOF). Cancel-safe: pending bytes are only
     /// consumed once the read from the reader has completed.
     async fn read(&mut self, n: Option<usize>) -> Result<Bytes> {
+        self.settle();
         if self.pending.is_empty() {
             return self.reader.read(n).await;
         }
@@ -160,6 +251,7 @@ impl ReaderState {
     /// `readinto(buf)`: pending bytes first, then straight from the reader
     /// into `buf`.
     async fn read_into(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.settle();
         let k = self.pending.len().min(buf.len());
         if k == buf.len() {
             buf.copy_from_slice(&self.pending[..k]);
@@ -175,13 +267,10 @@ impl ReaderState {
     /// The next line if it is already in `pending` (no I/O): up to and
     /// including the first `delim`, or `limit` bytes.
     fn take_line(&mut self, delim: &[u8], limit: Option<usize>) -> Option<Bytes> {
+        self.settle();
         let limit = limit.unwrap_or(usize::MAX);
         let window = &self.pending[..self.pending.len().min(limit.saturating_add(delim.len()))];
-        let found = if delim.len() == 1 {
-            memchr::memchr(delim[0], window)
-        } else {
-            memchr::memmem::find(window, delim)
-        };
+        let found = find(window, delim);
         match found {
             Some(i) => Some(self.pending.split_to((i + delim.len()).min(limit))),
             None if self.pending.len() >= limit => Some(self.pending.split_to(limit)),
@@ -190,43 +279,62 @@ impl ReaderState {
     }
 
     /// Read up to and including the first `delim` (or EOF, or `limit`
-    /// bytes). Cancel-safe: fetched data accumulates in `pending` until the
-    /// line is complete.
+    /// bytes).
+    ///
+    /// Each fetched chunk is searched once (plus the few bytes before it a
+    /// straddling delimiter can start in) and appended to `scan`; the line
+    /// is assembled once at the end, so a line of `L` bytes costs `O(L)`
+    /// work however many chunks it spans. Cancel-safe: chunks are stored in
+    /// `self` as soon as they arrive.
     async fn read_until(&mut self, delim: &[u8], limit: Option<usize>) -> Result<Bytes> {
+        self.settle();
         let dlen = delim.len();
         let limit = limit.unwrap_or(usize::MAX);
-        let mut searched = 0usize;
+        if let Some(line) = self.take_line(delim, Some(limit)) {
+            return Ok(line);
+        }
         let mut chunk = SCAN_CHUNK_MIN;
         loop {
-            let from = searched.saturating_sub(dlen - 1);
-            let found = if dlen == 1 {
-                memchr::memchr(delim[0], &self.pending[from..])
-            } else {
-                memchr::memmem::find(&self.pending[from..], delim)
-            };
-            if let Some(i) = found {
-                let end = (from + i + dlen).min(limit);
-                return Ok(self.pending.split_to(end));
-            }
-            if self.pending.len() >= limit {
-                return Ok(self.pending.split_to(limit));
-            }
-            let want = chunk.min(limit - self.pending.len());
+            let before = self.pending.len() + self.scan_len;
+            let want = chunk.min(limit - before);
             let more = self.reader.read(Some(want)).await?;
             if more.is_empty() {
-                return Ok(std::mem::take(&mut self.pending));
+                // EOF: the rest of the file is the line.
+                return Ok(self.take_buffered(before));
             }
-            searched = self.pending.len();
-            if self.pending.is_empty() {
-                self.pending = more;
+            // A delimiter starting in the buffered bytes and ending in `more`
+            // comes first; then one entirely inside `more`.
+            let straddling = if dlen > 1 {
+                let mut window = self.buffered_tail(dlen - 1);
+                let carried = window.len();
+                window.extend_from_slice(&more[..more.len().min(dlen - 1)]);
+                find(&window, delim)
+                    .filter(|&i| i < carried)
+                    .map(|i| i + dlen - carried)
             } else {
-                let mut joined = BytesMut::with_capacity(self.pending.len() + more.len());
-                joined.extend_from_slice(&self.pending);
-                joined.extend_from_slice(&more);
-                self.pending = joined.freeze();
+                None
+            };
+            let found = straddling.or_else(|| find(&more, delim).map(|i| i + dlen));
+            let fetched = more.len();
+            self.scan_len += fetched;
+            self.scan.push(more);
+            if let Some(end) = found {
+                return Ok(self.take_buffered((before + end).min(limit)));
+            }
+            if before + fetched >= limit {
+                return Ok(self.take_buffered(limit));
             }
             chunk = (chunk * 2).min(SCAN_CHUNK_MAX);
         }
+    }
+}
+
+/// Index of the first occurrence of `delim` in `hay`.
+fn find(hay: &[u8], delim: &[u8]) -> Option<usize> {
+    if delim.len() == 1 {
+        memchr::memchr(delim[0], hay)
+    } else {
+        memchr::memmem::find(hay, delim)
     }
 }
 
@@ -307,11 +415,7 @@ impl RustReader {
         if let Some(mut g) = self.state.try_lock() {
             let st = raise(py, self.open_state(&mut g))?;
             let mut fut = f(st);
-            let first = {
-                let _ctx = slot.handle().enter();
-                fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-            };
-            if let Poll::Ready(r) = first {
+            if let Poll::Ready(r) = poll_inline(&slot, fut.as_mut()) {
                 return raise(py, r);
             }
             // Pending: finish detached, still holding the state (other
@@ -370,6 +474,21 @@ impl RustReader {
         self.stats.add_bytes_read(data.len() as u64);
         bytes_to_py(py, &data)
     }
+}
+
+/// First poll of a file operation on the calling thread, which is attached
+/// to the interpreter: inside the fork gate when it is open, skipped
+/// (`Pending`, so the caller finishes detached) while a fork is pending,
+/// because an attached thread must never wait for the gate.
+fn poll_inline<T>(
+    slot: &crate::runtime::RuntimeSlot,
+    fut: std::pin::Pin<&mut (dyn std::future::Future<Output = Result<T>> + Send + '_)>,
+) -> Poll<Result<T>> {
+    let Some(_gate) = crate::gate::try_enter() else {
+        return Poll::Pending;
+    };
+    let _ctx = slot.handle().enter();
+    fut.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 fn opt_len(n: Option<i64>) -> Option<usize> {
@@ -620,8 +739,9 @@ struct WriterState {
     buffer_size: usize,
     accepted: u64,
     closed: bool,
-    /// PID that opened the handle (a forked child must not touch it).
-    pid: u32,
+    /// [`fork_generation`] that opened the handle (a forked child must not
+    /// touch it).
+    generation: u64,
     /// The handle was given up in a forked child (see `check_fork`).
     abandoned: bool,
     /// For error messages.
@@ -644,7 +764,7 @@ impl WriterState {
     /// runtime, and the parent commits the file. Afterwards writes raise and
     /// `close`/`abort` only mark the file closed. Idempotent.
     fn check_fork(&mut self) {
-        if self.abandoned || self.pid == std::process::id() {
+        if self.abandoned || self.generation == fork_generation() {
             return;
         }
         self.abandoned = true;
@@ -716,7 +836,7 @@ impl RustWriter {
                 buffer_size,
                 accepted: 0,
                 closed: false,
-                pid: std::process::id(),
+                generation: fork_generation(),
                 abandoned: false,
                 path: path.clone(),
             }),
@@ -738,11 +858,7 @@ impl RustWriter {
         if inline_first && let Some(mut g) = self.state.try_lock() {
             g.check_fork();
             let mut fut = f(&mut g);
-            let first = {
-                let _ctx = slot.handle().enter();
-                fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-            };
-            if let Poll::Ready(r) = first {
+            if let Poll::Ready(r) = poll_inline(&slot, fut.as_mut()) {
                 return raise(py, r);
             }
             let r = py.detach(move || drive(&slot, fut));
@@ -894,7 +1010,7 @@ impl Drop for RustWriter {
         let path = std::mem::take(&mut self.path);
         // Finish like a garbage-collected Python file: write what is left and
         // commit, in the background (drop may run on any thread).
-        runtime().handle().spawn(async move {
+        runtime().handle().spawn(crate::gate::Gated(Box::pin(async move {
             if !buf.is_empty()
                 && let Err(e) = h.write(buf).await
             {
@@ -908,6 +1024,168 @@ impl Drop for RustWriter {
                     let _ = h.abort().await;
                 }
             }
+        })));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fsfast_core::{ReadHandle, async_trait};
+    use std::pin::pin;
+
+    /// An in-memory read handle whose every read first yields once, so a
+    /// test can cancel an operation between fetches.
+    #[derive(Debug)]
+    struct YieldingHandle {
+        info: FileInfo,
+        data: Bytes,
+    }
+
+    #[async_trait]
+    impl ReadHandle for YieldingHandle {
+        fn info(&self) -> &FileInfo {
+            &self.info
+        }
+
+        async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+            tokio::task::yield_now().await;
+            let s = (offset as usize).min(self.data.len());
+            let e = s.saturating_add(len).min(self.data.len());
+            Ok(self.data.slice(s..e))
+        }
+    }
+
+    fn state(data: &[u8]) -> ReaderState {
+        let handle = Arc::new(YieldingHandle {
+            info: FileInfo::file("/t", data.len() as u64),
+            data: Bytes::copy_from_slice(data),
         });
+        let cfg = ReaderConfig::with_cache(CacheMode::None);
+        ReaderState::new(FileReader::new(handle, cfg.clone()), cfg)
+    }
+
+    /// `readuntil` on a byte vector: the reference semantics.
+    fn model_until(data: &[u8], pos: &mut usize, delim: &[u8], limit: Option<usize>) -> Vec<u8> {
+        let rest = &data[*pos..];
+        let mut end = find(rest, delim).map_or(rest.len(), |i| i + delim.len());
+        if let Some(l) = limit {
+            end = end.min(l);
+        }
+        *pos += end;
+        rest[..end].to_vec()
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    #[test]
+    fn delimiter_scans_match_a_model_across_chunk_boundaries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..40 {
+            // Sparse delimiters (long lines spanning many scan chunks) in
+            // some rounds, dense ones in others; multi-byte delimiters are
+            // placed right at scan-chunk boundaries (8 KiB, 24 KiB, ...).
+            let len = 1 + rng.below(300_000) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| b'a' + rng.below(3) as u8).collect();
+            let delims: [&[u8]; 3] = [b"\n", b"\r\n", b"<END>"];
+            let delim = delims[round % 3];
+            let density = if round % 2 == 0 { 50_000 } else { 300 };
+            let mut at = rng.below(density) as usize;
+            while at + delim.len() <= data.len() {
+                data[at..at + delim.len()].copy_from_slice(delim);
+                at += 1 + rng.below(density) as usize;
+            }
+            for b in [SCAN_CHUNK_MIN, 3 * SCAN_CHUNK_MIN, 7 * SCAN_CHUNK_MIN] {
+                // Starts 2 bytes before the boundary: straddles it.
+                let n = delim.len().min(data.len().saturating_sub(b - 2));
+                if b + 2 <= data.len() {
+                    data[b - 2..b - 2 + n].copy_from_slice(&delim[..n]);
+                }
+            }
+            let mut st = state(&data);
+            let mut pos = 0usize;
+            rt.block_on(async {
+                while pos < data.len() {
+                    match rng.below(10) {
+                        0 => {
+                            let n = rng.below(20_000) as usize;
+                            let got = st.read(Some(n)).await.unwrap();
+                            let want = &data[pos..(pos + n).min(data.len())];
+                            assert_eq!(&got[..], want, "read at {pos}");
+                            pos += want.len();
+                        }
+                        1 => {
+                            let to = rng.below(data.len() as u64 + 1) as usize;
+                            assert_eq!(st.seek(SeekFrom::Start(to as u64)).unwrap(), to as u64);
+                            pos = to;
+                        }
+                        k => {
+                            let limit = (k == 2).then(|| rng.below(40_000) as usize);
+                            let got = st.read_until(delim, limit).await.unwrap();
+                            let want = model_until(&data, &mut pos, delim, limit);
+                            assert_eq!(got.len(), want.len(), "round {round} at {pos}");
+                            assert!(got[..] == want[..], "round {round}: content");
+                        }
+                    }
+                    assert_eq!(st.tell(), pos as u64);
+                }
+                assert!(st.read_until(delim, None).await.unwrap().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_loses_no_data() {
+        // A 2 MB line: the scan needs many fetches (each takes two polls of
+        // the yielding handle). Cancel it after a few of them; every byte
+        // must still come back, in order.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut data: Vec<u8> = (0..2_000_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        data.extend_from_slice(b"\nnext line\n");
+        let mut st = state(&data);
+        let head = rt.block_on(st.read(Some(5))).unwrap();
+        assert_eq!(&head[..], &data[..5]);
+        {
+            let mut fut = pin!(st.read_until(b"\n", None));
+            let mut cx = Context::from_waker(Waker::noop());
+            let _guard = rt.enter();
+            for _ in 0..7 {
+                assert!(fut.as_mut().poll(&mut cx).is_pending());
+            }
+        } // dropped half-way
+        assert!(st.scan_len > 0, "the test did not cancel mid-scan");
+        assert_eq!(st.tell(), 5);
+        let line = rt.block_on(st.read_until(b"\n", None)).unwrap();
+        assert_eq!(&line[..], &data[5..2_000_001]);
+        // The same after a cancelled scan followed by a plain read.
+        let mut st = state(&data);
+        {
+            let mut fut = pin!(st.read_until(b"\n", None));
+            let mut cx = Context::from_waker(Waker::noop());
+            let _guard = rt.enter();
+            for _ in 0..5 {
+                assert!(fut.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+        assert!(st.scan_len > 0, "the test did not cancel mid-scan");
+        assert_eq!(&rt.block_on(st.read(None)).unwrap()[..], &data[..]);
     }
 }

@@ -99,6 +99,15 @@ class FsfastFileSystem(AsyncFileSystem):
     #: ``pipe_file(path, None)`` writes an empty file (fsspec's memory
     #: filesystem) instead of raising ``TypeError`` like a file's ``write``.
     _pipe_none_is_empty: ClassVar[bool] = False
+    #: A file's ``read(n)`` with ``n < -1`` raises ``ValueError``, as the
+    #: reference implementation's file objects do when they are CPython file
+    #: objects (fsspec's local files); otherwise it reads everything, like
+    #: ``AbstractBufferedFile`` and ``BytesIO``.
+    _strict_negative_read: ClassVar[bool] = False
+    #: In mode ``ab``, a file's ``tell()`` counts the existing content (the
+    #: reference's file is positioned at the end of the stored data, as in
+    #: fsspec's memory filesystem) instead of the bytes this handle wrote.
+    _append_tell_from_end: ClassVar[bool] = False
 
     async_impl = True
     mirror_sync_methods = True
@@ -503,7 +512,11 @@ class FsfastFileSystem(AsyncFileSystem):
         return self._cat_result(path, paths, out, on_error)
 
     def head(self, path: Any, size: int = 1024) -> bytes:
-        # fsspec: ``f.read(size)``; a negative size reads everything.
+        # fsspec: ``f.read(size)``; a negative size reads everything (or is
+        # an error below -1, see ``_strict_negative_read``).
+        if size < -1 and self._strict_negative_read:
+            self.cat_file(path, 0, 0)  # fails first like open() would
+            raise ValueError("read length must be non-negative or -1")
         return self.cat_file(path) if size < 0 else self.cat_file(path, 0, size)
 
     def tail(self, path: Any, size: int = 1024) -> bytes:

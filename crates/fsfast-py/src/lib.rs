@@ -13,6 +13,7 @@
 //! Module layout:
 //! * `runtime` — the process-wide tokio runtime, fork safety, the sync
 //!   (`block_on` with signal checks) and async bridges.
+//! * `gate` — the fork gate: `os.fork()` waits for backend code in progress.
 //! * `registry` — compiled-in backends and `make_filesystem`.
 //! * `filesystem` / `ops` — `RustFileSystem` and its operations.
 //! * `file` — `RustReader` / `RustWriter`.
@@ -30,6 +31,7 @@ mod convert;
 mod errors;
 mod file;
 mod filesystem;
+mod gate;
 mod ops;
 mod out;
 mod registry;
@@ -61,22 +63,39 @@ fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(d)
 }
 
-/// Fork hook (`os.register_at_fork(after_in_child=...)`): abandon the
-/// parent's runtime so the child builds its own on next use.
+/// Fork hook (`os.register_at_fork(before=...)`): wait until no backend
+/// code driven by fsfast is running and hold new operations back until the
+/// fork is done, so the child inherits no lock held by another thread.
+#[pyfunction]
+fn _before_fork(py: Python<'_>) {
+    runtime::before_fork(py);
+}
+
+/// Fork hook (`os.register_at_fork(after_in_parent=...)`): let operations
+/// held back by [`_before_fork`] proceed.
+#[pyfunction]
+fn _after_fork_parent() {
+    runtime::after_fork_parent();
+}
+
+/// Fork hook (`os.register_at_fork(after_in_child=...)`): reset the fork
+/// gate and abandon the parent's runtime so the child builds its own on
+/// next use.
 #[pyfunction]
 fn _after_fork_child() {
     runtime::after_fork_child();
 }
 
-/// Register [`_after_fork_child`] with `os.register_at_fork` where the
-/// platform supports forking.
+/// Register the fork hooks with `os.register_at_fork` where the platform
+/// supports forking.
 fn register_fork_hook(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     let os = py.import("os")?;
     if let Ok(register) = os.getattr("register_at_fork") {
-        let hook = m.getattr("_after_fork_child")?;
         let kwargs = PyDict::new(py);
-        kwargs.set_item("after_in_child", hook)?;
+        kwargs.set_item("before", m.getattr("_before_fork")?)?;
+        kwargs.set_item("after_in_parent", m.getattr("_after_fork_parent")?)?;
+        kwargs.set_item("after_in_child", m.getattr("_after_fork_child")?)?;
         register.call((), Some(&kwargs))?;
     }
     Ok(())
@@ -86,6 +105,7 @@ fn register_fork_hook(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pymodule(gil_used = false)]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
+    runtime::watch_forks();
     errors::init(py)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<RustFileSystem>()?;
@@ -96,6 +116,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(filesystem::make_filesystem, m)?)?;
     m.add_function(wrap_pyfunction!(available_protocols, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_info, m)?)?;
+    m.add_function(wrap_pyfunction!(_before_fork, m)?)?;
+    m.add_function(wrap_pyfunction!(_after_fork_parent, m)?)?;
     m.add_function(wrap_pyfunction!(_after_fork_child, m)?)?;
     register_fork_hook(m)?;
     Ok(())

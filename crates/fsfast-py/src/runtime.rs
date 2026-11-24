@@ -9,10 +9,14 @@
 //!   none of its threads. Using it would hang and dropping it would join
 //!   threads that do not exist, so the child leaks it (`mem::forget`) and
 //!   builds a new one: eagerly from `os.register_at_fork(after_in_child=...)`
-//!   ([`after_fork_child`]) and, as a fallback for forks that bypass Python's
-//!   hooks, whenever the current PID differs from the PID that built it.
+//!   ([`after_fork_child`]) and, for forks that bypass Python's hooks, on
+//!   first use, because a `pthread_atfork` handler counts every fork
+//!   ([`fork_generation`]; an atomic load per call instead of a `getpid`
+//!   system call).
 //!   The runtime slot is an [`ArcSwapOption`], so no lock can be held across
-//!   a fork.
+//!   a fork. Locks inside backends are kept out of the child by the fork
+//!   gate ([`crate::gate`]): the `before` hook ([`before_fork`]) waits until
+//!   no backend future is being polled.
 //! * **Sync calls** ([`block_on`]) detach from the interpreter (release the
 //!   GIL), drive the future on the calling thread with a minimal executor —
 //!   no thread hop, no asyncio, no per-call timer — and wake every
@@ -36,13 +40,16 @@ use pyo3_async_runtimes::TaskLocals;
 use pyo3_async_runtimes::generic::{ContextExt, Runtime as AsyncRuntime};
 use tokio::runtime::{Handle, Runtime};
 
+use crate::gate;
+
 /// How often a blocked sync call re-attaches to the interpreter to check for
 /// pending signals (Ctrl-C).
 pub(crate) const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The runtime together with the PID of the process that built it.
+/// The runtime together with the process (and fork generation) that built it.
 pub(crate) struct RuntimeSlot {
     pid: u32,
+    generation: u64,
     rt: Runtime,
 }
 
@@ -60,12 +67,19 @@ impl RuntimeSlot {
 
 static RUNTIME: ArcSwapOption<RuntimeSlot> = ArcSwapOption::const_empty();
 
-/// Incremented every time this process turns out to be a forked child of
-/// the process that built the runtime (by the fork hook, or by the PID check
-/// in [`runtime`]). Objects holding state tied to a runtime (open files with
-/// background fetches) record it and, when it changed, abandon that state
-/// instead of touching the parent's runtime, which has no threads here.
+/// Incremented in every forked child, by a `pthread_atfork` child handler
+/// ([`watch_forks`]) that sees each `fork()` made through the C library,
+/// including forks that bypass Python's `os.register_at_fork` hooks. State
+/// tied to a process's runtime (the runtime itself, backend instances, open
+/// files with background work) records it and, when it changed, is rebuilt
+/// or abandoned instead of touching the parent's runtime, which has no
+/// threads here. Checking it is one atomic load: no `getpid` system call on
+/// every operation.
 static FORK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the `pthread_atfork` handler is installed. If registering it
+/// failed, the Python `after_in_child` hook counts forks instead.
+static ATFORK_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// The current fork generation (see [`FORK_GENERATION`]); one atomic load.
 pub(crate) fn fork_generation() -> u64 {
@@ -76,11 +90,46 @@ fn note_fork() {
     FORK_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
+/// `pthread_atfork` child handler. Runs in the child inside `fork()`, where
+/// only async-signal-safe operations are allowed: a lock-free atomic
+/// increment is one.
+#[cfg(unix)]
+extern "C" fn on_fork_child() {
+    note_fork();
+}
+
+/// Install the fork watcher (once per process; cheap after the first call).
+/// Called before anything records a fork generation: when the module is
+/// imported, before building a runtime and when creating a filesystem.
+pub(crate) fn watch_forks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: registers a `'static` handler that performs a single
+            // atomic increment, which is async-signal-safe as required for
+            // code running in a child between `fork()` and its return.
+            let rc = unsafe {
+                libc::pthread_atfork(None, None, Some(on_fork_child as unsafe extern "C" fn()))
+            };
+            if rc == 0 {
+                ATFORK_INSTALLED.store(true, Ordering::Release);
+            } else {
+                tracing::warn!(
+                    rc,
+                    "fsfast: pthread_atfork failed; forks are only detected through os.fork()"
+                );
+            }
+        }
+    });
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
 }
 
 fn build_runtime() -> Runtime {
+    watch_forks();
     let mut b = tokio::runtime::Builder::new_multi_thread();
     b.enable_all().thread_name("fsfast-rt");
     if let Some(n) = env_usize("FSFAST_WORKER_THREADS") {
@@ -96,19 +145,21 @@ fn build_runtime() -> Runtime {
 }
 
 /// The current process's runtime, building it on first use (or after a
-/// fork). Cheap: one atomic load on the fast path.
+/// fork). Cheap: two atomic loads on the fast path.
 pub(crate) fn runtime() -> Arc<RuntimeSlot> {
-    let pid = std::process::id();
     loop {
+        let generation = fork_generation();
         let current = RUNTIME.load_full();
         if let Some(slot) = &current
-            && slot.pid == pid
+            && slot.generation == generation
         {
             return slot.clone();
         }
         let fresh = Arc::new(RuntimeSlot {
-            pid,
+            pid: std::process::id(),
             rt: build_runtime(),
+            // Read after `build_runtime` installed the fork watcher.
+            generation: fork_generation(),
         });
         let prev = RUNTIME.compare_and_swap(&current, Some(fresh.clone()));
         let won = match (&*prev, &current) {
@@ -119,8 +170,8 @@ pub(crate) fn runtime() -> Arc<RuntimeSlot> {
         drop(prev);
         if won {
             if let Some(inherited) = current {
-                // Built by the parent before a fork that skipped our hook.
-                note_fork();
+                // Built by the parent before the fork (the Python hook did
+                // not run, or has not run yet).
                 abandon(inherited);
             }
             return fresh;
@@ -143,12 +194,28 @@ fn abandon(slot: Arc<RuntimeSlot>) {
     std::mem::forget(slot);
 }
 
-/// `os.register_at_fork(after_in_child=...)` hook: forget the parent's
-/// runtime; the next call builds a fresh one.
+/// `os.register_at_fork(before=...)` hook: wait, with the interpreter
+/// released, until no backend code driven by fsfast runs, and keep new
+/// operations from starting until the fork is done (see [`crate::gate`]).
+pub(crate) fn before_fork(py: Python<'_>) {
+    py.detach(gate::close_for_fork);
+}
+
+/// `os.register_at_fork(after_in_parent=...)` hook: let operations resume.
+pub(crate) fn after_fork_parent() {
+    gate::reopen_after_fork();
+}
+
+/// `os.register_at_fork(after_in_child=...)` hook: reset the fork gate and
+/// forget the parent's runtime; the next call builds a fresh one.
 pub(crate) fn after_fork_child() {
+    let child = gate::reset_in_child();
+    if child && !ATFORK_INSTALLED.load(Ordering::Acquire) {
+        // The `pthread_atfork` handler is missing: count the fork here.
+        note_fork();
+    }
     if let Some(old) = RUNTIME.swap(None) {
-        if old.pid != std::process::id() {
-            note_fork();
+        if old.generation != fork_generation() {
             abandon(old);
         } else {
             // Not actually inherited (hook called by hand): keep it.
@@ -178,11 +245,14 @@ where
 {
     if Handle::try_current().is_ok() {
         // A runtime context is active on this thread: Python code reached
-        // from a finalizer running on a runtime worker. Blocking a worker
-        // could starve the very tasks the future waits for, so drive it
-        // from a helper thread instead (rare; correctness over speed).
+        // from a finalizer running on a runtime worker (or inside a poll).
+        // Blocking a worker could starve the very tasks the future waits
+        // for, so drive it from a helper thread instead (rare; correctness
+        // over speed). The helper works for this thread's poll, so it shares
+        // its fork-gate entries (see `gate::with_inherited_depth`).
+        let depth = gate::depth();
         return std::thread::scope(|s| {
-            s.spawn(|| run_until_complete(slot, fut))
+            s.spawn(move || gate::with_inherited_depth(depth, || run_until_complete(slot, fut)))
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         });
@@ -254,7 +324,13 @@ fn run_with_signal_checks<F: Future>(
     // once never read the clock.
     let mut next_check: Option<Instant> = None;
     loop {
-        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+        // Each poll runs inside the fork gate (see `crate::gate`); this
+        // thread is detached from the interpreter, so it may wait there.
+        let polled = {
+            let _gate = gate::enter();
+            fut.as_mut().poll(&mut cx)
+        };
+        if let Poll::Ready(v) = polled {
             return Ok(v);
         }
         let now = Instant::now();
@@ -337,8 +413,14 @@ where
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
     let locals = TaskLocals::new(event_loop).copy_context(py)?;
-    pyo3_async_runtimes::generic::future_into_py_with_locals::<FsfastRuntime, F, T>(
-        py, locals, fut,
+    // Only `fut` runs inside the fork gate: the wrapper around it attaches
+    // to the interpreter to resolve the asyncio future, which must never
+    // happen while holding a gate entry (the forking thread waits for gate
+    // entries and then needs the interpreter back).
+    pyo3_async_runtimes::generic::future_into_py_with_locals::<FsfastRuntime, _, T>(
+        py,
+        locals,
+        gate::Gated(Box::pin(fut)),
     )
 }
 
@@ -353,6 +435,32 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.pid(), std::process::id());
         assert_eq!(a.handle().block_on(async { 1 + 1 }), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_fork_is_counted_in_the_child_only() {
+        watch_forks();
+        let before = fork_generation();
+        // SAFETY: the child only performs async-signal-safe operations (an
+        // atomic load and `_exit`), as required after forking a
+        // multi-threaded process.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let counted = fork_generation() == before + 1;
+            // SAFETY: `_exit` is async-signal-safe and ends the child.
+            unsafe { libc::_exit(if counted { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child created above; `status` is valid.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the fork was not counted in the child (status {status})"
+        );
+        assert_eq!(fork_generation(), before, "the parent's generation changed");
     }
 
     #[test]

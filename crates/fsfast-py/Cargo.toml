@@ -37,6 +37,10 @@ pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 tokio.workspace = true
 tracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `pthread_atfork`: count forks without a `getpid` call per operation.
+libc = "0.2"
+
 [dev-dependencies]
 pyo3 = { version = "0.30", features = ["abi3-py310", "auto-initialize"] }
 tokio = { workspace = true, features = ["test-util"] }

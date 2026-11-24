@@ -86,13 +86,19 @@ Tuning and diagnostics:
   `errno`, `strerror`, `filename` and the attributes `http_status`,
   `ntstatus`, `sftp_status`, `code`.
 * **Fork safety**: one runtime per process; a forked child abandons the
-  parent's runtime and builds its own (`os.register_at_fork` plus a PID
-  check). Filesystem objects created before a fork keep working in the child.
+  parent's runtime and builds its own (`os.register_at_fork`, plus a
+  `pthread_atfork` counter for forks that bypass Python's hooks; checking it
+  is an atomic load, not a `getpid` call). `os.fork()` first waits for fsfast
+  operations of other threads that are inside backend code (a "fork gate"),
+  so the child never inherits a lock one of them held, such as the memory
+  store's. Filesystem objects created before a fork keep working in the child.
   Files opened for reading before a fork keep working too (the DataLoader
   pattern): the child leaks the parent's prefetch state, which belongs to
   the parent's runtime, and continues at the same position. A file opened
   for writing belongs to the parent: in the child, `write`/`flush` raise
-  `OSError` and `close` gives the file up without committing it.
+  `OSError` and `close` gives the file up without committing it. A file
+  object that another thread was using at the moment of the fork cannot be
+  used in the child (its lock stays taken there).
 * **Free-threaded CPython**: the module is declared `gil_used = false`.
 
 ## Performance status (local and memory, shared 4-core VM)
@@ -127,7 +133,10 @@ Relative to fsspec's reference classes, best of several runs:
 * `LocalFileSystem.put_file(..., mode="create")` raises `FileExistsError`
   for an existing target (fsspec's local `put_file` ignores `mode`).
 * `MemoryFileSystem` has no `store`/`pseudo_dirs` attributes; empty it with
-  `fs.rm("", recursive=True)`. Pickling an instance with
+  `fs.rm("", recursive=True)`. Files opened in a read/write mode (`r+b`,
+  `a+b`, `w+b`, `x+b`) are `BytesIO` buffers like fsspec's, but they are
+  copies: their content is stored back on `flush()`/`close()` (fsspec hands
+  out the stored object itself, so writes show up at once). Pickling an instance with
   `global_store=False` carries its files and directories along, as fsspec
   does.
 * Transactions (`autocommit=False`) write to a hidden sibling

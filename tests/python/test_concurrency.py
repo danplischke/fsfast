@@ -360,6 +360,83 @@ def test_writer_opened_before_fork(tmp, backend):
         assert fs.cat_file(path) == b"p" * (3 << 20) + b"q"
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.parametrize("backend", ["local", "memory"])
+def test_fork_while_other_threads_use_the_filesystem(tmp, backend):
+    """``os.fork()`` while other threads are inside fsfast calls on the same
+    filesystem: the child must not inherit a lock that one of those threads
+    held at the moment of the fork (it would never be released there). The
+    memory store's lock is taken by every operation, so before the fork gate
+    roughly one fork in five deadlocked the child."""
+    if backend == "local":
+        fs = fsfast.LocalFileSystem(auto_mkdir=True)
+        root = tmp
+    else:
+        fs = fsfast.MemoryFileSystem(global_store=False, skip_instance_cache=True)
+        root = "/forkrace"
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def hammer(i: int) -> None:
+        n = 0
+        try:
+            while not stop.is_set():
+                p = f"{root}/t{i}/{n % 20}"
+                fs.pipe_file(p, b"x" * 4096)
+                fs.cat_file(p)
+                fs.ls(f"{root}/t{i}")
+                n += 1
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=hammer, args=(i,), daemon=True) for i in range(4)]
+    for t in threads:
+        t.start()
+
+    def child() -> bool:
+        fs.pipe_file(f"{root}/child", b"c")
+        return fs.cat_file(f"{root}/child") == b"c" and len(fs.find(root)) > 0
+
+    try:
+        time.sleep(0.1)
+        for _ in range(40):
+            # A deadlocked child is killed by SIGALRM after 3 s.
+            assert _fork_and_run(child, timeout=3) == 0
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(10)
+    assert not errors, errors
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="calls glibc's fork() through ctypes")
+def test_fork_that_bypasses_python_hooks_gets_a_fresh_runtime(tmp):
+    """A fork that ``os.register_at_fork`` hooks never see (libc's
+    ``fork()`` called directly) must still not reuse the parent's runtime,
+    whose threads do not exist in the child: the local backend's blocking
+    pool would never run anything and the call would hang."""
+    import ctypes
+
+    fs = fsfast.LocalFileSystem()
+    fs.pipe_file(f"{tmp}/parent", b"runtime started")  # the parent's runtime exists
+    parent_pid = fsfast.runtime_info()["pid"]
+    # PyDLL keeps the GIL held across the call, so the child owns it.
+    pid = ctypes.PyDLL(None).fork()
+    if pid == 0:  # child: Python was not told about the fork
+        code = 1
+        try:
+            signal.alarm(10)
+            fs.pipe_file(f"{tmp}/child", b"child")
+            ok = fs.cat_file(f"{tmp}/child") == b"child"
+            code = 0 if ok and fsfast.runtime_info()["pid"] == os.getpid() else 2
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    assert fsfast.runtime_info()["pid"] == parent_pid
+    assert fs.cat_file(f"{tmp}/child") == b"child"
+
+
 def _gil_probe(blocking_call, release) -> int:
     """Count how often another Python thread runs while ``blocking_call``
     blocks in Rust; ``release`` unblocks it from outside the interpreter

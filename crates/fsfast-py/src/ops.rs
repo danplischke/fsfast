@@ -31,9 +31,10 @@ use crate::file::{RustReader, RustWriter};
 use crate::out::{Item, PyOut};
 use crate::registry::Backend;
 
-/// The backend instance together with the PID it was built in.
+/// The backend instance together with the fork generation it was built in
+/// (see [`crate::runtime::fork_generation`]).
 struct FsSlot {
-    pid: u32,
+    generation: u64,
     fs: DynFileSystem,
 }
 
@@ -49,6 +50,7 @@ pub(crate) struct FsInner {
 impl FsInner {
     /// Build the backend for `protocol` from `options`.
     pub(crate) fn new(protocol: &str, options: Options) -> Result<Self> {
+        crate::runtime::watch_forks();
         let backend = crate::registry::lookup(protocol)?;
         let fs = (backend.build)(options.clone())?;
         Ok(FsInner {
@@ -56,7 +58,7 @@ impl FsInner {
             protocol: protocol.to_owned(),
             options,
             slot: ArcSwap::from_pointee(FsSlot {
-                pid: std::process::id(),
+                generation: crate::runtime::fork_generation(),
                 fs,
             }),
             stats: Arc::new(Stats::new()),
@@ -68,13 +70,13 @@ impl FsInner {
     /// original options first (see `Backend::rebuild_after_fork`).
     pub(crate) fn fs(&self) -> Result<DynFileSystem> {
         let slot = self.slot.load();
-        let pid = std::process::id();
-        if slot.pid == pid || !self.backend.rebuild_after_fork {
+        let generation = crate::runtime::fork_generation();
+        if slot.generation == generation || !self.backend.rebuild_after_fork {
             return Ok(slot.fs.clone());
         }
         let fs = (self.backend.build)(self.options.clone())?;
         self.slot.store(Arc::new(FsSlot {
-            pid,
+            generation,
             fs: fs.clone(),
         }));
         Ok(fs)
@@ -1159,13 +1161,19 @@ mod tests {
         }
         // "return" runs everything and reports each item.
         let out = rt
-            .block_on(run_batch(5, 2, OnError::Return, Effects::Mutating, |i| async move {
-                if i % 2 == 1 {
-                    Err(Error::not_found(format!("i{i}")))
-                } else {
-                    Ok(PyOut::Bool(true))
-                }
-            }))
+            .block_on(run_batch(
+                5,
+                2,
+                OnError::Return,
+                Effects::Mutating,
+                |i| async move {
+                    if i % 2 == 1 {
+                        Err(Error::not_found(format!("i{i}")))
+                    } else {
+                        Ok(PyOut::Bool(true))
+                    }
+                },
+            ))
             .unwrap();
         match out {
             PyOut::Items(v) => {

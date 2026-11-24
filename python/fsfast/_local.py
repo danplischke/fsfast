@@ -37,6 +37,8 @@ class LocalFileSystem(FsfastFileSystem, _ref.LocalFileSystem):
     # ``f.read(end - f.tell())`` from a Python file: a count of -1 reads to
     # EOF, anything below raises ValueError.
     _seek_read_ranges = True
+    # fsspec's local files are CPython file objects.
+    _strict_negative_read = True
 
     # Path semantics are fsspec's own.
     _strip_protocol = classmethod(_ref.LocalFileSystem._strip_protocol.__func__)  # type: ignore[assignment,var-annotated]

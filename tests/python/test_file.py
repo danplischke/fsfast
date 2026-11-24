@@ -7,6 +7,7 @@ import gzip
 import io
 import os
 import pickle
+import time
 
 import pytest
 
@@ -294,6 +295,186 @@ def test_local_extra_modes_fall_back_to_os_file(tmp):
     assert fs.cat_file(p) == b"01ab456789"
 
 
+def _rw_scenario(fs, root: str) -> list:
+    """Read/write ('+') modes on a memory filesystem, recording results."""
+    out: list = []
+
+    def step(fn):
+        try:
+            out.append(("ok", fn()))
+        except Exception as e:  # noqa: BLE001
+            out.append(type(e).__name__)
+
+    fs.pipe_file(f"{root}/f", b"hello world")
+    fs.mkdir(f"{root}/d")
+
+    def rplus():
+        with fs.open(f"{root}/f", "r+b") as f:
+            head = f.read(5)
+            f.seek(0)
+            f.write(b"HE")
+            f.seek(0, 2)
+            f.write(b"!")
+            return head, f.tell()
+
+    step(rplus)
+    step(lambda: fs.cat_file(f"{root}/f"))
+
+    def aplus():
+        with fs.open(f"{root}/f", "a+b") as f:
+            start = f.tell()
+            f.write(b"++")
+            f.seek(0)
+            return start, f.read()
+
+    step(aplus)
+    step(lambda: fs.cat_file(f"{root}/f"))
+
+    def aplus_new():
+        with fs.open(f"{root}/new-a", "a+b") as f:
+            f.write(b"a")
+        return fs.cat_file(f"{root}/new-a")
+
+    step(aplus_new)
+
+    def wplus():
+        f = fs.open(f"{root}/f", "w+b")
+        visible_at_open = fs.cat_file(f"{root}/f")  # truncated at once
+        f.write(b"new")
+        f.seek(0)
+        back = f.read()
+        f.close()
+        return visible_at_open, back, fs.cat_file(f"{root}/f")
+
+    step(wplus)
+    step(lambda: fs.open(f"{root}/f", "x+b"))
+    step(lambda: fs.open(f"{root}/missing", "r+b"))
+    step(lambda: fs.open(f"{root}/d", "r+b"))
+    step(lambda: fs.open(f"{root}/d", "w+b"))
+    step(lambda: fs.open(f"{root}/f/below", "w+b"))
+
+    def xplus():
+        with fs.open(f"{root}/x", "x+b") as f:
+            f.write(b"x")
+        return fs.cat_file(f"{root}/x")
+
+    step(xplus)
+
+    def text_rplus():
+        with fs.open(f"{root}/x", "r+", encoding="utf-8") as f:
+            f.read()
+            f.write("é")
+        return fs.cat_file(f"{root}/x")
+
+    step(text_rplus)
+
+    def flushed_is_visible():
+        with fs.open(f"{root}/x", "r+b") as f:
+            f.write(b"Y")
+            f.flush()
+            return fs.cat_file(f"{root}/x")
+
+    step(flushed_is_visible)
+    return out
+
+
+def test_memory_read_write_modes_match_fsspec(memory_fs):
+    """fsspec's memory files are ``BytesIO`` objects, so its memory
+    filesystem supports ``r+b``, ``a+b``, ``w+b`` and ``x+b``; fsfast's must
+    too (and fail the same way for missing paths, directories, existing
+    targets)."""
+    from fsspec.implementations.memory import MemoryFileSystem as RefMemory
+
+    ref = RefMemory()
+    ref.store.clear()
+    ref.pseudo_dirs.clear()
+    ref.pseudo_dirs.append("")
+    try:
+        expected = _rw_scenario(ref, "/rw")
+    finally:
+        ref.store.clear()
+        ref.pseudo_dirs.clear()
+        ref.pseudo_dirs.append("")
+    assert _rw_scenario(memory_fs, "/rw") == expected
+
+
+def test_negative_read_lengths_match_the_reference_files(tmp, memory_fs):
+    """fsspec's local files are CPython file objects: ``read(n)`` with
+    ``n < -1`` raises ``ValueError`` (so does ``head``). Its memory files are
+    ``BytesIO`` objects, which read everything."""
+    from fsspec.implementations.local import LocalFileSystem as RefLocal
+    from fsspec.implementations.memory import MemoryFileSystem as RefMemory
+
+    def outcome(fn):
+        try:
+            return fn()
+        except ValueError:
+            return "ValueError"
+
+    lp = f"{tmp}/neg"
+    fsfast.LocalFileSystem().pipe_file(lp, b"0123456789")
+    RefMemory().pipe_file("/neg-ref", b"0123456789")
+    memory_fs.pipe_file("/neg", b"0123456789")
+    cases = [
+        (RefLocal(), fsfast.LocalFileSystem(), lp, lp),
+        (RefMemory(), memory_fs, "/neg-ref", "/neg"),
+    ]
+    try:
+        for ref, ours, rp, op in cases:
+            for n in (-1, -2, -5):
+                with ref.open(rp, "rb") as a, ours.open(op, "rb") as b:
+                    a.read(2), b.read(2)
+                    assert outcome(lambda: b.read(n)) == outcome(lambda: a.read(n)), (ref, n)
+                    assert b.tell() == a.tell()
+                assert outcome(lambda: ours.head(op, n)) == outcome(lambda: ref.head(rp, n))
+            with ours.open(op, "rb") as b:
+                assert b.read1(-3) == b"0123456789"  # read1 never rejects
+    finally:
+        RefMemory().rm_file("/neg-ref")
+
+
+def test_tell_in_append_mode_matches_the_reference(tmp, memory_fs):
+    """In mode ``ab``, fsspec's memory file is the stored ``BytesIO``
+    positioned at its end, so ``tell()`` counts the existing content; its
+    local file reports what this handle wrote."""
+    from fsspec.implementations.local import LocalFileSystem as RefLocal
+    from fsspec.implementations.memory import MemoryFileSystem as RefMemory
+
+    def tells(fs, path):
+        fs.pipe_file(path, b"0123")
+        with fs.open(path, "ab") as f:
+            out = [f.tell()]
+            f.write(b"xy")
+            out.append(f.tell())
+        with fs.open(f"{path}-new", "ab") as f:  # created by the append
+            f.write(b"z")
+            out.append(f.tell())
+        return out, fs.cat_file(path)
+
+    try:
+        assert tells(memory_fs, "/ab") == tells(RefMemory(), "/ab-ref")
+    finally:
+        RefMemory().rm(["/ab-ref", "/ab-ref-new"])
+    assert tells(fsfast.LocalFileSystem(), f"{tmp}/ab") == tells(RefLocal(), f"{tmp}/ab-ref")
+
+
+def test_memory_read_write_mode_in_a_transaction(memory_fs):
+    p = "/tx-rw"
+    with memory_fs.transaction:
+        with memory_fs.open(p, "w+b") as f:
+            f.write(b"deferred")
+        assert not memory_fs.exists(p)
+    assert memory_fs.cat_file(p) == b"deferred"
+    try:
+        with memory_fs.transaction:
+            with memory_fs.open(p, "w+b") as f:
+                f.write(b"dropped")
+            raise RuntimeError("abort")
+    except RuntimeError:
+        pass
+    assert memory_fs.cat_file(p) == b"deferred"
+
+
 def test_reader_and_writer_objects_directly(tmp):
     rfs = fsfast.LocalFileSystem().rust
     p = f"{tmp}/direct"
@@ -364,3 +545,31 @@ def test_threads_iterating_one_file_see_every_line_once(memory_fs):
         t.join(timeout=60)
     f.close()
     assert sorted(int(x) for x in seen) == list(range(n))
+
+
+def test_long_lines_cost_linear_time(tmp):
+    """A line spanning many scan chunks is assembled once. ``readline`` of a
+    96 MiB line used to re-copy everything fetched so far for every 1 MiB
+    chunk (quadratic: seconds, 12x slower than fsspec at 64 MiB); now it
+    costs about as much as reading the data."""
+    data = b"x" * (96 << 20) + b"\ntail\n"
+    p = f"{tmp}/long-line"
+    with open(p, "wb") as fh:
+        fh.write(data)
+    fs = fsfast.LocalFileSystem()
+    with fs.open(p, "rb") as f:
+        t0 = time.perf_counter()
+        assert len(f.read()) == len(data)
+        t_read = time.perf_counter() - t0
+    with fs.open(p, "rb") as f:
+        t0 = time.perf_counter()
+        line = f.readline()
+        t_line = time.perf_counter() - t0
+        assert len(line) == (96 << 20) + 1
+        assert f.readline() == b"tail\n"
+    with fs.open(p, "rb") as f:
+        t0 = time.perf_counter()
+        assert len(f.readuntil(b"\ntail")) == (96 << 20) + 5
+        t_until = time.perf_counter() - t0
+    assert t_line < 8 * t_read + 0.5, (t_line, t_read)
+    assert t_until < 8 * t_read + 0.5, (t_until, t_read)
