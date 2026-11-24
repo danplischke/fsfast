@@ -12,6 +12,8 @@ members = [
     "crates/fsfast-smb-proto",
     "crates/fsfast-smb",
     "crates/fsfast-sftp",
+    "crates/fsfast-gcs",
+    "crates/fsfast-azure",
     "crates/fsfast-py",
     "crates/fsfast-cli",
 ]
@@ -35,6 +37,8 @@ fsfast-s3 = { path = "crates/fsfast-s3" }
 fsfast-smb-proto = { path = "crates/fsfast-smb-proto" }
 fsfast-smb = { path = "crates/fsfast-smb" }
 fsfast-sftp = { path = "crates/fsfast-sftp" }
+fsfast-gcs = { path = "crates/fsfast-gcs" }
+fsfast-azure = { path = "crates/fsfast-azure" }
 
 async-trait = "0.1"
 bytes = "1"

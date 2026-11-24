@@ -51,13 +51,17 @@ file is the day-to-day contract.
   **gated on environment variables**: if the variables are unset, print a skip
   message and return (a plain `cargo test` must pass without services).
 - Test services are normally already running. Load their settings with
-  `eval "$(scripts/test-services.sh env)"`. Check a service with `ss -ltn`
+  `eval "$(scripts/test-services.sh env)"`. Check services with `scripts/test-services.sh status`
   before assuming it is down; only run `scripts/test-services.sh start` if it
   really is down, and never stop services (other engineers share them).
   - S3: `$FSFAST_TEST_S3_ENDPOINT` (RustFS), key/secret in env.
   - SMB: Samba on 127.0.0.1:445, shares `data` (signing mandatory) and `enc`
     (encryption required), user `fsfast` / `fsfastpw`.
   - SFTP: OpenSSH on 127.0.0.1:2222, user `fsfast` / `fsfastpw`.
+  - GCS: fake-gcs-server on `$FSFAST_TEST_GCS_ENDPOINT` (http, no auth).
+  - Azure: Azurite blob service, `$FSFAST_TEST_AZURE_*` (no ADLS Gen2/DFS).
+  - `scripts/test-services.sh status` shows what is listening; `start` only
+    starts services that are down, so it is always safe to run.
 - Local services need `NO_PROXY=127.0.0.1,localhost` (outbound HTTPS goes via
   a proxy configured in `HTTPS_PROXY`). HTTP clients must honour
   `HTTP(S)_PROXY`/`NO_PROXY`.
