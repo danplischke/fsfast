@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fsfast-core",
+    "crates/fsfast-engine",
+    "crates/fsfast-testkit",
+    "crates/fsfast-local",
+    "crates/fsfast-memory",
+    "crates/fsfast-http-transport",
+    "crates/fsfast-http",
+    "crates/fsfast-s3",
+    "crates/fsfast-smb-proto",
+    "crates/fsfast-smb",
+    "crates/fsfast-sftp",
+    "crates/fsfast-py",
+    "crates/fsfast-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/danplischke/fsfast"
+
+[workspace.dependencies]
+fsfast-core = { path = "crates/fsfast-core" }
+fsfast-engine = { path = "crates/fsfast-engine" }
+fsfast-testkit = { path = "crates/fsfast-testkit" }
+fsfast-local = { path = "crates/fsfast-local" }
+fsfast-memory = { path = "crates/fsfast-memory" }
+fsfast-http-transport = { path = "crates/fsfast-http-transport" }
+fsfast-http = { path = "crates/fsfast-http" }
+fsfast-s3 = { path = "crates/fsfast-s3" }
+fsfast-smb-proto = { path = "crates/fsfast-smb-proto" }
+fsfast-smb = { path = "crates/fsfast-smb" }
+fsfast-sftp = { path = "crates/fsfast-sftp" }
+
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "fs", "io-util", "macros", "net"] }
+tracing = "0.1"
+parking_lot = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"

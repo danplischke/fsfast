@@ -1,0 +1,14 @@
+[package]
+name = "fsfast-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fsf"
+path = "src/main.rs"
+
+[dependencies]
+fsfast-core.workspace = true
