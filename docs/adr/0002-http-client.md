@@ -34,7 +34,7 @@ pool, for maximum control.
    would have to rebuild what reqwest already does correctly: proxy
    tunnelling and authentication, `NO_PROXY` semantics, redirect policy
    with sensitive-header stripping, ALPN-driven HTTP/2 selection, and
-   timeouts at the connect, read and total levels. Each is a known source of
+   connect timeouts. Each is a known source of
    subtle bugs, and proxy handling is mandatory here, not optional.
 2. **reqwest**, built on the same hyper/hyper-util stack. It covers every
    requirement above and still lets us plug in a resolver
@@ -71,6 +71,18 @@ fsfast's own policy layer sits on top of reqwest:
   bounds concurrent requests per host. A response holds its permit until
   its body has been collected; a stream releases the permit straight away,
   so that a long-lived stream cannot starve other requests.
+- **Timeouts.** reqwest provides the connect timeout. The read timeout is
+  fsfast's own *idle* timeout (`crate::idle`): a request fails only after
+  `read_timeout` (default 120 s) without progress in either direction, so
+  a multi-GiB upload or download that keeps moving is never cut off.
+  reqwest's `read_timeout` is not used for this, because it is a fixed
+  deadline up to the response head and would kill long uploads. aiohttp's
+  300 s *total* timeout is deliberately not copied.
+- **Redirects of request bodies.** reqwest can resend a body on 307/308
+  only when it holds the whole body in memory. fsfast keeps in-memory bodies
+  up to 16 MiB resendable. Larger bodies and streams are sent in slices so
+  that the idle timeout sees progress, and a 307/308 for them fails with an
+  error instead of silently not resending the body.
 - **Statistics.** `fsfast_engine::stats::Stats` counts requests, errors,
   bytes, retries and throttles, and keeps latency histograms per operation.
 - **Error mapping.** Status codes map to `ErrorKind`s, with
