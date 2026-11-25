@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-sftp"
+description = "fsspec-compatible SFTP filesystem for fsfast: pipelined SFTP v3 client on russh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +9,33 @@ repository.workspace = true
 
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# SSH transport (client side only). aws-lc-rs is already in the tree through
+# rustls; flate2 backs paramiko's `compress=True`.
+russh = { version = "0.65.4", default-features = false, features = ["aws-lc-rs", "rsa", "flate2"] }
+# known_hosts: hashed host names are HMAC-SHA1 keyed with a base64 salt.
+# All three are already in the tree through russh.
+hmac = "0.13"
+sha1 = "0.11"
+base64 = "0.23"
+# Passwords, passphrases and key text are wiped on drop.
+zeroize = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+# getuid() for the passwd lookup of the default user name (no unsafe).
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+
+[dev-dependencies]
+fsfast-testkit.workspace = true
+fsfast-engine.workspace = true
+proptest = "1.5"
+# Content hashes in the differential test (already in the tree).
+sha2 = "0.11"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

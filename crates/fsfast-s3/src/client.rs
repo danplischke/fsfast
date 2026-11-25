@@ -56,15 +56,6 @@ pub(crate) enum Body {
     Bytes(Bytes),
 }
 
-impl Body {
-    fn len(&self) -> usize {
-        match self {
-            Body::Empty => 0,
-            Body::Bytes(b) => b.len(),
-        }
-    }
-}
-
 /// One S3 API call.
 #[derive(Debug)]
 pub(crate) struct Call<'a> {
@@ -122,8 +113,9 @@ impl<'a> Call<'a> {
     }
 
     pub fn header(mut self, name: &'static str, value: &str) -> Result<Self> {
-        let v = HeaderValue::from_str(value)
-            .map_err(|_| Error::invalid_input(format!("invalid value for header {name}: {value:?}")))?;
+        let v = HeaderValue::from_str(value).map_err(|_| {
+            Error::invalid_input(format!("invalid value for header {name}: {value:?}"))
+        })?;
         self.headers.insert(HeaderName::from_static(name), v);
         Ok(self)
     }
@@ -156,8 +148,13 @@ impl<'a> Call<'a> {
 
 fn op_kind(op: Op) -> OpKind {
     match op {
-        Op::HeadObject | Op::HeadBucket | Op::GetBucketLocation | Op::GetBucketVersioning => {
-            OpKind::Info
+        Op::HeadObject
+        | Op::HeadBucket
+        | Op::GetBucketLocation
+        | Op::GetBucketVersioning
+        | Op::GetObjectTagging => OpKind::Info,
+        Op::PutBucketVersioning | Op::PutObjectTagging | Op::PutObjectAcl | Op::PutBucketAcl => {
+            OpKind::Other
         }
         Op::ListBuckets | Op::ListObjectsV2 | Op::ListObjectVersions => OpKind::List,
         Op::GetObject => OpKind::Read,
@@ -263,7 +260,10 @@ impl Client {
     /// bucket (sent whatever the status, including 301 and 403).
     pub async fn discover_region(&self, bucket: &str) -> Option<String> {
         let path = bucket.to_owned();
-        let url = self.endpoint.url(Some(bucket), None, &[], &self.region).ok()?;
+        let url = self
+            .endpoint
+            .url(Some(bucket), None, &[], &self.region)
+            .ok()?;
         let mut headers = HeaderMap::new();
         if let Some(c) = &self.creds {
             let creds = c.get().await.ok()?;
@@ -386,10 +386,8 @@ impl Client {
                 .op(op_kind(op))
                 .path(path);
             *req.headers_mut() = h;
-            if body.len() > 0 || matches!(method, Method::PUT | Method::POST) {
-                if let Body::Bytes(b) = &body {
-                    req = req.body(b.clone());
-                }
+            if let Body::Bytes(b) = &body {
+                req = req.body(b.clone());
             }
             for s in [301u16, 302, 307, 400].iter().chain(allow.iter()) {
                 req = req.allow_status(*s);
@@ -430,7 +428,9 @@ impl Client {
                         to = %new,
                         "bucket is in another region; re-signing (configure region_name to avoid redirects)"
                     );
-                    self.bucket_regions.write().insert(b.to_owned(), new.clone());
+                    self.bucket_regions
+                        .write()
+                        .insert(b.to_owned(), new.clone());
                     region = new;
                     redirected = true;
                     continue;
@@ -463,8 +463,10 @@ async fn redirect_or_error(resp: Response, op: Op, path: &str) -> (Error, Option
     let doc = S3ErrorDoc::parse(&body).unwrap_or_default();
     let code = doc.code.as_deref();
     let special_head_object = op == Op::HeadObject && code.is_none() && matches!(status, 301 | 400);
-    let special_head_bucket =
-        op == Op::HeadBucket && code.is_none() && matches!(status, 301 | 400) && header_region.is_some();
+    let special_head_bucket = op == Op::HeadBucket
+        && code.is_none()
+        && matches!(status, 301 | 400)
+        && header_region.is_some();
     let wrong_signing_region = code == Some("AuthorizationHeaderMalformed") && doc.region.is_some();
     let redirect_status = matches!(status, 301 | 302 | 307);
     let permanent = code == Some("PermanentRedirect");

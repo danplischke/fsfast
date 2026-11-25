@@ -135,14 +135,24 @@ async fn run_fsfast(fs: &SmbFileSystem, share: &str, mb: usize) {
         .collect()
         .await;
     assert!(r.iter().all(|r| r.is_ok()));
-    report("info_1000_conc64", 1000.0, "ops/s", t.elapsed().as_secs_f64());
+    report(
+        "info_1000_conc64",
+        1000.0,
+        "ops/s",
+        t.elapsed().as_secs_f64(),
+    );
     let t = Instant::now();
     let r: Vec<_> = futures::stream::iter(names.iter().map(|n| fs.cat_file(n, ByteRange::Full)))
         .buffer_unordered(64)
         .collect()
         .await;
     assert!(r.iter().all(|r| r.is_ok()));
-    report("cat_1000x4k_conc64", 1000.0, "ops/s", t.elapsed().as_secs_f64());
+    report(
+        "cat_1000x4k_conc64",
+        1000.0,
+        "ops/s",
+        t.elapsed().as_secs_f64(),
+    );
     let r = fs.rm_files(&names).await;
     assert!(r.iter().all(|r| r.is_ok()));
     fs.rmdir(&small).await.unwrap();
@@ -154,14 +164,11 @@ async fn ls_tree(fs: &SmbFileSystem, share: &str, n: usize) -> String {
     fs.mkdir(&dir, false).await.unwrap();
     let names: Vec<String> = (0..n).map(|i| format!("{dir}/entry-{i:06}.dat")).collect();
     let opts = WriteOptions::default();
-    let r: Vec<_> = futures::stream::iter(
-        names
-            .iter()
-            .map(|p| fs.pipe_file(p, Bytes::new(), &opts)),
-    )
-    .buffer_unordered(64)
-    .collect()
-    .await;
+    let r: Vec<_> =
+        futures::stream::iter(names.iter().map(|p| fs.pipe_file(p, Bytes::new(), &opts)))
+            .buffer_unordered(64)
+            .collect()
+            .await;
     assert!(r.iter().all(|r| r.is_ok()));
     dir
 }
@@ -179,15 +186,32 @@ async fn bench_against_fsspec() {
         .unwrap_or(256);
     let py = std::env::var("FSFAST_TEST_FSSPEC_PYTHON").ok();
     for share in [env.share.clone(), env.enc_share.clone()] {
-        println!("== share {share} ({mb} MiB large file)");
-        let fs = env.fs(&[]);
+        let conns: i64 = std::env::var("FSFAST_TEST_SMB_BENCH_CONNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        println!("== share {share} ({mb} MiB large file, {conns} connection(s))");
+        let fs = env.fs(&[("connections", Value::Int(conns))]);
         run_fsfast(&fs, &share, mb).await;
         if let Some(py) = &py {
             let out = Command::new(py)
-                .args(["-c", FSSPEC_SCRIPT, &env.host, &env.port.to_string(), &env.user, &env.password, &share, &mb.to_string()])
+                .args([
+                    "-c",
+                    FSSPEC_SCRIPT,
+                    &env.host,
+                    &env.port.to_string(),
+                    &env.user,
+                    &env.password,
+                    &share,
+                    &mb.to_string(),
+                ])
                 .output()
                 .expect("run fsspec benchmark");
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             for l in String::from_utf8_lossy(&out.stdout).lines() {
                 println!("fsspec\t{l}");
             }
@@ -200,21 +224,42 @@ async fn bench_against_fsspec() {
         report("ls_10000", 1.0, "listings/s", t.elapsed().as_secs_f64());
         if let Some(py) = &py {
             let out = Command::new(py)
-                .args(["-c", FSSPEC_LS_SCRIPT, &env.host, &env.port.to_string(), &env.user, &env.password, &dir])
+                .args([
+                    "-c",
+                    FSSPEC_LS_SCRIPT,
+                    &env.host,
+                    &env.port.to_string(),
+                    &env.user,
+                    &env.password,
+                    &dir,
+                ])
                 .output()
                 .expect("run fsspec ls benchmark");
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             for l in String::from_utf8_lossy(&out.stdout).lines() {
                 println!("fsspec\t{l}");
             }
         }
         let fsd: Arc<dyn FileSystem> = Arc::new(fs.clone());
-        let names: Vec<String> = fsd.ls(&dir).await.unwrap().into_iter().map(|i| i.name).collect();
+        let names: Vec<String> = fsd
+            .ls(&dir)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
         let r = fsd.rm_files(&names).await;
         assert!(r.iter().all(|r| r.is_ok()));
         fs.rmdir(&dir).await.unwrap();
         let s = fs.stats().snapshot();
-        println!("fsfast stats: requests={} retries={} errors={}", s.requests, s.retries, s.errors);
+        println!(
+            "fsfast stats: requests={} retries={} errors={}",
+            s.requests, s.retries, s.errors
+        );
         fs.close().await.unwrap();
     }
 }
@@ -246,7 +291,9 @@ async fn bench_chunk_sizes() {
             fs.mkdir(&root, false).await.unwrap();
             let p = format!("{root}/big.bin");
             let t = Instant::now();
-            fs.pipe_file(&p, data.clone(), &WriteOptions::default()).await.unwrap();
+            fs.pipe_file(&p, data.clone(), &WriteOptions::default())
+                .await
+                .unwrap();
             let w = t.elapsed().as_secs_f64();
             let t = Instant::now();
             let got = fs.cat_file(&p, ByteRange::Full).await.unwrap();
@@ -263,4 +310,121 @@ async fn bench_chunk_sizes() {
             fs.close().await.unwrap();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bench_read_modes() {
+    let Some(env) = common::env() else { return };
+    if std::env::var("FSFAST_TEST_SMB_BENCH").as_deref() != Ok("1") {
+        eprintln!("skipping SMB benchmark: set FSFAST_TEST_SMB_BENCH=1");
+        return;
+    }
+    let mb = 256usize;
+    let data = common::pattern(mb << 20, 3);
+    for share in [env.share.clone(), env.enc_share.clone()] {
+        let fs = env.fs(&[]);
+        let root = format!("/{share}/{}", common::unique("modes"));
+        fs.mkdir(&root, false).await.unwrap();
+        let p = format!("{root}/big.bin");
+        fs.pipe_file(&p, data.clone(), &WriteOptions::default())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            // One big read_at (pipelined chunks copied into one buffer).
+            let t = Instant::now();
+            let got = fs.cat_file(&p, ByteRange::Full).await.unwrap();
+            let one = t.elapsed().as_secs_f64();
+            assert_eq!(got.len(), data.len());
+            drop(got);
+            // Chunk-sized read_at calls, 16 in flight, results dropped
+            // (zero-copy slices of the received frames).
+            let h = fs
+                .open_read(&p, &fsfast_core::ReadOptions::default())
+                .await
+                .unwrap();
+            let chunk = 1usize << 20;
+            let t = Instant::now();
+            let n: usize = futures::stream::iter((0..(mb << 20)).step_by(chunk).map(|off| {
+                let h = h.clone();
+                async move { h.read_at(off as u64, chunk).await.unwrap().len() }
+            }))
+            .buffer_unordered(16)
+            .fold(0usize, |a, b| async move { a + b })
+            .await;
+            let slices = t.elapsed().as_secs_f64();
+            assert_eq!(n, mb << 20);
+            h.close().await.unwrap();
+            println!(
+                "{share}\tcat_file={:.0} MB/s\tslices={:.0} MB/s\tdirect_reads={}",
+                mb as f64 / one,
+                mb as f64 / slices,
+                fs.connection_info(&share).await.unwrap().direct_reads
+            );
+        }
+        fs.rm_file(&p).await.unwrap();
+        fs.rmdir(&root).await.unwrap();
+        fs.close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bench_metadata_latency() {
+    let Some(env) = common::env() else { return };
+    if std::env::var("FSFAST_TEST_SMB_BENCH").as_deref() != Ok("1") {
+        eprintln!("skipping SMB benchmark: set FSFAST_TEST_SMB_BENCH=1");
+        return;
+    }
+    let fs = env.fs(&[]);
+    let root = format!("/{}/{}", env.share, common::unique("meta"));
+    fs.mkdir(&root, false).await.unwrap();
+    let names: Vec<String> = (0..500).map(|i| format!("{root}/f{i:04}")).collect();
+    let payload = Bytes::from(vec![b'x'; 4096]);
+    for n in &names {
+        fs.pipe_file(n, payload.clone(), &WriteOptions::default())
+            .await
+            .unwrap();
+    }
+    for round in 0..3 {
+        let t = Instant::now();
+        for n in &names {
+            fs.info(n).await.unwrap();
+        }
+        let info = 500.0 / t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        for n in &names {
+            fs.cat_file(n, ByteRange::Full).await.unwrap();
+        }
+        let cat = 500.0 / t.elapsed().as_secs_f64();
+        println!("round {round}: info {info:.0} ops/s, cat {cat:.0} ops/s");
+    }
+    assert!(fs.rm_files(&names).await.iter().all(|r| r.is_ok()));
+    fs.rmdir(&root).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bench_ls_10k() {
+    let Some(env) = common::env() else { return };
+    if std::env::var("FSFAST_TEST_SMB_BENCH").as_deref() != Ok("1") {
+        eprintln!("skipping SMB benchmark: set FSFAST_TEST_SMB_BENCH=1");
+        return;
+    }
+    let fs = env.fs(&[]);
+    let dir = ls_tree(&fs, &env.share, 10_000).await;
+    for _ in 0..5 {
+        let t = Instant::now();
+        let n = fs.ls(&dir).await.unwrap().len();
+        println!(
+            "ls of {n} entries: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let names: Vec<String> = fs
+        .ls(&dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    assert!(fs.rm_files(&names).await.iter().all(|r| r.is_ok()));
+    fs.rmdir(&dir).await.unwrap();
 }

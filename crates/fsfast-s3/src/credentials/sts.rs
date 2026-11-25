@@ -17,7 +17,9 @@ use super::{
 };
 use crate::encode::uri_encode;
 use crate::error::S3ErrorParser;
-use crate::profile::{Env, ProfileFiles, ProfileValue};
+use crate::profile::ProfileValue;
+#[cfg(test)]
+use crate::profile::{Env, ProfileFiles};
 use crate::sigv4::{Signer, sha256_hex};
 use crate::xml::parse_sts_credentials;
 
@@ -52,56 +54,46 @@ const LEGACY_GLOBAL_REGIONS: &[&str] = &[
     "us-west-2",
 ];
 
-/// The configured endpoint URL for `service` from the environment
-/// (`AWS_ENDPOINT_URL_<SERVICE>`, `AWS_ENDPOINT_URL`) or the profile, unless
-/// configured endpoints are ignored (botocore's lookup order).
-pub(crate) fn configured_endpoint(
-    env: &Env,
-    profiles: &ProfileFiles,
-    profile: &str,
-    service: &str,
-) -> Result<Option<String>> {
-    if env.flag("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
-        || profiles
-            .get(profile, "ignore_configured_endpoint_urls")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-    {
-        return Ok(None);
-    }
-    let var = format!("AWS_ENDPOINT_URL_{}", service.to_ascii_uppercase());
-    if let Some(u) = env.get(&var).or_else(|| env.get("AWS_ENDPOINT_URL")) {
-        return Ok(Some(u));
-    }
-    profiles.endpoint_url(profile, service)
-}
-
 impl StsClient {
     /// The STS client for `ctx`: a configured endpoint, else the regional
     /// endpoint of `ctx.region`, else the global endpoint.
     pub fn new(ctx: &ChainContext) -> Result<Self> {
-        let configured = configured_endpoint(&ctx.env, &ctx.profiles, &ctx.profile, "sts")?;
+        let configured =
+            crate::profile::configured_endpoint(&ctx.env, &ctx.profiles, &ctx.profile, "sts")?;
         let mode = ctx
             .env
             .get("AWS_STS_REGIONAL_ENDPOINTS")
-            .or_else(|| ctx.profiles.get(&ctx.profile, "sts_regional_endpoints").map(str::to_owned))
+            .or_else(|| {
+                ctx.profiles
+                    .get(&ctx.profile, "sts_regional_endpoints")
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| "regional".to_owned());
         let (endpoint, region) = match (configured, ctx.region.as_deref()) {
             (Some(u), r) => (u, r.unwrap_or("us-east-1").to_owned()),
-            (None, Some(r)) if mode == "legacy" && LEGACY_GLOBAL_REGIONS.contains(&r) => {
-                ("https://sts.amazonaws.com".to_owned(), "us-east-1".to_owned())
-            }
+            (None, Some(r)) if mode == "legacy" && LEGACY_GLOBAL_REGIONS.contains(&r) => (
+                "https://sts.amazonaws.com".to_owned(),
+                "us-east-1".to_owned(),
+            ),
             (None, Some(r)) => {
-                let suffix = if r.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+                let suffix = if r.starts_with("cn-") {
+                    "amazonaws.com.cn"
+                } else {
+                    "amazonaws.com"
+                };
                 (format!("https://sts.{r}.{suffix}"), r.to_owned())
             }
-            (None, None) => ("https://sts.amazonaws.com".to_owned(), "us-east-1".to_owned()),
+            (None, None) => (
+                "https://sts.amazonaws.com".to_owned(),
+                "us-east-1".to_owned(),
+            ),
         };
         let endpoint = Url::parse(&endpoint)
             .map_err(|e| Error::invalid_input(format!("invalid STS endpoint {endpoint:?}: {e}")))?;
         let mut cfg = ctx.http.clone();
         cfg.max_redirects = None;
         let http = HttpClient::builder(cfg)
-            .error_parser(Arc::new(S3ErrorParser::default()))
+            .error_parser(Arc::new(S3ErrorParser))
             .build()?;
         Ok(StsClient {
             http,
@@ -111,7 +103,11 @@ impl StsClient {
         })
     }
 
-    async fn call(&self, params: &[(&str, &str)], creds: Option<&Credentials>) -> Result<Credentials> {
+    async fn call(
+        &self,
+        params: &[(&str, &str)],
+        creds: Option<&Credentials>,
+    ) -> Result<Credentials> {
         let mut body = String::new();
         for (i, (k, v)) in params.iter().enumerate() {
             if i > 0 {
@@ -145,7 +141,10 @@ impl StsClient {
         *req.headers_mut() = headers;
         let body = self
             .http
-            .send_with(req, |resp| async move { resp.bytes_truncated(1 << 20).await })
+            .send_with(
+                req,
+                |resp| async move { resp.bytes_truncated(1 << 20).await },
+            )
             .await
             .map_err(|e| crate::error::finish_error(e, None))?;
         let c = parse_sts_credentials(&body)?;
@@ -390,7 +389,10 @@ impl AssumeRoleProvider {
         found.ok_or_else(|| {
             Error::new(
                 ErrorKind::PermissionDenied,
-                format!("no source credentials for assume-role profile {:?} ({root:?})", self.profile),
+                format!(
+                    "no source credentials for assume-role profile {:?} ({root:?})",
+                    self.profile
+                ),
             )
         })
     }
@@ -402,7 +404,10 @@ impl ProvideCredentials for AssumeRoleProvider {
         let Some((roles, root)) = self.plan()? else {
             return Ok(None);
         };
-        let sts = self.sts.get_or_try_init(|| async { StsClient::new(&self.ctx) }).await?;
+        let sts = self
+            .sts
+            .get_or_try_init(|| async { StsClient::new(&self.ctx) })
+            .await?;
         let mut creds = self.root_credentials(&root).await?;
         for role in roles.iter().rev() {
             creds = sts.assume_role(&creds, role).await?;
@@ -449,7 +454,8 @@ impl WebIdentityProvider {
 #[async_trait]
 impl ProvideCredentials for WebIdentityProvider {
     async fn provide(&self) -> Result<Option<Credentials>> {
-        let Some(token_file) = self.setting("AWS_WEB_IDENTITY_TOKEN_FILE", "web_identity_token_file")
+        let Some(token_file) =
+            self.setting("AWS_WEB_IDENTITY_TOKEN_FILE", "web_identity_token_file")
         else {
             return Ok(None);
         };
@@ -463,10 +469,16 @@ impl ProvideCredentials for WebIdentityProvider {
         let token = tokio::fs::read_to_string(&path).await.map_err(|e| {
             Error::new(
                 ErrorKind::PermissionDenied,
-                format!("cannot read web identity token file {}: {e}", path.display()),
+                format!(
+                    "cannot read web identity token file {}: {e}",
+                    path.display()
+                ),
             )
         })?;
-        let sts = self.sts.get_or_try_init(|| async { StsClient::new(&self.ctx) }).await?;
+        let sts = self
+            .sts
+            .get_or_try_init(|| async { StsClient::new(&self.ctx) })
+            .await?;
         Ok(Some(
             sts.assume_role_with_web_identity(&role_arn, &session, token.trim())
                 .await?,
@@ -568,13 +580,22 @@ mfa_serial = arn:aws:iam::1:mfa/me
             let c = StsClient::new(&ctx).unwrap();
             (c.endpoint.to_string(), c.region)
         };
-        assert_eq!(mk(vec![], None), ("https://sts.amazonaws.com/".into(), "us-east-1".into()));
         assert_eq!(
-            mk(vec![], Some("eu-west-1")),
-            ("https://sts.eu-west-1.amazonaws.com/".into(), "eu-west-1".into())
+            mk(vec![], None),
+            ("https://sts.amazonaws.com/".into(), "us-east-1".into())
         );
         assert_eq!(
-            mk(vec![("AWS_STS_REGIONAL_ENDPOINTS", "legacy")], Some("eu-west-1")),
+            mk(vec![], Some("eu-west-1")),
+            (
+                "https://sts.eu-west-1.amazonaws.com/".into(),
+                "eu-west-1".into()
+            )
+        );
+        assert_eq!(
+            mk(
+                vec![("AWS_STS_REGIONAL_ENDPOINTS", "legacy")],
+                Some("eu-west-1")
+            ),
             ("https://sts.amazonaws.com/".into(), "us-east-1".into())
         );
         assert_eq!(
@@ -582,7 +603,10 @@ mfa_serial = arn:aws:iam::1:mfa/me
             "https://sts.cn-north-1.amazonaws.com.cn/"
         );
         assert_eq!(
-            mk(vec![("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1234")], Some("eu-west-1")),
+            mk(
+                vec![("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1234")],
+                Some("eu-west-1")
+            ),
             ("http://127.0.0.1:1234/".into(), "eu-west-1".into())
         );
     }

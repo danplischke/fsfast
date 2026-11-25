@@ -3,7 +3,7 @@
 //! | operation | compound |
 //! |---|---|
 //! | info | CREATE + CLOSE (the CREATE response carries times, size, attributes) |
-//! | ls | CREATE + QUERY_DIRECTORY ×2 + CLOSE (falls back to a QUERY_DIRECTORY loop for huge directories) |
+//! | ls | CREATE + QUERY_DIRECTORY ×3 + CLOSE (a QUERY_DIRECTORY loop on an open handle beyond ~45k entries) |
 //! | small cat | CREATE + READ + CLOSE |
 //! | small pipe | CREATE + WRITE + CLOSE |
 //! | rm / rmdir | CREATE + SET_INFO(FileDispositionInformation) + CLOSE |
@@ -14,14 +14,14 @@
 use bytes::Bytes;
 use fsfast_core::{Error, ErrorKind, FileInfo, Result, Value};
 use fsfast_smb_proto::fscc::{
-    AccessMask, CreateDisposition, CreateOptions, DirEntry, FileAttributes,
-    FileBasicInformation, FileDispositionInformation, FileEndOfFileInformation, FileInfoClass,
-    FileRenameInformation, FileTime, ImpersonationLevel, OplockLevel, ShareAccess,
+    AccessMask, CreateDisposition, CreateOptions, DirEntry, FileAttributes, FileBasicInformation,
+    FileDispositionInformation, FileEndOfFileInformation, FileInfoClass, FileRenameInformation,
+    FileTime, ImpersonationLevel, OplockLevel, ShareAccess,
 };
 use fsfast_smb_proto::msg::{
     CloseFlags, CloseRequest, CloseResponse, CreateRequest, CreateResponse, Message,
-    QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse, RawMessage,
-    ReadRequest, ReadResponse, SetInfoRequest, WriteRequest, WriteResponse,
+    QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse, RawMessage, ReadRequest,
+    ReadResponse, SetInfoRequest, WriteRequest, WriteResponse,
 };
 use fsfast_smb_proto::{FileId, NtStatus};
 
@@ -36,9 +36,14 @@ pub(crate) const SHARE_ALL: ShareAccess = ShareAccess::all();
 /// would otherwise have to generate for every entry).
 const LIST_CLASS: FileInfoClass = FileInfoClass::ID_FULL_DIRECTORY;
 
-/// Output buffer of one QUERY_DIRECTORY in the listing compound (about
-/// 8,000 entries with short names).
+/// Output buffer of the first QUERY_DIRECTORY in the listing compound
+/// (about 9,000 entries with short names).
 const LIST_BUFFER: usize = 1 << 20;
+
+/// Output buffer of the second QUERY_DIRECTORY and of later pages. Servers
+/// fill responses to the entries' size, so a large buffer only reserves
+/// credits while the request is in flight.
+const LIST_BUFFER_2: usize = 4 << 20;
 
 /// Fail with the status of an error response, naming `path`.
 pub(crate) fn check(raw: &RawMessage, path: &str) -> Result<()> {
@@ -184,37 +189,34 @@ pub(crate) enum Listing {
     File(Meta),
 }
 
-/// ls: CREATE + QUERY_DIRECTORY + QUERY_DIRECTORY + CLOSE in one round trip.
+/// ls: CREATE + QUERY_DIRECTORY ×3 + CLOSE in one round trip.
 ///
 /// The CREATE has no directory option, so a file opens too and is reported
-/// as [`Listing::File`]. The second QUERY_DIRECTORY normally answers
-/// `STATUS_NO_MORE_FILES`, which proves the listing complete; for directories
-/// too large for two buffers the listing restarts with an open handle and a
-/// QUERY_DIRECTORY loop.
+/// as [`Listing::File`]. Only `STATUS_NO_MORE_FILES` proves a listing
+/// complete, so after a 1 MiB and a 4 MiB page a small probe page asks
+/// once more: up to ~45,000 entries (short names) take one round trip.
+/// Larger directories are listed again with an open handle and a
+/// QUERY_DIRECTORY loop. The CLOSE is always part of an awaited request, so
+/// a later operation on another connection never races it.
 pub(crate) async fn list(ctx: &Ctx, p: &SmbPath) -> Result<Listing> {
-    let buf = list_buffer(ctx);
+    let first = list_buffer(ctx, LIST_BUFFER);
+    let second = list_buffer(ctx, LIST_BUFFER_2);
     let mut chain = ctx.chain();
-    chain.push(&create_req(
-        &p.rel,
-        AccessMask::FILE_LIST_DIRECTORY | AccessMask::FILE_READ_ATTRIBUTES | AccessMask::SYNCHRONIZE,
-        SHARE_ALL,
-        CreateDisposition::OPEN,
-        CreateOptions::empty(),
-        FileAttributes::empty(),
-    ))?;
-    chain.push(&query_dir(FileId::RELATED, true, buf))?;
-    chain.push(&query_dir(FileId::RELATED, false, buf))?;
+    chain.push(&list_open(&p.rel, CreateOptions::empty()))?;
+    chain.push(&query_dir(FileId::RELATED, true, first))?;
+    chain.push(&query_dir(FileId::RELATED, false, second))?;
+    // A small probe that answers STATUS_NO_MORE_FILES when the first two
+    // pages held everything.
+    chain.push(&query_dir(FileId::RELATED, false, list_buffer(ctx, 4096)))?;
     chain.push(&close_related())?;
-    let r = match ctx.exec(chain).await {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    let r = ctx.exec(chain).await?;
     let c: CreateResponse = match decode(&r[0], &p.name) {
         Ok(c) => c,
         // A file held open without read sharing cannot be opened for
         // FILE_LIST_DIRECTORY (= FILE_READ_DATA); an attribute open can.
-        Err(e) if e.kind() == ErrorKind::PermissionDenied
-            && r[0].status() == NtStatus::SHARING_VIOLATION =>
+        Err(e)
+            if e.kind() == ErrorKind::PermissionDenied
+                && r[0].status() == NtStatus::SHARING_VIOLATION =>
         {
             let m = stat(ctx, p).await?;
             if m.is_dir() {
@@ -229,25 +231,97 @@ pub(crate) async fn list(ctx: &Ctx, p: &SmbPath) -> Result<Listing> {
         return Ok(Listing::File(meta));
     }
     let mut out = Vec::new();
-    match dir_entries(&r[1], p, &mut out)? {
-        Page::Done => return Ok(Listing::Dir(out)),
-        Page::More => {}
+    if let Page::Done = dir_entries(&r[1], p, &mut out)? {
+        return Ok(Listing::Dir(out));
     }
-    match dir_entries(&r[2], p, &mut out)? {
-        Page::Done => Ok(Listing::Dir(out)),
-        Page::More => list_large(ctx, p).await.map(Listing::Dir),
+    if let Page::Done = dir_entries(&r[2], p, &mut out)? {
+        return Ok(Listing::Dir(out));
+    }
+    if let Page::Done = dir_entries(&r[3], p, &mut out)? {
+        return Ok(Listing::Dir(out));
+    }
+    list_large(ctx, p).await.map(Listing::Dir)
+}
+
+fn list_open(rel: &str, options: CreateOptions) -> CreateRequest {
+    create_req(
+        rel,
+        AccessMask::FILE_LIST_DIRECTORY
+            | AccessMask::FILE_READ_ATTRIBUTES
+            | AccessMask::SYNCHRONIZE,
+        SHARE_ALL,
+        CreateDisposition::OPEN,
+        options,
+        FileAttributes::empty(),
+    )
+}
+
+/// Listing of a directory too large for the one-round-trip compound: an
+/// open handle and QUERY_DIRECTORY until `STATUS_NO_MORE_FILES`.
+async fn list_large(ctx: &Ctx, p: &SmbPath) -> Result<Vec<FileInfo>> {
+    let buf = list_buffer(ctx, LIST_BUFFER_2);
+    let mut chain = ctx.chain();
+    chain.push(&list_open(&p.rel, CreateOptions::DIRECTORY_FILE))?;
+    chain.push(&query_dir(FileId::RELATED, true, buf))?;
+    let r = ctx.exec(chain).await?;
+    let c: CreateResponse = decode(&r[0], &p.name)?;
+    let fid = c.file_id;
+    let mut out = Vec::new();
+    let res = async {
+        let mut page = dir_entries(&r[1], p, &mut out)?;
+        while let Page::More = page {
+            let mut chain = ctx.chain();
+            chain.push(&query_dir(fid, false, buf))?;
+            let r = ctx.exec(chain).await?;
+            page = dir_entries(&r[0], p, &mut out)?;
+        }
+        Ok::<_, Error>(())
+    }
+    .await;
+    let closed = close(ctx, fid, &p.name).await;
+    res?;
+    closed?;
+    Ok(out)
+}
+
+/// Send a CLOSE without waiting for its response (errors are irrelevant for
+/// a read-only handle; the reader task discards the answer). When credits
+/// are available the CLOSE is queued right away, so it reaches the server
+/// before any later request of the caller.
+pub(crate) fn close_detached(ctx: &Ctx, fid: FileId) {
+    use futures::FutureExt;
+    let mut chain = ctx.chain();
+    if chain
+        .push(&CloseRequest {
+            flags: CloseFlags::empty(),
+            file_id: fid,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let shared = ctx.live.conn.shared.clone();
+    let sec = ctx.sec();
+    let msgs = chain.into_messages();
+    let mut fut = Box::pin(async move {
+        let _ = shared.send(msgs, &sec).await;
+    });
+    if (&mut fut).now_or_never().is_none()
+        && let Ok(rt) = tokio::runtime::Handle::try_current()
+    {
+        rt.spawn(fut);
     }
 }
 
 /// QUERY_DIRECTORY output buffer: 1 MiB, within MaxTransactSize (64 KiB on
 /// 2.0.2).
-fn list_buffer(ctx: &Ctx) -> u32 {
+fn list_buffer(ctx: &Ctx, want: usize) -> u32 {
     let cap = if ctx.multi_credit() {
         ctx.max_transact()
     } else {
         65536
     };
-    ctx.credit_limited(LIST_BUFFER.min(cap).max(4096)) as u32
+    ctx.credit_limited(want.min(cap).max(4096)) as u32
 }
 
 fn query_dir(file_id: FileId, restart: bool, buf: u32) -> QueryDirectoryRequest {
@@ -294,40 +368,6 @@ fn dir_entries(raw: &RawMessage, dir: &SmbPath, out: &mut Vec<FileInfo>) -> Resu
     Ok(if any { Page::More } else { Page::Done })
 }
 
-/// Listing of a directory too large for the one-round-trip compound.
-async fn list_large(ctx: &Ctx, p: &SmbPath) -> Result<Vec<FileInfo>> {
-    let buf = list_buffer(ctx);
-    let mut chain = ctx.chain();
-    chain.push(&create_req(
-        &p.rel,
-        AccessMask::FILE_LIST_DIRECTORY | AccessMask::FILE_READ_ATTRIBUTES | AccessMask::SYNCHRONIZE,
-        SHARE_ALL,
-        CreateDisposition::OPEN,
-        CreateOptions::DIRECTORY_FILE,
-        FileAttributes::empty(),
-    ))?;
-    chain.push(&query_dir(FileId::RELATED, true, buf))?;
-    let r = ctx.exec(chain).await?;
-    let c: CreateResponse = decode(&r[0], &p.name)?;
-    let fid = c.file_id;
-    let mut out = Vec::new();
-    let res = async {
-        let mut page = dir_entries(&r[1], p, &mut out)?;
-        while let Page::More = page {
-            let mut chain = ctx.chain();
-            chain.push(&query_dir(fid, false, buf))?;
-            let r = ctx.exec(chain).await?;
-            page = dir_entries(&r[0], p, &mut out)?;
-        }
-        Ok::<_, Error>(())
-    }
-    .await;
-    let closed = close(ctx, fid, &p.name).await;
-    res?;
-    closed?;
-    Ok(out)
-}
-
 /// CLOSE a handle.
 pub(crate) async fn close(ctx: &Ctx, file_id: FileId, path: &str) -> Result<()> {
     let mut chain = ctx.chain();
@@ -357,7 +397,13 @@ fn read_data(raw: &RawMessage, path: &str) -> Result<Bytes> {
 }
 
 /// One WRITE on an open handle.
-pub(crate) async fn write(ctx: &Ctx, fid: FileId, offset: u64, data: Bytes, path: &str) -> Result<()> {
+pub(crate) async fn write(
+    ctx: &Ctx,
+    fid: FileId,
+    offset: u64,
+    data: Bytes,
+    path: &str,
+) -> Result<()> {
     let len = data.len();
     let mut chain = ctx.chain();
     chain.push(&WriteRequest {
@@ -421,7 +467,11 @@ pub(crate) fn read_open_req(rel: &str, share: ShareAccess) -> CreateRequest {
 }
 
 /// The CREATE of a file opened for writing (smbclient modes `wb`/`xb`/`ab`).
-pub(crate) fn write_open_req(rel: &str, share: ShareAccess, disposition: CreateDisposition) -> CreateRequest {
+pub(crate) fn write_open_req(
+    rel: &str,
+    share: ShareAccess,
+    disposition: CreateDisposition,
+) -> CreateRequest {
     create_req(
         rel,
         AccessMask::FILE_WRITE_DATA | AccessMask::FILE_WRITE_ATTRIBUTES | AccessMask::FILE_WRITE_EA,
@@ -525,7 +575,9 @@ pub(crate) async fn delete(ctx: &Ctx, p: &SmbPath, directory: Option<bool>) -> R
     let mut chain = ctx.chain();
     chain
         .push(&open(
-            AccessMask::DELETE | AccessMask::FILE_READ_ATTRIBUTES | AccessMask::FILE_WRITE_ATTRIBUTES,
+            AccessMask::DELETE
+                | AccessMask::FILE_READ_ATTRIBUTES
+                | AccessMask::FILE_WRITE_ATTRIBUTES,
         ))?
         .push(&basic)?
         .push(&disposition)?
@@ -538,7 +590,11 @@ pub(crate) async fn delete(ctx: &Ctx, p: &SmbPath, directory: Option<bool>) -> R
 }
 
 /// mkdir of one directory: CREATE(directory, `disposition`) + CLOSE.
-pub(crate) async fn mkdir_one(ctx: &Ctx, p: &SmbPath, disposition: CreateDisposition) -> Result<()> {
+pub(crate) async fn mkdir_one(
+    ctx: &Ctx,
+    p: &SmbPath,
+    disposition: CreateDisposition,
+) -> Result<()> {
     let mut chain = ctx.chain();
     chain
         .push(&create_req(

@@ -61,18 +61,16 @@ pub fn url_decode_plus(s: &str) -> Cow<'_, str> {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < b.len() => {
-                match (hex_val(b[i + 1]), hex_val(b[i + 2])) {
-                    (Some(h), Some(l)) => {
-                        out.push(h << 4 | l);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(b'%');
-                        i += 1;
-                    }
+            b'%' if i + 2 < b.len() => match (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
             c => {
                 out.push(c);
                 i += 1;
@@ -209,17 +207,20 @@ pub fn parse_iso8601(s: &str) -> Option<SystemTime> {
                 2 => (rest, "00"),
                 _ => return None,
             };
-            let v = i64::from(oh.parse::<u32>().ok()?) * 3600 + i64::from(om.parse::<u32>().ok()?) * 60;
+            let v =
+                i64::from(oh.parse::<u32>().ok()?) * 3600 + i64::from(om.parse::<u32>().ok()?) * 60;
             if sign == b'+' { v } else { -v }
         }
         _ => return None,
     };
     let days = days_from_civil(i64::from(y), mo, d);
-    let secs = days * 86_400 + i64::from(h) * 3600 + i64::from(mi) * 60 + i64::from(sec) - offset_secs;
+    let secs =
+        days * 86_400 + i64::from(h) * 3600 + i64::from(mi) * 60 + i64::from(sec) - offset_secs;
     if secs >= 0 {
         Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
     } else {
-        UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))?
+        UNIX_EPOCH
+            .checked_sub(Duration::from_secs(secs.unsigned_abs()))?
             .checked_add(Duration::from_nanos(u64::from(nanos)))
     }
 }
@@ -264,14 +265,14 @@ mod tests {
         let t = parse_iso8601("2026-11-24T12:34:56.789Z").unwrap();
         assert_eq!(amz_date(t), "20261124T123456Z");
         assert_eq!(iso8601(t), "2026-11-24T12:34:56Z");
-        assert_eq!(
-            t.duration_since(UNIX_EPOCH).unwrap().subsec_millis(),
-            789
-        );
+        assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().subsec_millis(), 789);
         let t2 = parse_iso8601("2026-11-24T14:34:56+02:00").unwrap();
         assert_eq!(amz_date(t2), "20261124T123456Z");
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(UNIX_EPOCH));
-        assert_eq!(amz_date(parse_iso8601("2000-02-29T23:59:59Z").unwrap()), "20000229T235959Z");
+        assert_eq!(
+            amz_date(parse_iso8601("2000-02-29T23:59:59Z").unwrap()),
+            "20000229T235959Z"
+        );
         assert!(parse_iso8601("2026-13-01T00:00:00Z").is_none());
         assert!(parse_iso8601("garbage").is_none());
         assert!(parse_iso8601("2026-11-24T12:34:56.Z").is_none());

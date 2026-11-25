@@ -174,7 +174,11 @@ pub struct S3ErrorParser;
 impl ErrorParser for S3ErrorParser {
     fn parse(&self, status: StatusCode, _headers: &HeaderMap, body: &[u8]) -> Option<ServiceError> {
         let doc = S3ErrorDoc::parse(body).unwrap_or_default();
-        let cl = classify(status.as_u16(), doc.code.as_deref(), doc.condition.as_deref());
+        let cl = classify(
+            status.as_u16(),
+            doc.code.as_deref(),
+            doc.condition.as_deref(),
+        );
         Some(ServiceError {
             code: doc.code,
             message: doc.message.filter(|m| !m.is_empty()),
@@ -255,11 +259,17 @@ mod tests {
         assert_eq!(k(404, None), ErrorKind::NotFound);
         assert_eq!(k(403, Some("AccessDenied")), ErrorKind::PermissionDenied);
         assert_eq!(k(403, None), ErrorKind::PermissionDenied);
-        assert_eq!(k(409, Some("BucketAlreadyOwnedByYou")), ErrorKind::AlreadyExists);
+        assert_eq!(
+            k(409, Some("BucketAlreadyOwnedByYou")),
+            ErrorKind::AlreadyExists
+        );
         assert_eq!(k(409, Some("BucketNotEmpty")), ErrorKind::DirectoryNotEmpty);
         assert_eq!(k(503, Some("SlowDown")), ErrorKind::Throttled);
         assert_eq!(k(429, None), ErrorKind::Throttled);
-        assert_eq!(k(412, Some("PreconditionFailed")), ErrorKind::PreconditionFailed);
+        assert_eq!(
+            k(412, Some("PreconditionFailed")),
+            ErrorKind::PreconditionFailed
+        );
         assert_eq!(
             classify(412, Some("PreconditionFailed"), Some("If-None-Match")).kind,
             ErrorKind::AlreadyExists
@@ -270,8 +280,14 @@ mod tests {
         assert_eq!((inv.kind, inv.errno), (ErrorKind::Io, Some(errno::EINVAL)));
         let big = classify(400, Some("EntityTooLarge"), None);
         assert_eq!(big.errno, Some(errno::EMSGSIZE));
-        assert_eq!(classify(500, Some("InternalError"), None).retryable, Some(true));
-        assert_eq!(classify(400, Some("SomethingNew"), None).errno, Some(errno::EINVAL));
+        assert_eq!(
+            classify(500, Some("InternalError"), None).retryable,
+            Some(true)
+        );
+        assert_eq!(
+            classify(400, Some("SomethingNew"), None).errno,
+            Some(errno::EINVAL)
+        );
     }
 
     #[test]
@@ -287,7 +303,14 @@ mod tests {
         assert_eq!(error_code(&e), Some("NoSuchKey"));
         assert_eq!(e.http_status(), Some(404));
         assert!(!e.is_retryable());
-        let e = response_error(200, &S3ErrorDoc { code: Some("InternalError".into()), ..Default::default() }, "b/k");
+        let e = response_error(
+            200,
+            &S3ErrorDoc {
+                code: Some("InternalError".into()),
+                ..Default::default()
+            },
+            "b/k",
+        );
         assert!(e.is_retryable());
         assert!(e.details().contains(&Detail::Errno(errno::EREMOTEIO)));
     }

@@ -12,12 +12,11 @@ use fsfast_smb_proto::crypto::{
 use fsfast_smb_proto::fscc::AccessMask;
 use fsfast_smb_proto::header::{Command, Header};
 use fsfast_smb_proto::msg::{
-    CipherId, FsctlData, HashAlgorithm, IoctlRequest, IoctlResponse, LogoffRequest,
-    LogoffResponse, Message, NegotiateContext, NegotiateRequest, NegotiateResponse,
-    SessionFlags, SessionSetupRequest, SessionSetupResponse, ShareFlags, ShareType,
-    SigningAlgorithmId, TreeConnectRequest, TreeConnectResponse, TreeDisconnectRequest,
-    TreeDisconnectResponse, ValidateNegotiateInfoRequest, ValidateNegotiateInfoResponse,
-    encode_message, fsctl,
+    CipherId, FsctlData, HashAlgorithm, IoctlRequest, IoctlResponse, LogoffRequest, LogoffResponse,
+    Message, NegotiateContext, NegotiateRequest, NegotiateResponse, SessionFlags,
+    SessionSetupRequest, SessionSetupResponse, ShareFlags, ShareType, SigningAlgorithmId,
+    TreeConnectRequest, TreeConnectResponse, TreeDisconnectRequest, TreeDisconnectResponse,
+    ValidateNegotiateInfoRequest, ValidateNegotiateInfoResponse, encode_message, fsctl,
 };
 use fsfast_smb_proto::{Capabilities, Dialect, FileId, Guid, NtStatus, SecurityMode};
 
@@ -49,7 +48,11 @@ pub(crate) fn header_for<M: Message>(
     let mut h = Header::request(M::COMMAND);
     h.session_id = session_id;
     h.set_tree_id(tree_id);
-    h.credit_charge = if multi_credit { body.credit_charge() } else { 0 };
+    h.credit_charge = if multi_credit {
+        body.credit_charge()
+    } else {
+        0
+    };
     h
 }
 
@@ -71,10 +74,15 @@ async fn call<M: Message>(
 /// 3.1.1 contexts (SHA-512 preauth integrity, AES-128-GCM preferred
 /// encryption, AES-GMAC preferred signing). Returns the negotiated
 /// parameters and the preauth hash after NEGOTIATE (3.1.1).
-pub(crate) async fn negotiate(conn: &Connection, cfg: &SmbConfig) -> Result<(Negotiated, PreauthHasher)> {
+pub(crate) async fn negotiate(
+    conn: &Connection,
+    cfg: &SmbConfig,
+) -> Result<(Negotiated, PreauthHasher)> {
     let dialects = cfg.dialects();
     if dialects.is_empty() {
-        return Err(Error::invalid_input("smb: no dialect in the configured range"));
+        return Err(Error::invalid_input(
+            "smb: no dialect in the configured range",
+        ));
     }
     let mut security_mode = SecurityMode::SIGNING_ENABLED;
     if cfg.require_signing {
@@ -164,9 +172,7 @@ pub(crate) async fn negotiate(conn: &Connection, cfg: &SmbConfig) -> Result<(Neg
     if cfg.encrypt == Some(true) && cipher.is_none() {
         return Err(Error::new(
             ErrorKind::Unsupported,
-            format!(
-                "SMB encryption was requested but the server ({dialect}) does not support it"
-            ),
+            format!("SMB encryption was requested but the server ({dialect}) does not support it"),
         )
         .with_retryable(false));
     }
@@ -291,8 +297,8 @@ pub(crate) async fn session_setup(
                 let server_requires_signing = neg
                     .server_security_mode
                     .contains(SecurityMode::SIGNING_REQUIRED);
-                let encrypt_all =
-                    r.session_flags.contains(SessionFlags::ENCRYPT_DATA) || cfg.encrypt == Some(true);
+                let encrypt_all = r.session_flags.contains(SessionFlags::ENCRYPT_DATA)
+                    || cfg.encrypt == Some(true);
                 if guest || null {
                     // [MS-SMB2] §3.2.5.3.1: guest and anonymous sessions have no
                     // usable keys, so they can neither sign nor encrypt.
@@ -313,6 +319,7 @@ pub(crate) async fn session_setup(
                         encryptor: None,
                         decryptor: None,
                         encrypt_all: false,
+                        peek: None,
                     }));
                 }
                 let key = auth
@@ -325,22 +332,24 @@ pub(crate) async fn session_setup(
                 // The final response is signed with the new key: always in
                 // 3.1.1, otherwise when signing is in use.
                 if raw.header().is_signed() {
-                    signer.verify(raw.bytes()).map_err(|e| {
-                        Error::from(e).with_retryable(false)
-                    })?;
+                    signer
+                        .verify(raw.bytes())
+                        .map_err(|e| Error::from(e).with_retryable(false))?;
                 } else if dialect.is_3_1_1() {
                     return Err(Error::protocol(
                         "SMB 3.1.1 server did not sign the final SESSION_SETUP response",
                     )
                     .with_retryable(false));
                 }
-                let (encryptor, decryptor) = match (neg.cipher, &keys.encryption_key, &keys.decryption_key)
-                {
-                    (Some(c), Some(ek), Some(dk)) => {
-                        (Some(SmbCipher::new(c, ek)?), Some(SmbCipher::new(c, dk)?))
-                    }
-                    _ => (None, None),
-                };
+                let (encryptor, decryptor, peek) =
+                    match (neg.cipher, &keys.encryption_key, &keys.decryption_key) {
+                        (Some(c), Some(ek), Some(dk)) => (
+                            Some(SmbCipher::new(c, ek)?),
+                            Some(SmbCipher::new(c, dk)?),
+                            crate::peek::Peek::new(c, dk),
+                        ),
+                        _ => (None, None, None),
+                    };
                 if encrypt_all && encryptor.is_none() {
                     return Err(Error::new(
                         ErrorKind::Unsupported,
@@ -364,6 +373,7 @@ pub(crate) async fn session_setup(
                     encryptor,
                     decryptor,
                     encrypt_all,
+                    peek,
                 }));
             }
             status => {
@@ -481,7 +491,11 @@ pub(crate) async fn validate_negotiate(
     {
         return fail(format!(
             "server reported {:?}/{:?}/{:?}, NEGOTIATE said {}/{:?}/{:?}",
-            v.dialect, v.security_mode, v.capabilities, n.dialect, n.server_security_mode,
+            v.dialect,
+            v.security_mode,
+            v.capabilities,
+            n.dialect,
+            n.server_security_mode,
             n.server_capabilities
         ));
     }
@@ -495,7 +509,14 @@ pub(crate) async fn tree_disconnect(conn: &Connection, crypto: &Arc<SessionCrypt
         encrypt: tree.encrypt,
         force_sign: false,
     };
-    if let Ok(raw) = call(conn, &TreeDisconnectRequest, crypto.session_id, tree.tree_id, &sec).await
+    if let Ok(raw) = call(
+        conn,
+        &TreeDisconnectRequest,
+        crypto.session_id,
+        tree.tree_id,
+        &sec,
+    )
+    .await
     {
         let _: Option<TreeDisconnectResponse> = raw.into_result().ok();
     }

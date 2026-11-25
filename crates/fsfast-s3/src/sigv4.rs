@@ -218,6 +218,7 @@ impl Signer {
     ///
     /// `payload_hash` is the hex SHA-256 of the body or
     /// [`UNSIGNED_PAYLOAD`].
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         &self,
         method: &str,

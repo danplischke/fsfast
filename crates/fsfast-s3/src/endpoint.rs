@@ -35,6 +35,17 @@ impl Addressing {
     }
 }
 
+/// Query parameters that name a sub-resource and are sent without a value.
+const SUBRESOURCES: &[&str] = &[
+    "uploads",
+    "delete",
+    "versions",
+    "location",
+    "versioning",
+    "tagging",
+    "acl",
+];
+
 /// Where requests go.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
@@ -114,8 +125,8 @@ impl Endpoint {
 
     /// The URL of a request: `bucket` (none for `ListBuckets`), `key` (none
     /// for bucket operations; encoded once, `/` kept), and the query
-    /// parameters (unencoded; an empty value renders as a bare name like
-    /// `?uploads`).
+    /// parameters (unencoded; sub-resources with an empty value render as a
+    /// bare name like `?uploads`).
     pub fn url(
         &self,
         bucket: Option<&str>,
@@ -183,13 +194,16 @@ impl Endpoint {
                     s.push('&');
                 }
                 s.push_str(&uri_encode(k, false));
-                if !v.is_empty() {
+                // Sub-resources are bare names (`?uploads`), as botocore
+                // sends them; other parameters keep `=` even when empty.
+                if !v.is_empty() || !SUBRESOURCES.contains(&k.as_str()) {
                     s.push('=');
                     s.push_str(&uri_encode(v, false));
                 }
             }
         }
-        Url::parse(&s).map_err(|e| Error::invalid_input(format!("cannot build request URL {s:?}: {e}")))
+        Url::parse(&s)
+            .map_err(|e| Error::invalid_input(format!("cannot build request URL {s:?}: {e}")))
     }
 }
 
@@ -198,35 +212,59 @@ mod tests {
     use super::*;
 
     fn q(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(a, b)| ((*a).into(), (*b).into())).collect()
+        pairs
+            .iter()
+            .map(|(a, b)| ((*a).into(), (*b).into()))
+            .collect()
     }
 
     #[test]
     fn aws_urls() {
         let e = Endpoint::aws();
-        let u = e.url(Some("my-bucket"), Some("a b/c"), &[], "eu-west-1").unwrap();
-        assert_eq!(u.as_str(), "https://my-bucket.s3.eu-west-1.amazonaws.com/a%20b/c");
-        let u = e.url(Some("my-bucket"), Some("k"), &[], "us-east-1").unwrap();
+        let u = e
+            .url(Some("my-bucket"), Some("a b/c"), &[], "eu-west-1")
+            .unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://my-bucket.s3.eu-west-1.amazonaws.com/a%20b/c"
+        );
+        let u = e
+            .url(Some("my-bucket"), Some("k"), &[], "us-east-1")
+            .unwrap();
         assert_eq!(u.as_str(), "https://my-bucket.s3.amazonaws.com/k");
-        let u = e.url(Some("my.bucket"), Some("k"), &[], "eu-west-1").unwrap();
+        let u = e
+            .url(Some("my.bucket"), Some("k"), &[], "eu-west-1")
+            .unwrap();
         assert_eq!(u.as_str(), "https://s3.eu-west-1.amazonaws.com/my.bucket/k");
         let u = e.url(None, None, &[], "eu-west-1").unwrap();
         assert_eq!(u.as_str(), "https://s3.eu-west-1.amazonaws.com/");
         let u = e
-            .url(Some("b-b-b"), None, &q(&[("list-type", "2"), ("prefix", "a/b c")]), "cn-north-1")
+            .url(
+                Some("b-b-b"),
+                None,
+                &q(&[("list-type", "2"), ("prefix", "a/b c")]),
+                "cn-north-1",
+            )
             .unwrap();
         assert_eq!(
             u.as_str(),
             "https://b-b-b.s3.cn-north-1.amazonaws.com.cn/?list-type=2&prefix=a%2Fb%20c"
         );
-        let u = e.url(Some("bbb"), Some("k"), &q(&[("uploads", "")]), "us-west-2").unwrap();
-        assert_eq!(u.as_str(), "https://bbb.s3.us-west-2.amazonaws.com/k?uploads");
+        let u = e
+            .url(Some("bbb"), Some("k"), &q(&[("uploads", "")]), "us-west-2")
+            .unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://bbb.s3.us-west-2.amazonaws.com/k?uploads"
+        );
     }
 
     #[test]
     fn custom_urls() {
         let e = Endpoint::custom("http://127.0.0.1:9000").unwrap();
-        let u = e.url(Some("bucket"), Some("//double"), &[], "us-east-1").unwrap();
+        let u = e
+            .url(Some("bucket"), Some("//double"), &[], "us-east-1")
+            .unwrap();
         assert_eq!(u.as_str(), "http://127.0.0.1:9000/bucket///double");
         let u = e.url(Some("bucket"), None, &[], "us-east-1").unwrap();
         assert_eq!(u.as_str(), "http://127.0.0.1:9000/bucket");
@@ -245,5 +283,23 @@ mod tests {
         assert!(e.url(Some("b"), Some("a/../b"), &[], "r").is_err());
         assert!(e.url(Some("b"), Some("."), &[], "r").is_err());
         assert!(e.url(Some("b"), Some("a/.hidden/..x"), &[], "r").is_ok());
+    }
+
+    proptest::proptest! {
+        /// The path the HTTP client sends (after the URL parser) is exactly
+        /// the path that was signed (`/bucket/` + the encoded key), for any
+        /// key without dot segments, path-style and virtual-hosted.
+        #[test]
+        fn sent_path_is_signed_path(key in "\\PC{0,40}") {
+            proptest::prop_assume!(!key.split('/').any(|s| s == "." || s == ".."));
+            let e = Endpoint::custom("http://127.0.0.1:9000").unwrap();
+            let u = e.url(Some("bucket"), Some(&key), &[], "r").unwrap();
+            proptest::prop_assert_eq!(u.path(), format!("/bucket/{}", uri_encode(&key, true)));
+            let u = Endpoint::aws().url(Some("my-bucket"), Some(&key), &[], "eu-west-1").unwrap();
+            proptest::prop_assert_eq!(u.path(), format!("/{}", uri_encode(&key, true)));
+            let q = vec![("prefix".to_owned(), key.clone())];
+            let u = e.url(Some("bucket"), None, &q, "r").unwrap();
+            proptest::prop_assert_eq!(u.query().unwrap(), format!("prefix={}", uri_encode(&key, false)));
+        }
     }
 }

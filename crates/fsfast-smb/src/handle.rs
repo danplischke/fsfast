@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use fsfast_core::{Error, ErrorKind, FileInfo, IoHints, ReadHandle, Result, WriteHandle, async_trait};
+use fsfast_core::{
+    Error, ErrorKind, FileInfo, IoHints, ReadHandle, Result, WriteHandle, async_trait,
+};
 use fsfast_engine::budget::{BudgetGuard, MemoryBudget};
 use fsfast_engine::stats::{OpKind, Stats};
 use fsfast_smb_proto::FileId;
@@ -27,7 +29,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 
 use crate::client::Ctx;
-use crate::conn::{Response, recv_all};
+use crate::conn::{ReadReply, Response, recv_all};
 use crate::ops;
 
 /// Coalescing gap for ranged reads: SMB READs are cheap and pipelined, so
@@ -49,17 +51,6 @@ impl IoShape {
             coalesce_gap: COALESCE_GAP,
             max_coalesced: (self.chunk * 4) as u64,
         }
-    }
-}
-
-/// Send a CLOSE for `fid` without waiting (handle dropped without close).
-fn close_in_background(ctx: Ctx, fid: FileId, path: String) {
-    if let Ok(rt) = tokio::runtime::Handle::try_current() {
-        rt.spawn(async move {
-            if let Err(e) = ops::close(&ctx, fid, &path).await {
-                tracing::debug!(path, error = %e, "background SMB CLOSE failed");
-            }
-        });
     }
 }
 
@@ -85,7 +76,13 @@ impl fmt::Debug for SmbReadHandle {
 }
 
 impl SmbReadHandle {
-    pub(crate) fn new(ctx: Ctx, fid: FileId, info: FileInfo, shape: IoShape, stats: Arc<Stats>) -> Self {
+    pub(crate) fn new(
+        ctx: Ctx,
+        fid: FileId,
+        info: FileInfo,
+        shape: IoShape,
+        stats: Arc<Stats>,
+    ) -> Self {
         SmbReadHandle {
             ctx,
             fid,
@@ -108,7 +105,13 @@ impl SmbReadHandle {
             ..Default::default()
         })?;
         let msgs = chain.into_messages();
-        let mut r = self.ctx.live.conn.shared.send(msgs, &self.ctx.sec()).await?;
+        let mut r = self
+            .ctx
+            .live
+            .conn
+            .shared
+            .send(msgs, &self.ctx.sec())
+            .await?;
         Ok((len, r.pop().expect("one response")))
     }
 
@@ -160,8 +163,10 @@ impl ReadHandle for SmbReadHandle {
 
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(Error::new(ErrorKind::InvalidInput, "read on a closed SMB handle")
-                .with_path(self.info.name.as_str()));
+            return Err(
+                Error::new(ErrorKind::InvalidInput, "read on a closed SMB handle")
+                    .with_path(self.info.name.as_str()),
+            );
         }
         let size = self.info.size;
         if len == 0 || offset >= size {
@@ -195,30 +200,74 @@ impl ReadHandle for SmbReadHandle {
 
 impl SmbReadHandle {
     /// A large read: chunks in flight concurrently, landing in one buffer.
+    ///
+    /// The destination is allocated once and split into one piece per READ;
+    /// each piece travels with its request, so the reader task can receive
+    /// the data straight into it (no copy). Pieces of responses that took
+    /// the regular path are filled by copying. The pieces are re-joined in
+    /// O(1) (`BytesMut::unsplit` of adjacent pieces).
     async fn read_pipelined(&self, offset: u64, n: usize) -> Result<Bytes> {
         let chunk = self.shape.chunk;
         // A zeroed allocation comes from calloc: fresh pages cost no memset.
-        let mut out = BytesMut::zeroed(n);
+        let mut rest = BytesMut::zeroed(n);
+        let mut pieces: Vec<Option<BytesMut>> = Vec::with_capacity(n / chunk + 1);
         let mut next = 0usize;
         // End of valid data (a short read means the file shrank).
         let mut valid = n;
         let mut inflight = FuturesUnordered::new();
         loop {
             while next < n && next < valid && inflight.len() < self.shape.inflight {
-                let want = chunk.min(n - next);
-                let (asked, resp) = self.send_read(offset + next as u64, want).await?;
+                let want = self.ctx.credit_limited(chunk.min(n - next));
+                let piece = rest.split_to(want);
+                let mut chain = self.ctx.chain();
+                chain.push(&ReadRequest {
+                    length: want as u32,
+                    offset: offset + next as u64,
+                    file_id: self.fid,
+                    ..Default::default()
+                })?;
+                let msg = chain.into_messages().pop().expect("one message");
+                let resp = self
+                    .ctx
+                    .live
+                    .conn
+                    .shared
+                    .send_read(msg, &self.ctx.sec(), piece)
+                    .await?;
+                let idx = pieces.len();
+                pieces.push(None);
                 let at = next;
-                next += asked;
-                inflight.push(async move { (at, asked, resp.recv().await) });
+                next += want;
+                inflight.push(async move { (idx, at, want, resp.recv_read().await) });
             }
-            let Some((at, asked, raw)) = inflight.next().await else {
+            let Some((idx, at, asked, reply)) = inflight.next().await else {
                 break;
             };
-            let data = read_result(raw?, &self.info.name)?;
-            let len = data.len().min(asked);
-            out[at..at + len].copy_from_slice(&data[..len]);
+            let (mut dest, len) = match reply? {
+                ReadReply::Direct { dest, len } => (dest, len),
+                ReadReply::Message { msg, mut dest } => {
+                    let data = read_result(msg, &self.info.name)?;
+                    let len = data.len().min(asked);
+                    dest[..len].copy_from_slice(&data[..len]);
+                    (dest, len)
+                }
+            };
             if len < asked {
                 valid = valid.min(at + len);
+            }
+            dest.truncate(len);
+            pieces[idx] = Some(dest);
+        }
+        // Join the pieces in order up to the first short one.
+        let mut out = BytesMut::new();
+        let mut total = 0usize;
+        for p in pieces {
+            let Some(p) = p else { break };
+            let full = total + p.len() <= valid;
+            total += p.len();
+            out.unsplit(p);
+            if !full || total >= valid {
+                break;
             }
         }
         out.truncate(valid.min(n));
@@ -229,7 +278,7 @@ impl SmbReadHandle {
 impl Drop for SmbReadHandle {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::AcqRel) && !self.ctx.live.conn.is_dead() {
-            close_in_background(self.ctx.clone(), self.fid, self.info.name.clone());
+            ops::close_detached(&self.ctx, self.fid);
         }
     }
 }
@@ -319,8 +368,10 @@ impl SmbWriteHandle {
 
     fn check_open(&self) -> Result<()> {
         if self.closed {
-            return Err(Error::new(ErrorKind::InvalidInput, "write to a closed SMB handle")
-                .with_path(self.path.as_str()));
+            return Err(
+                Error::new(ErrorKind::InvalidInput, "write to a closed SMB handle")
+                    .with_path(self.path.as_str()),
+            );
         }
         Ok(())
     }
@@ -359,17 +410,18 @@ impl SmbWriteHandle {
             while self.inflight.len() >= self.shape.inflight {
                 self.complete_one().await?;
             }
-            // Memory for the queued payload: speculative work waits for
-            // budget only while other writes are in flight.
-            let guard = match self.budget.try_acquire(data.len()) {
+            let len = self.ctx.credit_limited(data.len());
+            // Memory for the queued payload: wait for budget only while
+            // other writes are in flight (they release theirs), otherwise
+            // overcommit by this one request so progress is guaranteed.
+            let guard = match self.budget.try_acquire(len) {
                 Some(g) => g,
                 None if !self.inflight.is_empty() => {
                     self.complete_one().await?;
                     continue;
                 }
-                None => self.budget.force_acquire(data.len()),
+                None => self.budget.force_acquire(len),
             };
-            let len = self.ctx.credit_limited(data.len());
             let part = data.split_to(len);
             let mut chain = self.ctx.chain();
             chain.push(&WriteRequest {
@@ -470,8 +522,9 @@ impl WriteHandle for SmbWriteHandle {
         if self.closed {
             return match &self.error {
                 None => Ok(()),
-                Some(e) => Err(Error::new(e.kind(), e.message().to_owned())
-                    .with_path(self.path.as_str())),
+                Some(e) => {
+                    Err(Error::new(e.kind(), e.message().to_owned()).with_path(self.path.as_str()))
+                }
             };
         }
         if let Some(e) = &self.error {

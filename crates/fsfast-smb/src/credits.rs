@@ -234,3 +234,46 @@ mod tests {
         assert_eq!(c.max_charge(), 128);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Random request/response sequences: MessageIds are contiguous and
+        /// unique, credits never go negative, the window is exactly
+        /// "granted minus consumed", and charges are settled exactly once.
+        #[test]
+        fn window_invariants(ops in proptest::collection::vec((1u32..8, 0u16..16), 1..200)) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            rt.block_on(async {
+                let c = Credits::new(4096);
+                c.on_response(64, 0); // 65 available
+                let mut granted: i64 = 65;
+                let mut consumed: i64 = 0;
+                let mut next_mid = 0u64;
+                let mut inflight: Vec<u32> = Vec::new();
+                for (charge, grant) in ops {
+                    if c.available() >= charge as usize {
+                        let p = c.acquire(charge).await.unwrap();
+                        let mid = c.commit(p, charge);
+                        prop_assert_eq!(mid, next_mid);
+                        next_mid += u64::from(charge);
+                        consumed += i64::from(charge);
+                        inflight.push(charge);
+                    } else if let Some(ch) = inflight.pop() {
+                        // Answer one request; never let the window collapse.
+                        let g = grant.max(1);
+                        c.on_response(g, ch);
+                        granted += i64::from(g);
+                    }
+                    prop_assert_eq!(c.available() as i64, granted - consumed);
+                    prop_assert_eq!(c.outstanding() as u32, inflight.iter().sum::<u32>());
+                    prop_assert!(c.request_for(charge as u16) >= charge as u16);
+                }
+                Ok(())
+            })?;
+        }
+    }
+}

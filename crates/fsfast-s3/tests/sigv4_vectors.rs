@@ -17,7 +17,11 @@ const SK: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 
 fn vectors() -> Vec<Value> {
     let text = include_str!("data/sigv4_vectors.json");
-    serde_json::from_str::<Value>(text).unwrap().as_array().unwrap().clone()
+    serde_json::from_str::<Value>(text)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 fn fixed_time() -> std::time::SystemTime {
@@ -25,7 +29,8 @@ fn fixed_time() -> std::time::SystemTime {
 }
 
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
-    v[k].as_str().unwrap_or_else(|| panic!("{k} missing in {v}"))
+    v[k].as_str()
+        .unwrap_or_else(|| panic!("{k} missing in {v}"))
 }
 
 #[test]
@@ -35,7 +40,11 @@ fn header_signing_matches_botocore() {
         let name = s(v, "name");
         let url = Url::parse(s(v, "url")).unwrap();
         // The URL must survive parsing unchanged (it is what is sent).
-        assert_eq!(url.as_str().trim_end_matches('/'), s(v, "url").trim_end_matches('/'), "{name}");
+        assert_eq!(
+            url.as_str().trim_end_matches('/'),
+            s(v, "url").trim_end_matches('/'),
+            "{name}"
+        );
         let mut headers = HeaderMap::new();
         for h in v["headers"].as_array().unwrap() {
             let h = h.as_array().unwrap();
@@ -50,7 +59,11 @@ fn header_signing_matches_botocore() {
             "unsigned" => UNSIGNED_PAYLOAD.to_owned(),
             _ => sha256_hex(&body),
         };
-        assert_eq!(payload, s(v, "x_amz_content_sha256"), "{name}: payload hash");
+        assert_eq!(
+            payload,
+            s(v, "x_amz_content_sha256"),
+            "{name}: payload hash"
+        );
         let token = v["token"].as_str().map(str::to_owned);
         let creds = Credentials::new(AK, SK, token, None);
         let out = Signer::new("s3")
@@ -64,9 +77,21 @@ fn header_signing_matches_botocore() {
                 fixed_time(),
             )
             .unwrap();
-        assert_eq!(out.canonical_request, s(v, "canonical_request"), "{name}: canonical request");
-        assert_eq!(out.string_to_sign, s(v, "string_to_sign"), "{name}: string to sign");
-        assert_eq!(headers["authorization"], s(v, "authorization"), "{name}: authorization");
+        assert_eq!(
+            out.canonical_request,
+            s(v, "canonical_request"),
+            "{name}: canonical request"
+        );
+        assert_eq!(
+            out.string_to_sign,
+            s(v, "string_to_sign"),
+            "{name}: string to sign"
+        );
+        assert_eq!(
+            headers["authorization"],
+            s(v, "authorization"),
+            "{name}: authorization"
+        );
         assert_eq!(headers["x-amz-date"], s(v, "x_amz_date"), "{name}");
         n += 1;
     }
@@ -141,16 +166,25 @@ fn sorted_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Vec<(Strin
 }
 
 fn url_pairs(url: &Url) -> Vec<(String, String)> {
-    sorted_pairs(url.query().unwrap_or("").split('&').filter(|p| !p.is_empty()).map(|p| {
-        let (a, b) = p.split_once('=').unwrap_or((p, ""));
-        (a.to_owned(), b.to_owned())
-    }))
+    sorted_pairs(
+        url.query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (a, b) = p.split_once('=').unwrap_or((p, ""));
+                (a.to_owned(), b.to_owned())
+            }),
+    )
 }
 
 fn vector_pairs(v: &Value) -> Vec<(String, String)> {
     sorted_pairs(v["query"].as_array().unwrap().iter().map(|p| {
         let p = p.as_array().unwrap();
-        (p[0].as_str().unwrap().to_owned(), p[1].as_str().unwrap().to_owned())
+        (
+            p[0].as_str().unwrap().to_owned(),
+            p[1].as_str().unwrap().to_owned(),
+        )
     }))
 }
 
@@ -161,7 +195,12 @@ fn request_urls_match_botocore() {
         let name = s(v, "name");
         let e = endpoint_for(v);
         let url = e
-            .url(Some(s(v, "bucket")), v["key"].as_str(), &query_params(v), s(v, "region"))
+            .url(
+                Some(s(v, "bucket")),
+                v["key"].as_str(),
+                &query_params(v),
+                s(v, "region"),
+            )
             .unwrap();
         assert_eq!(url.scheme(), s(v, "scheme"), "{name}");
         let netloc = match url.port() {
@@ -186,14 +225,21 @@ fn presigned_urls_match_botocore() {
         if let Some(ver) = v["version_id"].as_str() {
             q.push(("versionId".to_owned(), ver.to_owned()));
         }
-        let ours = e.url(Some(s(v, "bucket")), Some(s(v, "key")), &q, s(v, "region")).unwrap();
+        let ours = e
+            .url(Some(s(v, "bucket")), Some(s(v, "key")), &q, s(v, "region"))
+            .unwrap();
         assert_eq!(ours.path(), s(v, "path"), "{name}: path");
         // botocore presigns AWS virtual-hosted URLs against the legacy global
         // host (`bucket.s3.amazonaws.com`) whatever the region; fsfast uses
         // the regional host (which also works in opt-in regions and for new
         // buckets). Sign the URL botocore used to compare the signatures.
-        let url = Url::parse(&format!("{}://{}{}", s(v, "scheme"), s(v, "netloc"), ours.path()))
-            .unwrap();
+        let url = Url::parse(&format!(
+            "{}://{}{}",
+            s(v, "scheme"),
+            s(v, "netloc"),
+            ours.path()
+        ))
+        .unwrap();
         let mut url = url;
         url.set_query(ours.query());
         let creds = Credentials::new(AK, SK, v["token"].as_str().map(str::to_owned), None);
@@ -208,7 +254,11 @@ fn presigned_urls_match_botocore() {
             )
             .unwrap();
         assert_eq!(signed.path(), s(v, "path"), "{name}: path");
-        assert_eq!(url_pairs(&signed), vector_pairs(v), "{name}: query and signature");
+        assert_eq!(
+            url_pairs(&signed),
+            vector_pairs(v),
+            "{name}: query and signature"
+        );
         n += 1;
     }
     assert!(n >= 7, "only {n} presign vectors");

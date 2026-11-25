@@ -71,7 +71,10 @@ impl fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"<redacted>")
-            .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("expiry", &self.expiry)
             .finish()
     }
@@ -259,7 +262,9 @@ pub(crate) fn section_keys(
 impl ProvideCredentials for ProfileKeysProvider {
     async fn provide(&self) -> Result<Option<Credentials>> {
         let (map, what) = match self.file {
-            ProfileFile::Credentials => (&self.profiles.credentials_file, "shared-credentials-file"),
+            ProfileFile::Credentials => {
+                (&self.profiles.credentials_file, "shared-credentials-file")
+            }
             ProfileFile::Config => (&self.profiles.config_file, "config-file"),
         };
         section_keys(map.get(&self.profile), what)
@@ -373,7 +378,9 @@ impl CredentialsCache {
         match self.provider.provide().await {
             Ok(Some(n)) => {
                 if n.expires_within(now, MANDATORY_REFRESH) {
-                    tracing::warn!("refreshed credentials expire within the mandatory refresh window");
+                    tracing::warn!(
+                        "refreshed credentials expire within the mandatory refresh window"
+                    );
                 }
                 Ok(self.store(n))
             }
@@ -437,7 +444,12 @@ pub struct ChainContext {
 
 impl ChainContext {
     /// A context for `env` and `profiles` with defaults for the rest.
-    pub fn new(env: Env, profiles: Arc<ProfileFiles>, profile: String, explicit_profile: bool) -> Self {
+    pub fn new(
+        env: Env,
+        profiles: Arc<ProfileFiles>,
+        profile: String,
+        explicit_profile: bool,
+    ) -> Self {
         ChainContext {
             env,
             profiles,
@@ -457,7 +469,10 @@ pub fn default_chain(ctx: &ChainContext) -> ChainProvider {
     if !ctx.explicit_profile {
         providers.push(Arc::new(EnvProvider::new(ctx.env.clone())));
     }
-    providers.push(Arc::new(AssumeRoleProvider::new(ctx.clone(), ctx.profile.clone())));
+    providers.push(Arc::new(AssumeRoleProvider::new(
+        ctx.clone(),
+        ctx.profile.clone(),
+    )));
     providers.push(Arc::new(WebIdentityProvider::new(
         ctx.clone(),
         ctx.profile.clone(),
@@ -481,7 +496,11 @@ pub fn default_chain(ctx: &ChainContext) -> ChainProvider {
         ctx.env.clone(),
         ctx.container_base.clone(),
     )));
-    providers.push(Arc::new(ImdsProvider::new(&ctx.env, &ctx.profiles, &ctx.profile)));
+    providers.push(Arc::new(ImdsProvider::new(
+        &ctx.env,
+        &ctx.profiles,
+        &ctx.profile,
+    )));
     ChainProvider::new(providers)
 }
 
@@ -590,7 +609,10 @@ mod tests {
         // Refresh fails, the old credentials are still valid for 5 minutes.
         assert_eq!(cache.get().await.unwrap().access_key_id(), "AK0");
         cache.invalidate();
-        assert_eq!(cache.get().await.unwrap_err().kind(), ErrorKind::ConnectionFailed);
+        assert_eq!(
+            cache.get().await.unwrap_err().kind(),
+            ErrorKind::ConnectionFailed
+        );
     }
 
     #[tokio::test]
@@ -643,6 +665,9 @@ mod tests {
     fn debug_hides_secrets() {
         let c = Credentials::new("AK", "supersecret", Some("sessiontokenvalue".into()), None);
         let s = format!("{c:?}");
-        assert!(!s.contains("supersecret") && !s.contains("sessiontokenvalue"), "{s}");
+        assert!(
+            !s.contains("supersecret") && !s.contains("sessiontokenvalue"),
+            "{s}"
+        );
     }
 }

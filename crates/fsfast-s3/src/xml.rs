@@ -122,7 +122,9 @@ impl<'a> Parser<'a> {
                 self.pos += i + end.len();
                 Ok(())
             }
-            None => Err(malformed(format_args!("unterminated construct (missing {end:?})"))),
+            None => Err(malformed(format_args!(
+                "unterminated construct (missing {end:?})"
+            ))),
         }
     }
 
@@ -296,13 +298,14 @@ pub fn unescape(raw: &str) -> Result<Cow<'_, str>> {
             "quot" => '"',
             "apos" => '\'',
             _ => {
-                let code = if let Some(h) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
-                    u32::from_str_radix(h, 16).ok()
-                } else if let Some(d) = ent.strip_prefix('#') {
-                    d.parse::<u32>().ok()
-                } else {
-                    None
-                };
+                let code =
+                    if let Some(h) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
+                        u32::from_str_radix(h, 16).ok()
+                    } else if let Some(d) = ent.strip_prefix('#') {
+                        d.parse::<u32>().ok()
+                    } else {
+                        None
+                    };
                 code.and_then(char::from_u32)
                     .ok_or_else(|| malformed(format_args!("unknown entity &{ent};")))?
             }
@@ -504,7 +507,10 @@ impl ListPage {
                 "DeleteMarker" => page.delete_markers.push(DeleteMarker {
                     key: decode(c.child_text("Key").unwrap_or("")),
                     version_id: c.child_string("VersionId"),
-                    is_latest: c.child_text("IsLatest").and_then(parse_bool).unwrap_or(false),
+                    is_latest: c
+                        .child_text("IsLatest")
+                        .and_then(parse_bool)
+                        .unwrap_or(false),
                     last_modified: c.child_text("LastModified").and_then(parse_iso8601),
                 }),
                 "CommonPrefixes" => {
@@ -513,9 +519,7 @@ impl ListPage {
                     }
                 }
                 "IsTruncated" => page.is_truncated = parse_bool(&c.text).unwrap_or(false),
-                "NextContinuationToken" => {
-                    page.next_continuation_token = Some(c.text.to_string())
-                }
+                "NextContinuationToken" => page.next_continuation_token = Some(c.text.to_string()),
                 "NextKeyMarker" => page.next_key_marker = Some(decode(&c.text)),
                 "NextVersionIdMarker" => page.next_version_id_marker = Some(c.text.to_string()),
                 "KeyCount" => page.key_count = c.text.trim().parse().ok(),
@@ -803,11 +807,17 @@ mod tests {
         assert_eq!(p.objects.len(), 2);
         let o = &p.objects[0];
         assert_eq!(o.key, "a/b c&d.txt");
-        assert_eq!(o.etag.as_deref(), Some("\"6057f13c496ecf7fd777ceb9e79ae285\""));
+        assert_eq!(
+            o.etag.as_deref(),
+            Some("\"6057f13c496ecf7fd777ceb9e79ae285\"")
+        );
         assert_eq!(o.size, 3);
         assert_eq!(o.checksum_algorithms, vec!["CRC32", "CRC64NVME"]);
         assert_eq!(o.checksum_type.as_deref(), Some("FULL_OBJECT"));
-        assert_eq!(o.owner.as_ref().unwrap().display_name.as_deref(), Some("me"));
+        assert_eq!(
+            o.owner.as_ref().unwrap().display_name.as_deref(),
+            Some("me")
+        );
         assert_eq!(o.restore_status.as_ref().unwrap().in_progress, Some(false));
         assert!(o.last_modified.is_some());
         assert_eq!(p.objects[1].key, "a/cdata");
@@ -871,8 +881,14 @@ mod tests {
     #[test]
     fn builds_documents() {
         let body = delete_objects_body(&[
-            DeleteTarget { key: "a&b<c>", version_id: None },
-            DeleteTarget { key: "ctl\u{1}", version_id: Some("v") },
+            DeleteTarget {
+                key: "a&b<c>",
+                version_id: None,
+            },
+            DeleteTarget {
+                key: "ctl\u{1}",
+                version_id: Some("v"),
+            },
         ]);
         assert!(body.contains("<Key>a&amp;b&lt;c&gt;</Key>"));
         assert!(body.contains("<Key>ctl&#1;</Key><VersionId>v</VersionId>"));

@@ -21,7 +21,12 @@ const ATTEMPTS: u32 = 3;
 const RETRY_SLEEP: Duration = Duration::from_secs(1);
 /// Hosts a non-HTTPS full URI may name (botocore's `_ALLOWED_HOSTS`), in
 /// addition to loopback addresses.
-const ALLOWED_HOSTS: &[&str] = &["169.254.170.2", "169.254.170.23", "fd00:ec2::23", "localhost"];
+const ALLOWED_HOSTS: &[&str] = &[
+    "169.254.170.2",
+    "169.254.170.23",
+    "fd00:ec2::23",
+    "localhost",
+];
 
 /// Container credentials provider.
 #[derive(Debug, Clone)]
@@ -51,24 +56,26 @@ impl ContainerProvider {
     fn url(&self) -> Result<Option<Url>> {
         if let Some(rel) = self.env.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
             let s = format!("{}{}", self.base.trim_end_matches('/'), rel);
-            return Url::parse(&s)
-                .map(Some)
-                .map_err(|e| Error::invalid_input(format!("invalid container credentials URI {s:?}: {e}")));
+            return Url::parse(&s).map(Some).map_err(|e| {
+                Error::invalid_input(format!("invalid container credentials URI {s:?}: {e}"))
+            });
         }
         let Some(full) = self.env.get("AWS_CONTAINER_CREDENTIALS_FULL_URI") else {
             return Ok(None);
         };
         let url = Url::parse(&full).map_err(|e| {
-            Error::invalid_input(format!("invalid AWS_CONTAINER_CREDENTIALS_FULL_URI {full:?}: {e}"))
+            Error::invalid_input(format!(
+                "invalid AWS_CONTAINER_CREDENTIALS_FULL_URI {full:?}: {e}"
+            ))
         })?;
         validate_full_uri(&url)?;
         Ok(Some(url))
     }
 
-    fn auth_token(&self) -> Result<Option<String>> {
+    async fn auth_token(&self) -> Result<Option<String>> {
         let token = if let Some(path) = self.env.get("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
             // Re-read on every fetch: EKS rotates the token file.
-            Some(std::fs::read_to_string(&path).map_err(|e| {
+            Some(tokio::fs::read_to_string(&path).await.map_err(|e| {
                 Error::new(
                     ErrorKind::PermissionDenied,
                     format!("cannot read AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE {path:?}: {e}"),
@@ -80,7 +87,9 @@ impl ContainerProvider {
         if let Some(t) = &token
             && (t.contains('\r') || t.contains('\n'))
         {
-            return Err(Error::invalid_input("Auth token value is not a legal header value"));
+            return Err(Error::invalid_input(
+                "Auth token value is not a legal header value",
+            ));
         }
         Ok(token)
     }
@@ -119,9 +128,11 @@ impl ProvideCredentials for ContainerProvider {
             let mut req = Request::from_url(fsfast_http_transport::Method::GET, url.clone())?
                 .try_header("accept", "application/json")?
                 .retry_safe(false);
-            if let Some(t) = self.auth_token()? {
-                let mut v = fsfast_http_transport::header::HeaderValue::from_str(&t)
-                    .map_err(|_| Error::invalid_input("Auth token value is not a legal header value"))?;
+            if let Some(t) = self.auth_token().await? {
+                let mut v =
+                    fsfast_http_transport::header::HeaderValue::from_str(&t).map_err(|_| {
+                        Error::invalid_input("Auth token value is not a legal header value")
+                    })?;
                 v.set_sensitive(true);
                 req = req.header(fsfast_http_transport::header::AUTHORIZATION, v);
             }
@@ -129,7 +140,9 @@ impl ProvideCredentials for ContainerProvider {
                 let resp = client.send(req).await?;
                 let body = resp.bytes_truncated(1 << 20).await?;
                 let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
-                    Error::protocol("Unable to parse JSON returned from container metadata services")
+                    Error::protocol(
+                        "Unable to parse JSON returned from container metadata services",
+                    )
                 })?;
                 credentials_from_json(&v, "container metadata")
             }

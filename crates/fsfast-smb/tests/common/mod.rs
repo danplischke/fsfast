@@ -36,7 +36,9 @@ pub fn env() -> Option<Env> {
     let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
     Some(Env {
         host,
-        port: get("FSFAST_TEST_SMB_PORT", "445").parse().expect("FSFAST_TEST_SMB_PORT"),
+        port: get("FSFAST_TEST_SMB_PORT", "445")
+            .parse()
+            .expect("FSFAST_TEST_SMB_PORT"),
         user: get("FSFAST_TEST_SMB_USER", "fsfast"),
         password: get("FSFAST_TEST_SMB_PASSWORD", "fsfastpw"),
         share: get("FSFAST_TEST_SMB_SHARE", "data"),
@@ -96,13 +98,19 @@ pub fn pattern(len: usize, seed: u8) -> bytes::Bytes {
 pub async fn cleanup(fs: &SmbFileSystem, root: &str) {
     use fsfast_core::{FileSystem, FindOptions};
     let Ok(all) = fs
-        .find(root, &FindOptions { maxdepth: None, withdirs: true })
+        .find(
+            root,
+            &FindOptions {
+                maxdepth: None,
+                withdirs: true,
+            },
+        )
         .await
     else {
         return;
     };
     let mut entries = all;
-    entries.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.name.len()));
     for e in entries {
         if e.is_dir() {
             let _ = fs.rmdir(&e.name).await;

@@ -11,7 +11,7 @@
 //!   (multi-credit large-MTU requests included) and requested generously so
 //!   dozens of 1–8 MiB READs/WRITEs are in flight per connection.
 //! * **Compounding.** Every metadata operation is one round trip: `info` is
-//!   CREATE+CLOSE, `ls` is CREATE+QUERY_DIRECTORY+QUERY_DIRECTORY+CLOSE, a
+//!   CREATE+CLOSE, `ls` is CREATE+QUERY_DIRECTORY×3+CLOSE, a
 //!   small `cat` is CREATE+READ+CLOSE, a small `pipe` CREATE+WRITE+CLOSE,
 //!   `rm`/`rmdir`/`mv`/`touch` are CREATE+SET_INFO+CLOSE. (smbclient needs
 //!   three to six round trips for each.)
@@ -71,6 +71,7 @@ mod copy;
 pub mod credits;
 mod handle;
 mod ops;
+mod peek;
 mod session;
 
 #[cfg(test)]
@@ -120,7 +121,21 @@ pub struct ConnectionInfo {
     pub max_transact_size: u32,
     /// Credits currently available plus in flight.
     pub credit_window: usize,
+    /// Request frames sent so far over all of the filesystem's connections
+    /// (a compound chain is one frame): shows how many round trips
+    /// operations cost.
+    pub frames_sent: u64,
+    /// Local address of the TCP connection.
+    pub local_addr: Option<String>,
+    /// READ responses received (or, encrypted, decrypted) straight into the
+    /// caller's buffer so far, over all connections.
+    pub direct_reads: u64,
+    /// Connections currently established.
+    pub connections: usize,
 }
+
+/// Largest speculative READ of the one-round-trip `cat_file`.
+const INLINE_READ: usize = 1 << 20;
 
 /// The fsspec `info()` keys after `name`/`size`/`type`, in the reference
 /// implementation's order (for the Python bindings).
@@ -175,7 +190,9 @@ impl SmbFileSystem {
     /// What the connection serving `share` negotiated (connecting if
     /// needed): dialect, signing and encryption, server limits.
     pub async fn connection_info(&self, share: &str) -> Result<ConnectionInfo> {
-        let ctx = self.client.ctx(share).await?;
+        use std::sync::atomic::Ordering::Relaxed;
+        let ctx = self.client.ctx(&SmbPath::parse(share)?).await?;
+        let conns = self.client.live_connections();
         let n = ctx.live.conn.neg();
         let c = &ctx.live.crypto;
         let dialect = match n.dialect {
@@ -213,6 +230,16 @@ impl SmbFileSystem {
             max_write_size: n.max_write_size,
             max_transact_size: n.max_transact_size,
             credit_window: ctx.live.conn.shared.credits.window(),
+            frames_sent: conns
+                .iter()
+                .map(|l| l.conn.shared.frames_sent.load(Relaxed))
+                .sum(),
+            local_addr: ctx.live.conn.shared.local_addr.map(|a| a.to_string()),
+            direct_reads: conns
+                .iter()
+                .map(|l| l.conn.shared.direct_reads.load(Relaxed))
+                .sum(),
+            connections: conns.len(),
         })
     }
 
@@ -226,7 +253,11 @@ impl SmbFileSystem {
         let want = block_size
             .filter(|b| *b >= 4096)
             .unwrap_or(self.client.cfg.read_chunk_size);
-        let max = if ctx.multi_credit() { ctx.max_read() } else { 65536 };
+        let max = if ctx.multi_credit() {
+            ctx.max_read()
+        } else {
+            65536
+        };
         IoShape {
             chunk: want.min(max).max(4096.min(max)),
             inflight: self.client.cfg.max_inflight,
@@ -237,7 +268,11 @@ impl SmbFileSystem {
         let want = block_size
             .filter(|b| *b >= 4096)
             .unwrap_or(self.client.cfg.write_chunk_size);
-        let max = if ctx.multi_credit() { ctx.max_write() } else { 65536 };
+        let max = if ctx.multi_credit() {
+            ctx.max_write()
+        } else {
+            65536
+        };
         IoShape {
             chunk: want.min(max).max(4096.min(max)),
             inflight: self.client.cfg.max_inflight,
@@ -248,47 +283,49 @@ impl SmbFileSystem {
         self.client.stats.measure(op, fut).await
     }
 
-    /// Create the parent directories of `p` (auto_mkdir).
+    /// Create the parent directory of `p` (fsspec's `auto_mkdir`:
+    /// `makedirs(parent, exist_ok=True)`).
     async fn ensure_parent(&self, p: &SmbPath) -> Result<()> {
         match p.parent() {
-            Some(parent) if !parent.is_share_root() => self.ensure_dir(&parent).await,
+            Some(parent) if !parent.is_share_root() => self.makedirs_smb(&parent, true).await,
             _ => Ok(()),
         }
     }
 
-    /// `makedirs(p, exist_ok=True)` without the final existence check.
-    async fn ensure_dir(&self, p: &SmbPath) -> Result<()> {
-        if p.is_share_root() {
-            return Ok(());
-        }
-        // Walk up until a directory can be created or exists, then come back
-        // down (one round trip per missing level).
-        let mut missing = vec![p.clone()];
-        loop {
-            let cur = missing.last().expect("non-empty").clone();
-            let r = self
-                .client
-                .run(&cur.share, true, |ctx| {
-                    let cur = cur.clone();
-                    async move { ops::mkdir_one(&ctx, &cur, CreateDisposition::OPEN_IF).await }
-                })
-                .await;
-            match r {
+    /// smbclient's `makedirs`: create `p`, walking up one level per missing
+    /// ancestor (one round trip each) and back down. An existing entry — a
+    /// directory or a file — counts as present; `exist_ok` only applies to
+    /// `p` itself; a missing parent right below a present entry (a file in
+    /// the way) raises the original `NotFound`.
+    async fn makedirs_smb(&self, p: &SmbPath, exist_ok: bool) -> Result<()> {
+        let mut queue = vec![p.clone()];
+        let mut present: Option<String> = None;
+        while let Some(cur) = queue.last().cloned() {
+            match self.mkdir_create(&cur).await {
                 Ok(()) => {
-                    missing.pop();
-                    if missing.is_empty() {
-                        return Ok(());
+                    queue.pop();
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    present = Some(cur.name.clone());
+                    queue.pop();
+                    if queue.is_empty() && !exist_ok {
+                        return Err(e);
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => match cur.parent() {
-                    Some(parent) if !parent.is_share_root() && missing.len() < 512 => {
-                        missing.push(parent)
+                    Some(parent)
+                        if !parent.is_share_root()
+                            && present.as_deref() != Some(parent.name.as_str())
+                            && queue.len() < 1024 =>
+                    {
+                        queue.push(parent)
                     }
                     _ => return Err(e),
                 },
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
     }
 
     /// Open a file for reading on a context.
@@ -296,7 +333,7 @@ impl SmbFileSystem {
         let share = self.share_mode(true);
         let (ctx, c) = self
             .client
-            .run(&p.share, true, |ctx| {
+            .run(p, true, |ctx| {
                 let req = ops::read_open_req(&p.rel, share);
                 async move {
                     let c = ops::open(&ctx, req, &p.name).await?;
@@ -339,7 +376,7 @@ impl SmbFileSystem {
         let share = self.share_mode(false);
         let attempt = || {
             self.client
-                .run(&p.share, opts.mode != WriteMode::CreateNew, |ctx| {
+                .run(p, opts.mode != WriteMode::CreateNew, |ctx| {
                     let req = ops::write_open_req(&p.rel, share, disposition);
                     async move {
                         let c = ops::open(&ctx, req, &p.name).await?;
@@ -368,7 +405,7 @@ impl SmbFileSystem {
             Box::new(move || {
                 Box::pin(async move {
                     fs.client
-                        .run(&target.share, false, |ctx| {
+                        .run(&target, false, |ctx| {
                             let t = target.clone();
                             async move { ops::delete(&ctx, &t, Some(false)).await }
                         })
@@ -404,7 +441,7 @@ impl SmbFileSystem {
 
     async fn rm_inner(&self, p: &SmbPath, directory: Option<bool>) -> Result<()> {
         self.client
-            .run(&p.share, false, |ctx| async move {
+            .run(p, false, |ctx| async move {
                 ops::delete(&ctx, p, directory).await
             })
             .await
@@ -412,7 +449,7 @@ impl SmbFileSystem {
 
     async fn mkdir_create(&self, p: &SmbPath) -> Result<()> {
         self.client
-            .run(&p.share, false, |ctx| async move {
+            .run(p, false, |ctx| async move {
                 ops::mkdir_one(&ctx, p, CreateDisposition::CREATE).await
             })
             .await
@@ -424,7 +461,7 @@ impl SmbFileSystem {
         }
         let mut attempt = 1;
         let outcome = loop {
-            let (sctx, dctx) = self.client.ctx_pair(&src.share, &dst.share).await?;
+            let (sctx, dctx) = self.client.ctx_pair(src, dst).await?;
             match copy::server_side_copy(&sctx, &dctx, src, dst).await {
                 Err(e)
                     if attempt < 3
@@ -440,7 +477,11 @@ impl SmbFileSystem {
         match outcome {
             CopyOutcome::Done => Ok(()),
             CopyOutcome::Unsupported => {
-                tracing::debug!(src = src.name, dst = dst.name, "server-side copy unsupported; streaming");
+                tracing::debug!(
+                    src = src.name,
+                    dst = dst.name,
+                    "server-side copy unsupported; streaming"
+                );
                 copy_via_stream(self, &src.name, &dst.name).await
             }
         }
@@ -483,7 +524,7 @@ impl FileSystem for SmbFileSystem {
         let meta = self
             .measure(
                 OpKind::Info,
-                self.client.run(&p.share, true, |ctx| {
+                self.client.run(&p, true, |ctx| {
                     let p = &p;
                     async move { ops::stat(&ctx, p).await }
                 }),
@@ -497,7 +538,7 @@ impl FileSystem for SmbFileSystem {
         let listing = self
             .measure(
                 OpKind::List,
-                self.client.run(&p.share, true, |ctx| {
+                self.client.run(&p, true, |ctx| {
                     let p = &p;
                     async move { ops::list(&ctx, p).await }
                 }),
@@ -559,7 +600,7 @@ impl FileSystem for SmbFileSystem {
         let chunk = self.client.cfg.read_chunk_size;
         let fast = self
             .client
-            .run(&p.share, true, |ctx| {
+            .run(&p, true, |ctx| {
                 let p = &p;
                 async move {
                     let max = if ctx.multi_credit() {
@@ -571,7 +612,10 @@ impl FileSystem for SmbFileSystem {
                     let len = match want {
                         Some(w) if w > inline as u64 => return Ok(None),
                         Some(w) => w as usize,
-                        None => inline,
+                        // A read of unknown length is speculative (the
+                        // server allocates the full length): at most 1 MiB,
+                        // enough for typical small files.
+                        None => inline.min(INLINE_READ),
                     };
                     let (meta, data) = ops::read_small(&ctx, p, share, start, len).await?;
                     let eof = meta.end_of_file;
@@ -621,7 +665,7 @@ impl FileSystem for SmbFileSystem {
         let len = data.len();
         let small = || {
             self.client
-                .run(&p.share, opts.mode == WriteMode::Overwrite, |ctx| {
+                .run(&p, opts.mode == WriteMode::Overwrite, |ctx| {
                     let p = &p;
                     let data = data.clone();
                     async move {
@@ -668,12 +712,11 @@ impl FileSystem for SmbFileSystem {
     async fn mkdir(&self, path: &str, create_parents: bool) -> Result<()> {
         let p = SmbPath::parse(path)?;
         let res = async {
-            match self.mkdir_create(&p).await {
-                Err(e) if e.kind() == ErrorKind::NotFound && create_parents => {
-                    self.ensure_parent(&p).await?;
-                    self.mkdir_create(&p).await
-                }
-                r => r,
+            if create_parents {
+                // fsspec: smbclient.makedirs(path, exist_ok=False).
+                self.makedirs_smb(&p, false).await
+            } else {
+                self.mkdir_create(&p).await
             }
         };
         self.measure(OpKind::Other, res).await
@@ -685,22 +728,8 @@ impl FileSystem for SmbFileSystem {
             // fsspec only acts when the path goes below the share.
             return Ok(());
         }
-        let res = async {
-            let r = match self.mkdir_create(&p).await {
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    self.ensure_parent(&p).await?;
-                    self.mkdir_create(&p).await
-                }
-                r => r,
-            };
-            match r {
-                // smbclient's makedirs ignores EEXIST with exist_ok, even
-                // when a file is in the way.
-                Err(e) if e.kind() == ErrorKind::AlreadyExists && exist_ok => Ok(()),
-                r => r,
-            }
-        };
-        self.measure(OpKind::Other, res).await
+        self.measure(OpKind::Other, self.makedirs_smb(&p, exist_ok))
+            .await
     }
 
     async fn rmdir(&self, path: &str) -> Result<()> {
@@ -731,7 +760,7 @@ impl FileSystem for SmbFileSystem {
         }
         self.measure(
             OpKind::Other,
-            self.client.run(&s.share, false, |ctx| {
+            self.client.run(&s, false, |ctx| {
                 let (s, d) = (&s, &d);
                 async move { ops::rename(&ctx, s, d, true).await }
             }),
@@ -748,7 +777,7 @@ impl FileSystem for SmbFileSystem {
         let p = SmbPath::parse(path)?;
         self.measure(
             OpKind::Write,
-            self.client.run(&p.share, true, |ctx| {
+            self.client.run(&p, true, |ctx| {
                 let p = &p;
                 async move { ops::touch(&ctx, p).await }
             }),

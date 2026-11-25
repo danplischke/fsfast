@@ -55,7 +55,9 @@ async fn suite_parallel_checks_two_connections_small_chunks() {
             ("write_chunk_size", Value::Int(96 << 10)),
             ("auto_mkdir", Value::Bool(true)),
         ],
-        SuiteConfig::default().parallelism(6).large_file_bytes(8 << 20),
+        SuiteConfig::default()
+            .parallelism(6)
+            .large_file_bytes(8 << 20),
     )
     .await;
 }

@@ -167,8 +167,14 @@ mod tests {
     #[test]
     fn split_like_s3fs() {
         let p = split_path("s3://mybucket/path/to/file", false);
-        assert_eq!((p.bucket.as_str(), p.key.as_str()), ("mybucket", "path/to/file"));
-        let p = split_path("s3://mybucket/path/to/versioned_file?versionId=some_version_id", true);
+        assert_eq!(
+            (p.bucket.as_str(), p.key.as_str()),
+            ("mybucket", "path/to/file")
+        );
+        let p = split_path(
+            "s3://mybucket/path/to/versioned_file?versionId=some_version_id",
+            true,
+        );
         assert_eq!(p.key, "path/to/versioned_file");
         assert_eq!(p.version_id.as_deref(), Some("some_version_id"));
         let p = split_path("mybucket/f?versionId=v", false);
@@ -190,7 +196,10 @@ mod tests {
             "arn:aws:s3:us-west-2:123456789012:accesspoint/my-ap/some/key.txt",
             false,
         );
-        assert_eq!(p.bucket, "arn:aws:s3:us-west-2:123456789012:accesspoint/my-ap");
+        assert_eq!(
+            p.bucket,
+            "arn:aws:s3:us-west-2:123456789012:accesspoint/my-ap"
+        );
         assert_eq!(p.key, "some/key.txt");
         assert!(p.is_arn());
     }

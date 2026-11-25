@@ -95,7 +95,12 @@ fn copychunk_req(key: [u8; 24], chunks: Vec<SrvCopyChunk>, fid: FileId) -> Resul
         chunks,
     }
     .to_bytes()?;
-    Ok(IoctlRequest::fsctl(fsctl::SRV_COPYCHUNK_WRITE, fid, input, 12))
+    Ok(IoctlRequest::fsctl(
+        fsctl::SRV_COPYCHUNK_WRITE,
+        fid,
+        input,
+        12,
+    ))
 }
 
 /// Server-side copy of `src` (on `sctx`'s tree) to `dst` (on `dctx`'s tree;
@@ -194,8 +199,10 @@ async fn copy_to(dctx: &Ctx, dst: &SmbPath, key: [u8; 24], size: u64) -> Result<
             match chunk_result(&raw, &dst.name, &mut limits)? {
                 Some(n) if n >= len => refusals = 0,
                 Some(0) => {
-                    return Err(Error::new(ErrorKind::Io, "server-side copy made no progress")
-                        .with_path(dst.name.as_str()));
+                    return Err(
+                        Error::new(ErrorKind::Io, "server-side copy made no progress")
+                            .with_path(dst.name.as_str()),
+                    );
                 }
                 // Short batch, or refused with new limits: let the rest of
                 // the window finish, then resume after what was written

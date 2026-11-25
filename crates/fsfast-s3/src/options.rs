@@ -20,14 +20,16 @@
 //! | `part_size` | 16 MiB | multipart upload part size (when `default_block_size` is not given) |
 //! | `speculative_info` | false | race `HEAD` and `LIST` in `info()` (one round trip, one extra request) |
 //! | `strict_delete` | true | `rm_file`/`rm_files` report missing keys as `NotFound` (S3 itself deletes them silently; costs a check) |
-//! | `probe_conditional_writes` | true | verify once per bucket that the server enforces `If-None-Match: *` before relying on it for `xb` writes |
+//! | `probe_conditional_writes` | true | verify once that the server enforces `If-None-Match: *` before relying on it for `xb` writes |
+//! | `copy_threshold` | 150 MiB | objects up to this size are copied with one `CopyObject` (s3fs's `MANAGED_COPY_THRESHOLD`), larger ones with parallel `UploadPartCopy` |
+//! | `copy_part_size` | 64 MiB | part size of multipart copies (at least 5 MiB) |
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fsfast_core::{Error, OptionReader, Options, Result, Value};
-use fsfast_http_transport::{HttpConfig, ProxyConfig};
 use fsfast_engine::reader::CacheMode;
+use fsfast_http_transport::{HttpConfig, ProxyConfig};
 
 use crate::credentials::Credentials;
 use crate::endpoint::Addressing;
@@ -44,6 +46,8 @@ pub const DEFAULT_PART_SIZE: usize = 16 << 20;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 16;
 /// s3fs `MANAGED_COPY_THRESHOLD`: larger objects are copied in parts.
 pub const COPY_THRESHOLD: u64 = 150 << 20;
+/// Default part size of multipart copies.
+pub const DEFAULT_COPY_PART: u64 = 64 << 20;
 
 /// Options s3fs accepts that have no effect in fsfast (Python-side
 /// concerns: event loops, sessions, listings caches, instance caching).
@@ -126,6 +130,10 @@ pub struct S3Options {
     pub part_size: usize,
     /// fsfast: ranged-GET size.
     pub request_size: usize,
+    /// fsfast: largest object copied with a single `CopyObject`.
+    pub copy_threshold: u64,
+    /// fsfast: part size of multipart copies.
+    pub copy_part_size: u64,
     /// The environment credentials, regions and endpoints are read from.
     pub env: Env,
 }
@@ -169,7 +177,9 @@ impl S3Options {
         let secret = r.string("secret")?;
         let password = r.string("password")?;
         if key.is_some() && username.is_some() {
-            return Err(Error::invalid_input("Supply either key or username, not both"));
+            return Err(Error::invalid_input(
+                "Supply either key or username, not both",
+            ));
         }
         if secret.is_some() && password.is_some() {
             return Err(Error::invalid_input("Supply secret or password, not both"));
@@ -317,7 +327,9 @@ impl S3Options {
                 http.user_agent = Some(ua);
             }
             if let Some(proxies) = c.string_map("proxies")? {
-                let scheme = if endpoint_url.as_deref().is_some_and(|e| e.starts_with("http://"))
+                let scheme = if endpoint_url
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("http://"))
                     || (endpoint_url.is_none() && !use_ssl)
                 {
                     "http"
@@ -381,7 +393,9 @@ impl S3Options {
                 nested_finish(retries, &format!("{what}['retries']"))?;
             }
             if c.value("client_cert").is_some() {
-                return Err(Error::unsupported(format!("{what}: client_cert (mutual TLS)")));
+                return Err(Error::unsupported(format!(
+                    "{what}: client_cert (mutual TLS)"
+                )));
             }
             if c.value("sigv4a_signing_region_set").is_some() {
                 return Err(Error::unsupported(format!("{what}: SigV4a")));
@@ -418,6 +432,14 @@ impl S3Options {
             .usize("request_size")?
             .filter(|p| *p > 0)
             .unwrap_or(DEFAULT_REQUEST_SIZE);
+        let copy_threshold = r
+            .u64("copy_threshold")?
+            .unwrap_or(COPY_THRESHOLD)
+            .min(5 << 30);
+        let copy_part_size = r
+            .u64("copy_part_size")?
+            .unwrap_or(DEFAULT_COPY_PART)
+            .clamp(5 << 20, 5 << 30);
         r.finish()?;
 
         let credentials = if anon {
@@ -481,6 +503,8 @@ impl S3Options {
             probe_conditional_writes,
             part_size,
             request_size,
+            copy_threshold,
+            copy_part_size,
             env,
         })
     }
@@ -491,11 +515,19 @@ mod tests {
     use super::*;
 
     fn opts(pairs: &[(&str, Value)]) -> Options {
-        pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
     }
 
     fn map(pairs: &[(&str, Value)]) -> Value {
-        Value::Map(pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect())
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        )
     }
 
     fn parse(pairs: &[(&str, Value)]) -> Result<S3Options> {
@@ -519,7 +551,10 @@ mod tests {
             ("asynchronous", false.into()),
             (
                 "client_kwargs",
-                map(&[("region_name", "eu-west-1".into()), ("verify", false.into())]),
+                map(&[
+                    ("region_name", "eu-west-1".into()),
+                    ("verify", false.into()),
+                ]),
             ),
             (
                 "config_kwargs",
@@ -528,7 +563,13 @@ mod tests {
                     ("read_timeout", Value::Int(60)),
                     ("max_pool_connections", Value::Int(50)),
                     ("s3", map(&[("addressing_style", "virtual".into())])),
-                    ("retries", map(&[("max_attempts", Value::Int(10)), ("mode", "standard".into())])),
+                    (
+                        "retries",
+                        map(&[
+                            ("max_attempts", Value::Int(10)),
+                            ("mode", "standard".into()),
+                        ]),
+                    ),
                 ]),
             ),
             (
@@ -586,7 +627,13 @@ mod tests {
     fn strictness() {
         assert!(parse(&[("bogus", true.into())]).is_err());
         assert!(parse(&[("client_kwargs", map(&[("bogus", true.into())]))]).is_err());
-        assert!(parse(&[("config_kwargs", map(&[("s3", map(&[("bogus", true.into())]))]))]).is_err());
+        assert!(
+            parse(&[(
+                "config_kwargs",
+                map(&[("s3", map(&[("bogus", true.into())]))])
+            )])
+            .is_err()
+        );
         assert!(parse(&[("s3_additional_kwargs", map(&[("NotAParam", "x".into())]))]).is_err());
         assert!(parse(&[("max_concurrency", Value::Int(0))]).is_err());
         assert!(parse(&[("default_cache_type", "nonsense".into())]).is_err());
@@ -596,7 +643,11 @@ mod tests {
                 .kind(),
             fsfast_core::ErrorKind::Unsupported
         );
-        let o = parse(&[("config_kwargs", map(&[("signature_version", "UNSIGNED".into())]))]).unwrap();
+        let o = parse(&[(
+            "config_kwargs",
+            map(&[("signature_version", "UNSIGNED".into())]),
+        )])
+        .unwrap();
         assert!(o.anon);
         let o = parse(&[("cache_regions", true.into())]).unwrap();
         assert!(o.cache_regions);

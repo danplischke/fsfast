@@ -36,10 +36,10 @@ use fsfast_core::{Error, ErrorKind, Result};
 use fsfast_engine::concurrency::AbortOnDrop;
 use fsfast_smb_proto::compound::split_compound;
 use fsfast_smb_proto::crypto::{Signer, SmbCipher};
-use fsfast_smb_proto::framing::FrameDecoder;
+use fsfast_smb_proto::framing::MAX_TRANSPORT_FRAME_LEN;
 use fsfast_smb_proto::header::{
-    COMPRESSION_PROTOCOL_ID, Command, Header, HeaderFlags, HeaderId,
-    MESSAGE_ID_OFFSET, TRANSFORM_PROTOCOL_ID, UNSOLICITED_MESSAGE_ID,
+    COMPRESSION_PROTOCOL_ID, Command, Header, HeaderFlags, HeaderId, MESSAGE_ID_OFFSET,
+    TRANSFORM_PROTOCOL_ID, UNSOLICITED_MESSAGE_ID,
 };
 use fsfast_smb_proto::msg::{
     CancelRequest, EchoRequest, EchoResponse, EncodedMessage, OutgoingFrame, RawMessage,
@@ -79,6 +79,9 @@ pub(crate) struct SessionCrypto {
     /// Encrypt every request of the session (session `ENCRYPT_DATA` flag or
     /// the user's `encrypt=True`).
     pub encrypt_all: bool,
+    /// Server-to-client AES key schedule for peeking at encrypted READ
+    /// headers (GCM sessions only).
+    pub peek: Option<crate::peek::Peek>,
 }
 
 impl std::fmt::Debug for SessionCrypto {
@@ -155,9 +158,29 @@ pub(crate) fn was_not_sent(e: &Error) -> bool {
 
 /// A response routed to its caller.
 #[derive(Debug)]
-struct Delivered {
-    msg: RawMessage,
-    encrypted: bool,
+enum Delivered {
+    /// A regular response (`encrypted`: it arrived in a TRANSFORM_HEADER);
+    /// a READ's registered destination comes back untouched.
+    Msg {
+        msg: RawMessage,
+        encrypted: bool,
+        dest: Option<BytesMut>,
+    },
+    /// READ data received straight into `dest[..len]`; `head` holds the
+    /// header and the fixed READ body.
+    Direct {
+        head: RawMessage,
+        dest: BytesMut,
+        len: usize,
+    },
+    /// An encrypted READ response for the caller to authenticate and decrypt
+    /// into `dest`; `peeked` is what routing assumed the plaintext starts
+    /// with.
+    Sealed {
+        frame: Bytes,
+        dest: BytesMut,
+        peeked: [u8; 80],
+    },
 }
 
 /// One request waiting for its response.
@@ -171,7 +194,23 @@ struct Pending {
     /// Set by an interim `STATUS_PENDING` response.
     async_id: Option<u64>,
     session_id: u64,
+    /// For a READ: the caller's buffer the data may be received into.
+    dest: Option<BytesMut>,
+    /// Counted in `Shared::direct_waiters` until removed.
+    has_dest: bool,
 }
+
+/// Answer to a READ sent with [`Shared::send_read`].
+pub(crate) enum ReadReply {
+    /// The data was received straight into `dest[..len]` (no copy).
+    Direct { dest: BytesMut, len: usize },
+    /// A regular response; `dest` comes back untouched for the caller to
+    /// copy the data into.
+    Message { msg: RawMessage, dest: BytesMut },
+}
+
+/// Smallest READ payload worth receiving directly into the caller's buffer.
+const DIRECT_MIN: usize = 16 << 10;
 
 /// State shared by the connection's tasks and its callers.
 pub(crate) struct Shared {
@@ -192,6 +231,15 @@ pub(crate) struct Shared {
     /// Milliseconds since `started` when the last frame arrived.
     last_rx: AtomicU64,
     request_timeout: Option<Duration>,
+    /// Local socket address (diagnostics).
+    pub local_addr: Option<std::net::SocketAddr>,
+    /// Request frames queued for sending (one per compound chain).
+    pub frames_sent: AtomicU64,
+    /// READs in flight that registered a destination buffer.
+    direct_waiters: std::sync::atomic::AtomicUsize,
+    /// READ responses received (plain) or decrypted (encrypted) straight
+    /// into the caller's buffer.
+    pub direct_reads: AtomicU64,
 }
 
 impl std::fmt::Debug for Shared {
@@ -231,6 +279,7 @@ impl Connection {
         keepalive: Option<Duration>,
     ) -> Connection {
         let _ = stream.set_nodelay(true);
+        let local_addr = stream.local_addr().ok();
         let (rd, wr) = stream.into_split();
         let (tx, rx) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
@@ -248,6 +297,10 @@ impl Connection {
             started: Instant::now(),
             last_rx: AtomicU64::new(0),
             request_timeout,
+            local_addr,
+            frames_sent: AtomicU64::new(0),
+            direct_waiters: std::sync::atomic::AtomicUsize::new(0),
+            direct_reads: AtomicU64::new(0),
         });
         let mut tasks = vec![
             AbortOnDrop::spawn(reader_loop(shared.clone(), rd)),
@@ -293,11 +346,6 @@ impl Connection {
         *self.shared.crypto.write() = c;
     }
 
-    /// Requests in flight.
-    pub fn in_flight(&self) -> usize {
-        self.shared.pending.lock().len()
-    }
-
     /// Mark the connection dead (closing it).
     pub fn kill(&self, why: &str) {
         self.shared.fail(why);
@@ -330,6 +378,7 @@ impl Shared {
         let _ = self.shutdown.send(true);
         let drained: Vec<Pending> = self.pending.lock().drain().map(|(_, p)| p).collect();
         for p in drained {
+            self.forget_dest(&p);
             if let Some(tx) = p.tx {
                 let _ = tx.send(Err(self.dead_error()));
             }
@@ -362,7 +411,22 @@ impl Shared {
         msgs: Vec<EncodedMessage>,
         sec: &Security,
     ) -> Result<Vec<Response>> {
-        self.send_inner(msgs, sec, false).await.map(|(r, _)| r)
+        self.send_inner(msgs, sec, false, None)
+            .await
+            .map(|(r, _)| r)
+    }
+
+    /// Send one READ whose data may be received straight into `dest`
+    /// (which must be at least as long as the READ). Wait for it with
+    /// [`Response::recv_read`].
+    pub async fn send_read(
+        self: &Arc<Self>,
+        msg: EncodedMessage,
+        sec: &Security,
+        dest: BytesMut,
+    ) -> Result<Response> {
+        let (mut r, _) = self.send_inner(vec![msg], sec, false, Some(dest)).await?;
+        Ok(r.pop().expect("one response"))
     }
 
     /// [`Shared::send`] that also returns each message exactly as sent
@@ -372,7 +436,7 @@ impl Shared {
         msgs: Vec<EncodedMessage>,
         sec: &Security,
     ) -> Result<(Vec<Response>, Vec<Bytes>)> {
-        self.send_inner(msgs, sec, true).await
+        self.send_inner(msgs, sec, true, None).await
     }
 
     async fn send_inner(
@@ -380,6 +444,7 @@ impl Shared {
         mut msgs: Vec<EncodedMessage>,
         sec: &Security,
         capture: bool,
+        mut dest: Option<BytesMut>,
     ) -> Result<(Vec<Response>, Vec<Bytes>)> {
         if self.is_dead() {
             return Err(self.dead_error().with_source(NotSent));
@@ -403,8 +468,8 @@ impl Shared {
 
         // ---- From here on nothing awaits: MessageIds taken are always sent.
         let session = sec.session.as_ref();
-        let encrypt = sec.encrypt
-            && session.is_some_and(|s| s.encryptor.is_some() && s.session_id != 0);
+        let encrypt =
+            sec.encrypt && session.is_some_and(|s| s.encryptor.is_some() && s.session_id != 0);
         if sec.encrypt && !encrypt {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -419,7 +484,8 @@ impl Shared {
             let charge = charges[i];
             m.head[MESSAGE_ID_OFFSET..MESSAGE_ID_OFFSET + 8].copy_from_slice(&mid.to_le_bytes());
             let req = if i == 0 {
-                self.credits.request_for(total.min(u32::from(u16::MAX)) as u16)
+                self.credits
+                    .request_for(total.min(u32::from(u16::MAX)) as u16)
             } else {
                 charge as u16
             };
@@ -436,11 +502,12 @@ impl Shared {
         {
             for m in msgs.iter_mut() {
                 let h = m.header();
-                if h.session_id != 0 && h.command != Command::NEGOTIATE {
-                    if let Err(e) = signer.sign(m) {
-                        sign_err = Some(e);
-                        break;
-                    }
+                if h.session_id != 0
+                    && h.command != Command::NEGOTIATE
+                    && let Err(e) = signer.sign(m)
+                {
+                    sign_err = Some(e);
+                    break;
                 }
             }
         }
@@ -475,6 +542,9 @@ impl Shared {
         };
         let session_id = session.map_or(0, |s| s.session_id);
         let mut responses = Vec::with_capacity(mids.len());
+        if dest.is_some() {
+            self.direct_waiters.fetch_add(1, Ordering::AcqRel);
+        }
         {
             let mut pending = self.pending.lock();
             for &(mid, charge) in &mids {
@@ -488,6 +558,8 @@ impl Shared {
                         encrypted: encrypt,
                         async_id: None,
                         session_id,
+                        has_dest: dest.is_some(),
+                        dest: dest.take(),
                     },
                 );
                 responses.push(Response {
@@ -498,6 +570,7 @@ impl Shared {
                 });
             }
         }
+        self.frames_sent.fetch_add(1, Ordering::Relaxed);
         if self.tx.send(frame).is_err() {
             self.fail("writer task stopped");
             return Err(self.dead_error().with_source(NotSent));
@@ -516,8 +589,19 @@ impl Shared {
     }
 
     /// Handle one received frame (reader task).
-    fn on_frame(&self, frame: BytesMut) {
+    fn on_frame(&self, mut frame: BytesMut) {
         self.touch_rx();
+        if frame.starts_with(&TRANSFORM_PROTOCOL_ID) && self.wants_direct() {
+            let crypto = self.crypto.read().clone();
+            if let Some(c) = crypto
+                && let Some(peek) = &c.peek
+            {
+                match self.route_sealed(frame, peek) {
+                    None => return,
+                    Some(f) => frame = f,
+                }
+            }
+        }
         let (plain, encrypted) = if frame.starts_with(&TRANSFORM_PROTOCOL_ID) {
             let crypto = self.crypto.read().clone();
             let Some(c) = crypto.filter(|c| c.decryptor.is_some()) else {
@@ -573,7 +657,11 @@ impl Shared {
         let Some(p) = pending.get_mut(&h.message_id) else {
             drop(pending);
             self.credits.on_response(h.credits, 0);
-            tracing::debug!(conn = self.id, mid = h.message_id, "response for unknown MessageId");
+            tracing::debug!(
+                conn = self.id,
+                mid = h.message_id,
+                "response for unknown MessageId"
+            );
             return;
         };
         let settle = if p.settled {
@@ -589,6 +677,7 @@ impl Shared {
         }
         let p = pending.remove(&h.message_id).expect("present above");
         drop(pending);
+        self.forget_dest(&p);
         if p.encrypted && !encrypted {
             if let Some(tx) = p.tx {
                 let _ = tx.send(Err(Error::protocol(
@@ -600,7 +689,149 @@ impl Shared {
             return;
         }
         if let Some(tx) = p.tx {
-            let _ = tx.send(Ok(Delivered { msg: m, encrypted }));
+            let _ = tx.send(Ok(Delivered::Msg {
+                msg: m,
+                encrypted,
+                dest: p.dest,
+            }));
+        }
+    }
+
+    /// Whether the frame starting in `buf` (transport header included, total
+    /// payload `len`) is a plain, successful, single READ response whose
+    /// caller registered a destination large enough: then take that buffer
+    /// and return `(mid, data_offset, data_len, dest)`.
+    fn direct_candidate(&self, buf: &[u8], len: usize) -> Option<(u64, usize, usize, BytesMut)> {
+        const B: usize = 4; // transport header
+        if buf.len() < B + 80 || buf[B..B + 4] != fsfast_smb_proto::header::PROTOCOL_ID {
+            return None;
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([buf[B + o], buf[B + o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes(buf[B + o..B + o + 4].try_into().unwrap());
+        let status = u32_at(8);
+        let command = u16_at(12);
+        let flags = u32_at(16);
+        let next = u32_at(20);
+        if status != 0
+            || command != Command::READ.0
+            || flags & HeaderFlags::SERVER_TO_REDIR.bits() == 0
+            || next != 0
+            || u16_at(64) != 17
+        {
+            return None;
+        }
+        let data_offset = usize::from(buf[B + 66]);
+        let data_len = u32_at(68) as usize;
+        if data_offset < 80 || data_offset + data_len != len || data_len < DIRECT_MIN {
+            return None;
+        }
+        if buf.len() < B + data_offset {
+            return None;
+        }
+        let mid = u64::from_le_bytes(buf[B + 24..B + 32].try_into().unwrap());
+        let mut pending = self.pending.lock();
+        let p = pending.get_mut(&mid)?;
+        if p.encrypted || p.dest.as_ref().is_none_or(|d| d.len() < data_len) {
+            return None;
+        }
+        let dest = p.dest.take()?;
+        Some((mid, data_offset, data_len, dest))
+    }
+
+    /// An encrypted frame that is a single successful READ response for a
+    /// caller with a destination buffer goes to that caller still sealed
+    /// (see `crate::peek`). Returns the frame when it does not qualify.
+    fn route_sealed(&self, frame: BytesMut, peek: &crate::peek::Peek) -> Option<BytesMut> {
+        let Some(p) = peek.peek::<80>(&frame) else {
+            return Some(frame);
+        };
+        let u16_at = |o: usize| u16::from_le_bytes([p[o], p[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+        if p[..4] != fsfast_smb_proto::header::PROTOCOL_ID
+            || u32_at(8) != 0
+            || u16_at(12) != Command::READ.0
+            || u32_at(16) & HeaderFlags::SERVER_TO_REDIR.bits() == 0
+            || u32_at(20) != 0
+            || u16_at(64) != 17
+        {
+            return Some(frame);
+        }
+        let data_offset = usize::from(p[66]);
+        let data_len = u32_at(68) as usize;
+        if data_offset < 80
+            || data_len < DIRECT_MIN
+            || frame.len() != crate::peek::TRANSFORM_LEN + data_offset + data_len
+        {
+            return Some(frame);
+        }
+        let mid = u64::from_le_bytes(p[24..32].try_into().unwrap());
+        let credits = u16_at(14);
+        let mut pending = self.pending.lock();
+        let ok = pending
+            .get(&mid)
+            .is_some_and(|e| e.encrypted && e.dest.as_ref().is_some_and(|d| d.len() >= data_len));
+        if !ok {
+            return Some(frame);
+        }
+        let mut e = pending.remove(&mid).expect("checked above");
+        drop(pending);
+        self.forget_dest(&e);
+        // Credits from the (still unauthenticated) header: a forged value
+        // cannot survive the caller's tag check, which kills the connection.
+        let settle = if e.settled { 0 } else { e.charge };
+        e.settled = true;
+        self.credits.on_response(credits, settle);
+        self.direct_reads.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx) = e.tx
+            && let Some(dest) = e.dest
+        {
+            let _ = tx.send(Ok(Delivered::Sealed {
+                frame: frame.freeze(),
+                dest,
+                peeked: p,
+            }));
+        }
+        None
+    }
+
+    fn forget_dest(&self, p: &Pending) {
+        if p.has_dest {
+            self.direct_waiters.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether some READ in flight may be received directly.
+    fn wants_direct(&self) -> bool {
+        self.direct_waiters.load(Ordering::Acquire) > 0
+    }
+
+    /// Complete a directly received READ (reader task).
+    fn deliver_direct(&self, head: Bytes, dest: BytesMut, len: usize) {
+        let msg = match RawMessage::parse(head) {
+            Ok(m) => m,
+            Err(e) => {
+                self.fail(&format!("malformed READ response: {e}"));
+                return;
+            }
+        };
+        let h = *msg.header();
+        let mut pending = self.pending.lock();
+        let Some(mut p) = pending.remove(&h.message_id) else {
+            drop(pending);
+            self.credits.on_response(h.credits, 0);
+            return;
+        };
+        drop(pending);
+        self.forget_dest(&p);
+        let settle = if p.settled { 0 } else { p.charge };
+        p.settled = true;
+        self.credits.on_response(h.credits, settle);
+        if let Some(tx) = p.tx {
+            let _ = tx.send(Ok(Delivered::Direct {
+                head: msg,
+                dest,
+                len,
+            }));
         }
     }
 
@@ -657,7 +888,12 @@ impl Shared {
             _ => OutgoingFrame::from_messages([m]).ok(),
         };
         if let Some(f) = frame {
-            tracing::debug!(conn = self.id, mid, async_id, "cancelling abandoned async request");
+            tracing::debug!(
+                conn = self.id,
+                mid,
+                async_id,
+                "cancelling abandoned async request"
+            );
             let _ = self.tx.send(f);
         }
     }
@@ -697,43 +933,160 @@ impl std::fmt::Debug for Response {
 }
 
 impl Response {
+    /// Wait for the routed response, applying `request_timeout` until the
+    /// first (interim or final) answer.
+    async fn wait(&mut self) -> Result<Delivered> {
+        // `rx` stays in `self` while waiting, so dropping the caller's
+        // future runs `Drop`, which abandons (and if needed CANCELs) the
+        // request.
+        let timeout = self.shared.request_timeout;
+        let shared = self.shared.clone();
+        let mid = self.mid;
+        let rx = self.rx.as_mut().expect("response awaited once");
+        let res = match timeout {
+            None => rx.await,
+            Some(limit) => match tokio::time::timeout(limit, &mut *rx).await {
+                Ok(r) => r,
+                // An async (STATUS_PENDING) operation may legitimately take
+                // longer; wait without a limit.
+                Err(_) if shared.went_async(mid) => rx.await,
+                Err(_) => {
+                    let msg = format!("no SMB response from {} within {limit:?}", shared.peer);
+                    shared.fail(&msg);
+                    self.rx = None;
+                    return Err(Error::timeout(msg));
+                }
+            },
+        };
+        self.rx = None;
+        match res {
+            Ok(r) => r,
+            Err(_) => Err(self.shared.dead_error()),
+        }
+    }
+
     /// Wait for the response and verify its signature.
     ///
     /// Error statuses are returned as `Ok` (callers map them with the path
     /// they know); `Err` means the request failed at the connection level.
     pub async fn recv(mut self) -> Result<RawMessage> {
-        // `rx` stays in `self` while waiting, so dropping this future runs
-        // `Drop`, which abandons (and if needed CANCELs) the request.
-        let timeout = self.shared.request_timeout;
-        let shared = self.shared.clone();
-        let mid = self.mid;
-        let rx = self.rx.as_mut().expect("recv called once");
-        let res = match timeout {
-            None => rx.await,
-            Some(limit) => loop {
-                match tokio::time::timeout(limit, &mut *rx).await {
-                    Ok(r) => break r,
-                    // An async (STATUS_PENDING) operation may legitimately
-                    // take longer; wait without a limit.
-                    Err(_) if shared.went_async(mid) => break rx.await,
-                    Err(_) => {
-                        let msg = format!("no SMB response from {} within {limit:?}", shared.peer);
-                        shared.fail(&msg);
-                        self.rx = None;
-                        return Err(Error::timeout(msg));
-                    }
+        match self.wait().await? {
+            Delivered::Msg { msg, encrypted, .. } => {
+                if !encrypted {
+                    self.verify(&msg)?;
                 }
-            },
-        };
-        self.rx = None;
-        let delivered = match res {
-            Ok(r) => r?,
-            Err(_) => return Err(self.shared.dead_error()),
-        };
-        if !delivered.encrypted {
-            self.verify(&delivered.msg)?;
+                Ok(msg)
+            }
+            // Only READs sent with a destination are delivered this way.
+            Delivered::Direct { .. } | Delivered::Sealed { .. } => {
+                Err(Error::protocol("unexpected direct READ delivery"))
+            }
         }
-        Ok(delivered.msg)
+    }
+
+    /// Wait for the answer to a READ sent with [`Shared::send_read`].
+    pub async fn recv_read(mut self) -> Result<ReadReply> {
+        match self.wait().await? {
+            Delivered::Msg {
+                msg,
+                encrypted,
+                dest,
+            } => {
+                if !encrypted {
+                    self.verify(&msg)?;
+                }
+                Ok(ReadReply::Message {
+                    msg,
+                    dest: dest.unwrap_or_default(),
+                })
+            }
+            Delivered::Direct { head, dest, len } => {
+                self.verify_parts(&head, &dest[..len])?;
+                Ok(ReadReply::Direct { dest, len })
+            }
+            Delivered::Sealed {
+                frame,
+                mut dest,
+                peeked,
+            } => {
+                let len = u32::from_le_bytes(peeked[68..72].try_into().unwrap()) as usize;
+                self.open_sealed(&frame, &mut dest, &peeked)?;
+                Ok(ReadReply::Direct { dest, len })
+            }
+        }
+    }
+
+    /// Authenticate and decrypt a sealed READ response straight into `dest`
+    /// (AES-GCM checks the tag before writing plaintext), then check that
+    /// the authenticated header is what the reader routed by.
+    fn open_sealed(&self, frame: &[u8], dest: &mut BytesMut, peeked: &[u8; 80]) -> Result<()> {
+        let fail = |why: String| {
+            self.shared.fail(&why);
+            Err(Error::protocol(why).with_retryable(false))
+        };
+        let Some(dec) = self.session.as_ref().and_then(|s| s.decryptor.as_ref()) else {
+            return fail("encrypted READ response without session keys".into());
+        };
+        let data_offset = usize::from(peeked[66]);
+        let len = u32::from_le_bytes(peeked[68..72].try_into().unwrap()) as usize;
+        let mut head = vec![0u8; data_offset];
+        match dec.decrypt_into_parts(frame, &mut [&mut head[..], &mut dest[..len]]) {
+            Ok((hdr, n)) if n == data_offset + len => {
+                let sid = self.session.as_ref().map_or(0, |s| s.session_id);
+                if hdr.session_id != sid {
+                    return fail(format!(
+                        "encrypted READ response for unknown session {:#x}",
+                        hdr.session_id
+                    ));
+                }
+            }
+            Ok(_) => return fail("encrypted READ response of unexpected size".into()),
+            Err(e) => return fail(format!("decryption failed: {e}")),
+        }
+        if head[..80] != peeked[..] {
+            return fail("encrypted READ response changed between peek and decryption".into());
+        }
+        Ok(())
+    }
+
+    /// Verify a READ response received in two parts (header + data).
+    fn verify_parts(&self, head: &RawMessage, data: &[u8]) -> Result<()> {
+        let Some(s) = &self.session else {
+            return Ok(());
+        };
+        let h = head.header();
+        if h.session_id == 0 {
+            return Ok(());
+        }
+        if h.is_signed() {
+            if let Some(signer) = &s.signer {
+                let ok = signer
+                    .compute(&[head.bytes(), data])
+                    .map(|sig| {
+                        // Constant-time comparison.
+                        let got = &head.bytes()[48..64];
+                        sig.iter().zip(got).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+                    })
+                    .unwrap_or(false);
+                if !ok {
+                    self.shared.fail("bad signature on READ response");
+                    return Err(
+                        Error::protocol("SMB READ response signature verification failed")
+                            .with_retryable(false),
+                    );
+                }
+            }
+            return Ok(());
+        }
+        if s.signing {
+            self.shared
+                .fail("unsigned READ response on a signing session");
+            return Err(Error::protocol(
+                "unsigned SMB READ response on a session that requires signing",
+            )
+            .with_retryable(false));
+        }
+        Ok(())
     }
 
     /// [MS-SMB2] §3.2.5.1.3: verify signed responses; on a signing session
@@ -799,32 +1152,104 @@ pub(crate) async fn recv_all(responses: Vec<Response>) -> Result<Vec<RawMessage>
 async fn reader_loop(shared: Arc<Shared>, mut rd: OwnedReadHalf) {
     let mut shutdown = shared.shutdown.subscribe();
     let mut buf = BytesMut::with_capacity(READ_BUF);
-    let mut dec = FrameDecoder::new();
     let why = loop {
-        match dec.decode(&mut buf) {
-            Ok(Some(frame)) => {
+        let mut limit = None;
+        if buf.len() >= 4 {
+            let len =
+                (usize::from(buf[1]) << 16) | (usize::from(buf[2]) << 8) | usize::from(buf[3]);
+            match buf[0] {
+                0 => {}
+                // NetBIOS keepalive.
+                0x85 if len == 0 => {
+                    buf.advance(4);
+                    continue;
+                }
+                _ => break "bad transport frame header".to_owned(),
+            }
+            if len > MAX_TRANSPORT_FRAME_LEN {
+                break format!("transport frame of {len} bytes is too large");
+            }
+            if buf.len() >= 4 + len {
+                buf.advance(4);
+                let frame = buf.split_to(len);
                 shared.on_frame(frame);
                 if shared.is_dead() {
                     return;
                 }
                 continue;
             }
-            Ok(None) => {}
-            Err(e) => break format!("bad transport frame: {e}"),
+            // A large READ response whose caller gave us its buffer: receive
+            // the data straight into it instead of into `buf` (saves a copy
+            // of every byte and the receive-buffer allocations).
+            if let Some((_mid, data_offset, data_len, mut dest)) =
+                shared.direct_candidate(&buf, len)
+            {
+                buf.advance(4);
+                let head = buf.split_to(data_offset).freeze();
+                let have = buf.len().min(data_len);
+                dest[..have].copy_from_slice(&buf[..have]);
+                buf.advance(have);
+                let mut filled = have;
+                while filled < data_len {
+                    tokio::select! {
+                        r = rd.read(&mut dest[filled..data_len]) => match r {
+                            Ok(0) => {
+                                shared.fail("server closed the connection");
+                                return;
+                            }
+                            Ok(n) => filled += n,
+                            Err(e) => {
+                                shared.fail(&format!("read failed: {e}"));
+                                return;
+                            }
+                        },
+                        _ = shutdown.changed() => return,
+                    }
+                }
+                shared.touch_rx();
+                shared.direct_reads.fetch_add(1, Ordering::Relaxed);
+                shared.deliver_direct(head, dest, data_len);
+                continue;
+            }
+            // While the frame could still go direct, do not pull its payload
+            // into `buf`: read only up to the end of the READ body.
+            if shared.wants_direct() && len >= 80 + DIRECT_MIN && buf.len() < 4 + 80 {
+                limit = Some(4 + 80 - buf.len());
+            } else {
+                // Room for the rest of this frame in one allocation.
+                let need = 4 + len - buf.len();
+                if buf.capacity() - buf.len() < need {
+                    buf.reserve(need.max(4096));
+                }
+            }
+        } else {
+            if buf.capacity() - buf.len() < 4096 {
+                buf.reserve(READ_BUF);
+            }
+            if shared.wants_direct() {
+                limit = Some(4 + 80 - buf.len());
+            }
         }
-        // `decode` reserved room for a partially received frame; make sure a
-        // header-sized read always has space too.
-        let need = dec.bytes_needed(&buf);
-        if buf.capacity() - buf.len() < need.max(4096) {
-            buf.reserve(need.max(READ_BUF));
-        }
-        tokio::select! {
-            r = rd.read_buf(&mut buf) => match r {
-                Ok(0) => break "server closed the connection".to_owned(),
-                Ok(_) => {}
-                Err(e) => break format!("read failed: {e}"),
+        let r = match limit {
+            Some(n) => {
+                if buf.capacity() - buf.len() < n {
+                    buf.reserve(n);
+                }
+                let mut limited = (&mut rd).take(n as u64);
+                tokio::select! {
+                    r = limited.read_buf(&mut buf) => r,
+                    _ = shutdown.changed() => return,
+                }
+            }
+            None => tokio::select! {
+                r = rd.read_buf(&mut buf) => r,
+                _ = shutdown.changed() => return,
             },
-            _ = shutdown.changed() => return,
+        };
+        match r {
+            Ok(0) => break "server closed the connection".to_owned(),
+            Ok(_) => {}
+            Err(e) => break format!("read failed: {e}"),
         }
     };
     shared.fail(&why);
@@ -881,7 +1306,9 @@ async fn write_frames(
         }
         let mut left = written;
         while left > 0 {
-            let front = queue.front_mut().expect("written bytes belong to queued frames");
+            let front = queue
+                .front_mut()
+                .expect("written bytes belong to queued frames");
             let r = front.remaining();
             if left >= r {
                 left -= r;

@@ -21,7 +21,8 @@ OPS = [
     "ListObjectsV2", "ListObjectVersions", "HeadObject", "GetObject", "PutObject",
     "DeleteObject", "DeleteObjects", "CopyObject", "CreateMultipartUpload", "UploadPart",
     "UploadPartCopy", "CompleteMultipartUpload", "AbortMultipartUpload",
-    "GetBucketVersioning",
+    "GetBucketVersioning", "PutBucketVersioning", "GetObjectTagging", "PutObjectTagging",
+    "PutObjectAcl", "PutBucketAcl",
 ]
 
 # Parameters fsfast sets itself from the operation's arguments (paths,

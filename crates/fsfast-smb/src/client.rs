@@ -20,7 +20,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
 
-use crate::config::SmbConfig;
+use crate::config::{SmbConfig, SmbPath};
 use crate::conn::{Connection, Security, SessionCrypto, recv_all, was_not_sent};
 use crate::session::{self, Tree, header_for};
 
@@ -223,28 +223,31 @@ impl Client {
         self.live_in(&self.slots[0]).await.map(|_| ())
     }
 
-    /// A live connection: the least busy established one, or a new one when
-    /// every established connection is busy and a slot is free.
-    pub async fn live(&self) -> Result<Arc<Live>> {
-        let mut best: Option<(usize, Arc<Live>)> = None;
-        let mut idle_slot = None;
-        for (i, s) in self.slots.iter().enumerate() {
-            match s.live() {
-                Some(l) => {
-                    let load = l.conn.in_flight();
-                    if best.as_ref().is_none_or(|(b, _)| load < *b) {
-                        best = Some((load, l));
-                    }
-                }
-                None if idle_slot.is_none() => idle_slot = Some(i),
-                None => {}
-            }
-        }
-        match (best, idle_slot) {
-            (Some((0, l)), _) | (Some((_, l)), None) => Ok(l),
-            (_, Some(i)) => self.live_in(&self.slots[i]).await,
-            (None, None) => unreachable!("at least one slot"),
-        }
+    /// The live connection serving `key` (a path).
+    ///
+    /// Paths are spread over the slots by a hash of their lower-cased name
+    /// (servers compare names case-insensitively), so every operation on one
+    /// path uses one connection and the server sees them in program order —
+    /// including CLOSEs sent in the background for dropped handles — while
+    /// operations on different paths run on different connections (Samba
+    /// serves each connection with its own process). Slots connect lazily.
+    pub async fn live_for(&self, key: &str) -> Result<Arc<Live>> {
+        let n = self.slots.len();
+        let i = if n == 1 {
+            0
+        } else {
+            // FNV-1a.
+            let h = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b.to_ascii_lowercase())).wrapping_mul(0x0100_0000_01b3)
+            });
+            (h % n as u64) as usize
+        };
+        self.live_in(&self.slots[i]).await
+    }
+
+    /// Every established, live connection.
+    pub fn live_connections(&self) -> Vec<Arc<Live>> {
+        self.slots.iter().filter_map(Slot::live).collect()
     }
 
     async fn live_in(&self, slot: &Slot) -> Result<Arc<Live>> {
@@ -298,7 +301,9 @@ impl Client {
         let peer = format!("{}:{}", cfg.host, cfg.port());
         let fut = async {
             let stream = TcpStream::connect(addr).await.map_err(|e| {
-                Error::from(e).with_kind(ErrorKind::ConnectionFailed).with_path(peer.clone())
+                Error::from(e)
+                    .with_kind(ErrorKind::ConnectionFailed)
+                    .with_path(peer.clone())
             })?;
             let conn = Connection::start(
                 stream,
@@ -327,18 +332,19 @@ impl Client {
         }
     }
 
-    /// An operation context for `share`.
-    pub async fn ctx(&self, share: &str) -> Result<Ctx> {
-        let live = self.live().await?;
-        let tree = live.tree(&self.cfg, share).await?;
+    /// An operation context for path `p`.
+    pub async fn ctx(&self, p: &SmbPath) -> Result<Ctx> {
+        let live = self.live_for(&p.name).await?;
+        let tree = live.tree(&self.cfg, &p.share).await?;
         Ok(Ctx { live, tree })
     }
 
-    /// Two contexts on the same session (server-side copy across shares).
-    pub async fn ctx_pair(&self, a: &str, b: &str) -> Result<(Ctx, Ctx)> {
-        let live = self.live().await?;
-        let ta = live.tree(&self.cfg, a).await?;
-        let tb = live.tree(&self.cfg, b).await?;
+    /// Two contexts on the same session (server-side copy, also across
+    /// shares), on the connection of `a`.
+    pub async fn ctx_pair(&self, a: &SmbPath, b: &SmbPath) -> Result<(Ctx, Ctx)> {
+        let live = self.live_for(&a.name).await?;
+        let ta = live.tree(&self.cfg, &a.share).await?;
+        let tb = live.tree(&self.cfg, &b.share).await?;
         Ok((
             Ctx {
                 live: live.clone(),
@@ -353,7 +359,7 @@ impl Client {
     /// the tree or session (the request was refused before it ran), or —
     /// for `idempotent` operations only — the connection was lost while the
     /// request was in flight.
-    pub async fn run<T, F, Fut>(&self, share: &str, idempotent: bool, f: F) -> Result<T>
+    pub async fn run<T, F, Fut>(&self, p: &SmbPath, idempotent: bool, f: F) -> Result<T>
     where
         F: Fn(Ctx) -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -361,7 +367,7 @@ impl Client {
         const ATTEMPTS: u32 = 3;
         let mut attempt = 1;
         loop {
-            let ctx = self.ctx(share).await?;
+            let ctx = self.ctx(p).await?;
             let live = ctx.live.clone();
             let err = match f(ctx).await {
                 Ok(v) => return Ok(v),
@@ -374,7 +380,7 @@ impl Client {
                 Some(NtStatus::USER_SESSION_DELETED | NtStatus::NETWORK_SESSION_EXPIRED)
             );
             if tree_gone {
-                live.drop_tree(share);
+                live.drop_tree(&p.share);
             }
             if session_gone {
                 live.conn.kill("session expired");
@@ -386,7 +392,7 @@ impl Client {
             if !retry || attempt >= ATTEMPTS {
                 return Err(err);
             }
-            tracing::debug!(share, attempt, error = %err, "retrying SMB operation");
+            tracing::debug!(path = p.name, attempt, error = %err, "retrying SMB operation");
             self.stats.add_retry();
             attempt += 1;
         }

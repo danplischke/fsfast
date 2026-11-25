@@ -42,7 +42,9 @@ impl Env {
     {
         Env {
             vars: Some(Arc::new(
-                vars.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+                vars.into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
             )),
         }
     }
@@ -59,7 +61,8 @@ impl Env {
 
     /// Whether `key` is set to a true value (`true`, case-insensitive).
     pub fn flag(&self, key: &str) -> bool {
-        self.get(key).is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        self.get(key)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     /// The home directory (`HOME`, else `USERPROFILE`).
@@ -284,6 +287,29 @@ pub fn profile_name(explicit: Option<&str>, env: &Env) -> String {
         .unwrap_or_else(|| "default".to_owned())
 }
 
+/// The configured endpoint URL for `service` from the environment
+/// (`AWS_ENDPOINT_URL_<SERVICE>`, `AWS_ENDPOINT_URL`) or the profile, unless
+/// configured endpoints are ignored (botocore's lookup order).
+pub fn configured_endpoint(
+    env: &Env,
+    profiles: &ProfileFiles,
+    profile: &str,
+    service: &str,
+) -> Result<Option<String>> {
+    if env.flag("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
+        || profiles
+            .get(profile, "ignore_configured_endpoint_urls")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return Ok(None);
+    }
+    let var = format!("AWS_ENDPOINT_URL_{}", service.to_ascii_uppercase());
+    if let Some(u) = env.get(&var).or_else(|| env.get("AWS_ENDPOINT_URL")) {
+        return Ok(Some(u));
+    }
+    profiles.endpoint_url(profile, service)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,11 +365,17 @@ aws_session_token = TOK
     fn env_lookup_and_home_expansion() {
         let env = Env::from_map([("HOME", "/home/u"), ("EMPTY", ""), ("AWS_PROFILE", "p")]);
         assert_eq!(env.get("EMPTY"), None);
-        assert_eq!(env.expand("~/.aws/config"), PathBuf::from("/home/u/.aws/config"));
+        assert_eq!(
+            env.expand("~/.aws/config"),
+            PathBuf::from("/home/u/.aws/config")
+        );
         assert_eq!(env.expand("/abs"), PathBuf::from("/abs"));
         assert_eq!(profile_name(None, &env), "p");
         assert_eq!(profile_name(Some("x"), &env), "x");
-        assert_eq!(profile_name(None, &Env::from_map::<[(&str, &str); 0], _, _>([])), "default");
+        assert_eq!(
+            profile_name(None, &Env::from_map::<[(&str, &str); 0], _, _>([])),
+            "default"
+        );
     }
 
     #[tokio::test]

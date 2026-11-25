@@ -32,7 +32,11 @@ pub fn shell_split(s: &str) -> Result<Vec<String>> {
                     match chars.next() {
                         Some('\'') => break,
                         Some(c) => cur.push(c),
-                        None => return Err(Error::invalid_input("credential_process: no closing quotation")),
+                        None => {
+                            return Err(Error::invalid_input(
+                                "credential_process: no closing quotation",
+                            ));
+                        }
                     }
                 }
             }
@@ -51,7 +55,11 @@ pub fn shell_split(s: &str) -> Result<Vec<String>> {
                             _ => cur.push('\\'),
                         },
                         Some(c) => cur.push(c),
-                        None => return Err(Error::invalid_input("credential_process: no closing quotation")),
+                        None => {
+                            return Err(Error::invalid_input(
+                                "credential_process: no closing quotation",
+                            ));
+                        }
                     }
                 }
             }
@@ -60,7 +68,11 @@ pub fn shell_split(s: &str) -> Result<Vec<String>> {
                 match chars.next() {
                     Some('\n') => {}
                     Some(n) => cur.push(n),
-                    None => return Err(Error::invalid_input("credential_process: no escaped character")),
+                    None => {
+                        return Err(Error::invalid_input(
+                            "credential_process: no escaped character",
+                        ));
+                    }
                 }
             }
             c => {
@@ -134,7 +146,10 @@ impl ProcessProvider {
                     ErrorKind::PermissionDenied,
                     format!(
                         "Unsupported version {} for credential process provider, supported versions: 1",
-                        other.map_or_else(|| "<Version key not provided>".to_owned(), |v| v.to_string())
+                        other.map_or_else(
+                            || "<Version key not provided>".to_owned(),
+                            |v| v.to_string()
+                        )
                     ),
                 ));
             }
@@ -166,7 +181,13 @@ mod tests {
         assert_eq!(shell_split("a b  c").unwrap(), vec!["a", "b", "c"]);
         assert_eq!(
             shell_split(r#"/bin/helper --profile 'my profile' "x \"y\" \$z" a\ b"#).unwrap(),
-            vec!["/bin/helper", "--profile", "my profile", "x \"y\" $z", "a b"]
+            vec![
+                "/bin/helper",
+                "--profile",
+                "my profile",
+                "x \"y\" $z",
+                "a b"
+            ]
         );
         assert_eq!(shell_split(r#""a\b""#).unwrap(), vec![r"a\b"]);
         assert_eq!(shell_split("''").unwrap(), vec![""]);
@@ -184,7 +205,10 @@ mod tests {
         )
         .unwrap();
         let profiles = Arc::new(ProfileFiles::from_texts(
-            Some(&format!("[default]\ncredential_process = sh {}\n", script.display())),
+            Some(&format!(
+                "[default]\ncredential_process = sh {}\n",
+                script.display()
+            )),
             None,
         ));
         let c = ProcessProvider::new(profiles, "default")
@@ -196,9 +220,13 @@ mod tests {
         assert_eq!(c.session_token(), Some("T"));
         assert!(c.expiry().is_some());
 
-        let e = ProcessProvider::run("sh -c 'echo nope >&2; exit 3'").await.unwrap_err();
+        let e = ProcessProvider::run("sh -c 'echo nope >&2; exit 3'")
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("nope"), "{e}");
-        let e = ProcessProvider::run(r#"sh -c 'echo {\"Version\": 2}'"#).await.unwrap_err();
+        let e = ProcessProvider::run(r#"sh -c 'echo {\"Version\": 2}'"#)
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("Unsupported version"), "{e}");
     }
 }

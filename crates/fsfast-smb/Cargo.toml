@@ -17,6 +17,9 @@ futures.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# AES block function for peeking at GCM-encrypted READ headers (src/peek.rs);
+# already in the tree through fsfast-smb-proto.
+aes = "0.9"
 
 [dev-dependencies]
 fsfast-testkit.workspace = true

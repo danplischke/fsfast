@@ -22,9 +22,12 @@ use md5::{Digest, Md5};
 use crate::encode::{b64, http_date, iso8601};
 
 #[path = "params_table.rs"]
+#[allow(dead_code)]
 mod table;
 
-pub(crate) use table::{OPERATIONS, PARAMS};
+#[cfg(test)]
+use table::OPERATIONS;
+pub(crate) use table::PARAMS;
 
 /// An S3 API operation fsfast issues.
 #[allow(missing_docs)]
@@ -49,6 +52,11 @@ pub enum Op {
     CompleteMultipartUpload,
     AbortMultipartUpload,
     GetBucketVersioning,
+    PutBucketVersioning,
+    GetObjectTagging,
+    PutObjectTagging,
+    PutObjectAcl,
+    PutBucketAcl,
 }
 
 /// Where a parameter goes on the wire.
@@ -147,9 +155,8 @@ impl Params {
     pub fn from_map(map: &BTreeMap<String, Value>, what: &str) -> Result<Params> {
         let mut p = Params::default();
         for (k, v) in map {
-            p.set(k, v).map_err(|e| {
-                Error::invalid_input(format!("{what}: {}", e.message()))
-            })?;
+            p.set(k, v)
+                .map_err(|e| Error::invalid_input(format!("{what}: {}", e.message())))?;
         }
         Ok(p)
     }
@@ -177,14 +184,21 @@ impl Params {
                 let mut hs = Vec::with_capacity(m.len());
                 for (k, v) in m {
                     let v = scalar(name, v)?;
-                    hs.push((header_name(&format!("{prefix}{k}"))?, header_value(name, &v)?));
+                    hs.push((
+                        header_name(&format!("{prefix}{k}"))?,
+                        header_value(name, &v)?,
+                    ));
                 }
                 (Rendered::Headers(hs), None)
             }
             (loc, kind) => {
                 let text = match (kind, value) {
                     (ParamKind::Timestamp(iso), Value::Time(t)) => {
-                        if iso { iso8601(*t) } else { http_date(*t) }
+                        if iso {
+                            iso8601(*t)
+                        } else {
+                            http_date(*t)
+                        }
                     }
                     (ParamKind::Timestamp(iso), Value::Int(_) | Value::Float(_)) => {
                         let secs = value.as_f64().unwrap_or(0.0).max(0.0);
@@ -328,13 +342,16 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
-        pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
     }
 
     #[test]
     fn table_is_sorted_and_covers_operations() {
         assert!(PARAMS.windows(2).all(|w| w[0].name < w[1].name));
-        assert_eq!(OPERATIONS.len(), 19);
+        assert_eq!(OPERATIONS.len(), 24);
         let sse = spec("ServerSideEncryption").unwrap();
         assert!(sse.ops.contains(&Op::PutObject));
         assert!(!sse.ops.contains(&Op::GetObject));
@@ -374,7 +391,10 @@ mod tests {
         p.apply(Op::GetObject, &mut h, &mut q);
         assert!(!h.contains_key("x-amz-server-side-encryption"));
         assert_eq!(h["x-amz-request-payer"], "requester");
-        assert_eq!(q, vec![("response-content-type".to_owned(), "text/plain".to_owned())]);
+        assert_eq!(
+            q,
+            vec![("response-content-type".to_owned(), "text/plain".to_owned())]
+        );
         assert_eq!(p.get("ACL"), Some("private"));
     }
 
@@ -382,7 +402,10 @@ mod tests {
     fn sse_c_key_gets_md5() {
         let key = "0123456789abcdef0123456789abcdef";
         let p = Params::from_map(
-            &map(&[("SSECustomerAlgorithm", "AES256".into()), ("SSECustomerKey", key.into())]),
+            &map(&[
+                ("SSECustomerAlgorithm", "AES256".into()),
+                ("SSECustomerKey", key.into()),
+            ]),
             "x",
         )
         .unwrap();
@@ -396,8 +419,11 @@ mod tests {
             h["x-amz-server-side-encryption-customer-key-md5"],
             "hRasmdxgYDKV3nvbahU1MA=="
         );
-        let raw = Params::from_map(&map(&[("SSECustomerKey", Value::Bytes(vec![0xff; 32]))]), "x")
-            .unwrap();
+        let raw = Params::from_map(
+            &map(&[("SSECustomerKey", Value::Bytes(vec![0xff; 32]))]),
+            "x",
+        )
+        .unwrap();
         assert!(raw.sse_c_headers().is_some());
     }
 

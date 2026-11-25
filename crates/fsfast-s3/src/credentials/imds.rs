@@ -54,24 +54,30 @@ impl ImdsProvider {
             env.get(envk)
                 .or_else(|| profiles.get(profile, key).map(str::to_owned))
         };
-        let base = cfg("AWS_EC2_METADATA_SERVICE_ENDPOINT", "ec2_metadata_service_endpoint")
-            .unwrap_or_else(|| {
-                match cfg(
-                    "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
-                    "ec2_metadata_service_endpoint_mode",
-                ) {
-                    Some(m) if m.eq_ignore_ascii_case("ipv6") => IPV6_ENDPOINT.to_owned(),
-                    _ => IPV4_ENDPOINT.to_owned(),
-                }
-            });
+        let base = cfg(
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+            "ec2_metadata_service_endpoint",
+        )
+        .unwrap_or_else(|| {
+            match cfg(
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+                "ec2_metadata_service_endpoint_mode",
+            ) {
+                Some(m) if m.eq_ignore_ascii_case("ipv6") => IPV6_ENDPOINT.to_owned(),
+                _ => IPV4_ENDPOINT.to_owned(),
+            }
+        });
         let timeout = cfg("AWS_METADATA_SERVICE_TIMEOUT", "metadata_service_timeout")
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
             .map_or(Duration::from_secs(1), Duration::from_secs_f64);
-        let attempts = cfg("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "metadata_service_num_attempts")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1)
-            .max(1);
+        let attempts = cfg(
+            "AWS_METADATA_SERVICE_NUM_ATTEMPTS",
+            "metadata_service_num_attempts",
+        )
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
         let v1_disabled = cfg("AWS_EC2_METADATA_V1_DISABLED", "ec2_metadata_v1_disabled")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"));
         ImdsProvider {
@@ -120,7 +126,9 @@ impl ImdsProvider {
 
     async fn get(&self, client: &HttpClient, path: &str, token: Option<&str>) -> Option<String> {
         for _ in 0..self.attempts {
-            let mut req = Request::new(Method::GET, &self.url(path)).ok()?.retry_safe(false);
+            let mut req = Request::new(Method::GET, &self.url(path))
+                .ok()?
+                .retry_safe(false);
             if let Some(t) = token {
                 req = req.try_header("x-aws-ec2-metadata-token", t).ok()?;
             }
@@ -220,7 +228,10 @@ mod tests {
             ("AWS_EC2_METADATA_DISABLED", "TRUE"),
         ]);
         let p = ImdsProvider::new(&env, &ProfileFiles::default(), "default");
-        assert_eq!(p.url("latest/api/token"), "http://127.0.0.1:1/latest/api/token");
+        assert_eq!(
+            p.url("latest/api/token"),
+            "http://127.0.0.1:1/latest/api/token"
+        );
         assert!(p.disabled);
     }
 }
