@@ -92,6 +92,22 @@ fn own_connections_to(port: u16) -> usize {
 /// The tests count this process's connections, so they must not overlap.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// This process's connection count to `port` once it stops changing: a
+/// filesystem dropped by an earlier test closes its connection
+/// asynchronously, so sampling a baseline too early counts it.
+async fn settled_connections_to(port: u16) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = own_connections_to(port);
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let now = own_connections_to(port);
+        if now == last || Instant::now() >= deadline {
+            return now;
+        }
+        last = now;
+    }
+}
+
 async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !f() {
@@ -198,7 +214,7 @@ async fn dropped_and_cancelled_operations_release_server_handles() {
 async fn close_releases_tcp_connections() {
     let Some(env) = common::env() else { return };
     let _serial = SERIAL.lock().await;
-    let before = own_connections_to(env.port);
+    let before = settled_connections_to(env.port).await;
     {
         let fs = env.fs(&[("connections", 3.into())]);
         // Concurrency grows the pool.
