@@ -53,7 +53,10 @@ async fn large_file_throughput() {
     let fs = env.fs(&[]);
     let dir = env.dir("bench");
     fs.mkdir(&dir, false).await.unwrap();
-    let data: Bytes = (0..size).map(|i| (i * 31 % 251) as u8).collect::<Vec<u8>>().into();
+    let data: Bytes = (0..size)
+        .map(|i| (i * 31 % 251) as u8)
+        .collect::<Vec<u8>>()
+        .into();
     let p = format!("{dir}/big.bin");
     // Warm up the connection.
     fs.info(&dir).await.unwrap();
@@ -66,7 +69,11 @@ async fn large_file_throughput() {
         }
         w.close().await.unwrap();
         let dt = t.elapsed().as_secs_f64();
-        eprintln!("round {round}: write   {} MiB: {}  ({dt:.2}s)", size >> 20, rate(size, dt));
+        eprintln!(
+            "round {round}: write   {} MiB: {}  ({dt:.2}s)",
+            size >> 20,
+            rate(size, dt)
+        );
 
         let t = Instant::now();
         let got = fs.cat_file(&p, ByteRange::Full).await.unwrap();
@@ -74,26 +81,44 @@ async fn large_file_throughput() {
         assert_eq!(got.len(), size);
         assert!(got == data, "read back mismatch");
         drop(got);
-        eprintln!("round {round}: cat     {} MiB: {}  ({dt:.2}s)", size >> 20, rate(size, dt));
+        eprintln!(
+            "round {round}: cat     {} MiB: {}  ({dt:.2}s)",
+            size >> 20,
+            rate(size, dt)
+        );
 
         let local = std::env::temp_dir().join(format!("{}.bin", common::unique("get")));
         let t = Instant::now();
         fs.get_file(&p, &local).await.unwrap();
         let dt = t.elapsed().as_secs_f64();
-        eprintln!("round {round}: get     {} MiB: {}  ({dt:.2}s)", size >> 20, rate(size, dt));
+        eprintln!(
+            "round {round}: get     {} MiB: {}  ({dt:.2}s)",
+            size >> 20,
+            rate(size, dt)
+        );
 
         let p2 = format!("{dir}/put.bin");
         let t = Instant::now();
-        fs.put_file(&local, &p2, &WriteOptions::default()).await.unwrap();
+        fs.put_file(&local, &p2, &WriteOptions::default())
+            .await
+            .unwrap();
         let dt = t.elapsed().as_secs_f64();
-        eprintln!("round {round}: put     {} MiB: {}  ({dt:.2}s)", size >> 20, rate(size, dt));
+        eprintln!(
+            "round {round}: put     {} MiB: {}  ({dt:.2}s)",
+            size >> 20,
+            rate(size, dt)
+        );
         let _ = std::fs::remove_file(&local);
 
         let p3 = format!("{dir}/copy.bin");
         let t = Instant::now();
         fs.cp_file(&p, &p3).await.unwrap();
         let dt = t.elapsed().as_secs_f64();
-        eprintln!("round {round}: cp_file {} MiB: {}  ({dt:.2}s, server-side)", size >> 20, rate(size, dt));
+        eprintln!(
+            "round {round}: cp_file {} MiB: {}  ({dt:.2}s, server-side)",
+            size >> 20,
+            rate(size, dt)
+        );
     }
     common::rm_tree(&fs, &dir).await;
 }
@@ -110,18 +135,39 @@ async fn many_small_files() {
     fs.info(&dir).await.unwrap();
 
     for conc in [1usize, 32] {
+        if conc > 1 {
+            // The pool grows in the background under concurrent load; a
+            // handshake takes longer than this whole phase, so let it reach
+            // its size first (the steady state of a long-running process).
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while fs.connections() < 4 && Instant::now() < deadline {
+                futures::stream::iter(0..64)
+                    .map(|_| fs.info(&dir))
+                    .buffer_unordered(32)
+                    .collect::<Vec<_>>()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
         let t = Instant::now();
         futures::stream::iter(paths.iter())
             .map(|p| {
                 let fs = &fs;
                 let payload = payload.clone();
-                async move { fs.pipe_file(p, payload, &WriteOptions::default()).await.unwrap() }
+                async move {
+                    fs.pipe_file(p, payload, &WriteOptions::default())
+                        .await
+                        .unwrap()
+                }
             })
             .buffer_unordered(conc)
             .collect::<Vec<_>>()
             .await;
         let dt = t.elapsed().as_secs_f64();
-        eprintln!("conc {conc:2}: pipe  {n} x 16 KiB: {:8.0} files/s", n as f64 / dt);
+        eprintln!(
+            "conc {conc:2}: pipe  {n} x 16 KiB: {:8.0} files/s",
+            n as f64 / dt
+        );
 
         let t = Instant::now();
         futures::stream::iter(paths.iter())
@@ -133,7 +179,10 @@ async fn many_small_files() {
             .collect::<Vec<_>>()
             .await;
         let dt = t.elapsed().as_secs_f64();
-        eprintln!("conc {conc:2}: cat   {n} x 16 KiB: {:8.0} files/s", n as f64 / dt);
+        eprintln!(
+            "conc {conc:2}: cat   {n} x 16 KiB: {:8.0} files/s",
+            n as f64 / dt
+        );
 
         let t = Instant::now();
         futures::stream::iter(paths.iter())

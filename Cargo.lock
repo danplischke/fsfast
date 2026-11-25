@@ -945,7 +945,25 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 name = "fsfast-azure"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
  "fsfast-core",
+ "fsfast-engine",
+ "fsfast-http-transport",
+ "fsfast-testkit",
+ "futures",
+ "hmac",
+ "httpdate",
+ "parking_lot",
+ "proptest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

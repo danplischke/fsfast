@@ -112,6 +112,10 @@ pub fn classify(status: u16, code: Option<&str>, condition: Option<&str>) -> Cla
             "InternalError" => Some(c(K::Io, Some(EREMOTEIO), Some(true))),
             "NotImplemented" => Some(c(K::Unsupported, None, Some(false))),
             "XAmzContentSHA256Mismatch" => Some(c(K::Io, Some(EINVAL), Some(true))),
+            // A conditional write raced another one on the same key and
+            // was not applied: AWS documents it as safe to retry (the retry
+            // then succeeds or fails with 412).
+            "ConditionalRequestConflict" => Some(c(K::Io, Some(EBUSY), Some(true))),
             "OperationAborted" | "RestoreAlreadyInProgress" => Some(c(K::Io, Some(EBUSY), None)),
             "EntityTooLarge" | "InlineDataTooLarge" | "MaxMessageLengthExceeded"
             | "MaxPostPreDataLengthExceededError" | "MetadataTooLarge" => {

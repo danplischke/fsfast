@@ -31,7 +31,9 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 
-use fsfast_core::{Error, ErrorKind, FileInfo, IoHints, ReadHandle, Result, WriteHandle, async_trait};
+use fsfast_core::{
+    Error, ErrorKind, FileInfo, IoHints, ReadHandle, Result, WriteHandle, async_trait,
+};
 use fsfast_engine::stats::Stats;
 
 use crate::pool::Lease;
@@ -119,7 +121,10 @@ impl<'a> ReadPipeline<'a> {
     }
 
     fn fill(&mut self) -> Result<()> {
-        let window = self.window.load(Ordering::Relaxed).clamp(1, self.max_window);
+        let window = self
+            .window
+            .load(Ordering::Relaxed)
+            .clamp(1, self.max_window);
         while self.inflight.len() < window {
             if let Some((off, len)) = self.redo.pop_front() {
                 if off < self.limit() {
@@ -184,8 +189,7 @@ impl<'a> ReadPipeline<'a> {
                     let n = p.len();
                     if n < len as usize {
                         // Short read: fetch the rest before anything newer.
-                        self.redo
-                            .push_front((off + n as u64, len - n as u32));
+                        self.redo.push_front((off + n as u64, len - n as u32));
                     } else {
                         let w = self.window.load(Ordering::Relaxed);
                         if w < self.max_window {
@@ -307,7 +311,9 @@ impl ReadHandle for SftpReadHandle {
 
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(Error::invalid_input("read on a closed SFTP handle").with_path(&self.info.name));
+            return Err(
+                Error::invalid_input("read on a closed SFTP handle").with_path(&self.info.name)
+            );
         }
         let size = self.info.size;
         if len == 0 || offset >= size {
@@ -435,15 +441,23 @@ impl SftpWriteHandle {
         e
     }
 
-    /// Wait for the oldest WRITE.
+    /// Wait for the oldest WRITE. Cancel-safe: the call stays queued until
+    /// its reply has arrived, so a cancelled `write` never loses a WRITE
+    /// status (which would let `close` report success after a failed WRITE).
     async fn reap_one(&mut self) -> Result<()> {
-        let Some(call) = self.inflight.pop_front() else {
+        let timeout = self.lease.request_timeout();
+        let Some(call) = self.inflight.front_mut() else {
             return Ok(());
         };
-        let r = match self.lease.finish(call).await {
-            Ok(r) => status_reply(r, "write", &self.path),
-            Err(e) => Err(e),
+        let reply = match timeout {
+            Some(d) => tokio::time::timeout(d, call).await.unwrap_or_else(|_| {
+                Err(Error::timeout(format!("SFTP WRITE timed out after {d:?}")))
+            }),
+            None => call.await,
         };
+        // No await between the completion and the removal.
+        self.inflight.pop_front();
+        let r = reply.and_then(|r| status_reply(r, "write", &self.path));
         r.map_err(|e| self.record(e))
     }
 
@@ -629,7 +643,10 @@ impl WriteHandle for SftpWriteHandle {
                 handle: self.handle.clone(),
             });
             let truncated = match t {
-                Ok(t) => s.finish(t).await.and_then(|r| status_reply(r, "truncate", &self.path)),
+                Ok(t) => s
+                    .finish(t)
+                    .await
+                    .and_then(|r| status_reply(r, "truncate", &self.path)),
                 Err(e) => Err(e),
             };
             if let Ok(c) = c {
@@ -647,7 +664,11 @@ impl WriteHandle for SftpWriteHandle {
             let _ = s.finish(c).await;
         }
         match rm {
-            Ok(rm) => match s.finish(rm).await.and_then(|r| status_reply(r, "remove", &self.path)) {
+            Ok(rm) => match s
+                .finish(rm)
+                .await
+                .and_then(|r| status_reply(r, "remove", &self.path))
+            {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e),
@@ -685,6 +706,248 @@ impl Drop for SftpWriteHandle {
             // buffered here is lost, as with a crashed writer).
             self.inflight.clear();
             self.lease.close_nowait(self.handle.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::BytesMut;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::*;
+    use crate::proto::{Reply, Status, Version, fxp, status};
+    use crate::session::SessionOptions;
+    use crate::session::testing::pair;
+
+    /// Reads whole request packets from the client byte stream.
+    async fn next_req(
+        rx: &mut mpsc::UnboundedReceiver<Bytes>,
+        buf: &mut BytesMut,
+    ) -> Option<Bytes> {
+        loop {
+            if buf.len() >= 4 {
+                let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if buf.len() >= 4 + n {
+                    let mut p = buf.split_to(4 + n);
+                    let _ = p.split_to(4);
+                    return Some(p.freeze());
+                }
+            }
+            buf.extend_from_slice(&rx.recv().await?);
+        }
+    }
+
+    /// A write cancelled while it waits for window space must not lose the
+    /// status of the WRITE it was waiting for: a failure of that WRITE has to
+    /// surface on `close`.
+    #[tokio::test]
+    async fn cancelled_write_keeps_the_pending_write_status() {
+        let (tx, rx, mut srx, stx) = pair();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            let init = next_req(&mut srx, &mut buf).await.unwrap();
+            assert_eq!(init[0], fxp::INIT);
+            stx.send(
+                Version {
+                    version: 3,
+                    extensions: vec![],
+                }
+                .encode(),
+            )
+            .unwrap();
+            let mut release = Some(release_rx);
+            while let Some(p) = next_req(&mut srx, &mut buf).await {
+                let (id, r) = Request::decode(p).unwrap();
+                let code = match r {
+                    Request::Write { offset: 0, .. } => {
+                        // Hold the first WRITE's reply until the client gave up
+                        // waiting, then fail it.
+                        if let Some(r) = release.take() {
+                            let _ = r.await;
+                        }
+                        status::FAILURE
+                    }
+                    _ => status::OK,
+                };
+                stx.send(Reply::Status(Status::new(code)).encode(id))
+                    .unwrap();
+            }
+        });
+        let s = Session::start(tx, rx, SessionOptions::default(), "t".into(), None)
+            .await
+            .unwrap();
+        let chunk = s.write_chunk();
+        let mut w = SftpWriteHandle::new(
+            Lease::new(s),
+            Bytes::from_static(b"H"),
+            "/f".into(),
+            0,
+            Undo::Remove,
+            1,
+            false,
+            Arc::new(Stats::new()),
+        );
+        w.write(Bytes::from(vec![1u8; chunk])).await.unwrap();
+        // The second write waits for the first WRITE's status (window of 1);
+        // cancel it there.
+        let r = tokio::time::timeout(
+            Duration::from_millis(50),
+            w.write(Bytes::from(vec![2u8; chunk])),
+        )
+        .await;
+        assert!(r.is_err(), "the write should have been waiting");
+        release_tx.send(()).unwrap();
+        let e = w
+            .close()
+            .await
+            .expect_err("close succeeded although a WRITE failed");
+        assert_eq!(e.kind(), ErrorKind::Io);
+        drop(w);
+        server.abort();
+    }
+
+    /// A quirky server: answers each batch of READs in reverse order, returns
+    /// short reads, over-long DATA and empty DATA mid-file and stops at a
+    /// real length shorter than the size announced at open time (the file
+    /// shrank). `read_at` must reassemble exactly the real bytes.
+    async fn quirky_reads(real: usize, announced: u64, seed: u64, allow_empty: bool) {
+        let content: Vec<u8> = (0..real as u32)
+            .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+            .collect();
+        let expect = content.clone();
+        let (tx, rx, mut srx, stx) = pair();
+        let server = tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            next_req(&mut srx, &mut buf).await.unwrap();
+            stx.send(
+                Version {
+                    version: 3,
+                    extensions: vec![],
+                }
+                .encode(),
+            )
+            .unwrap();
+            let mut x = seed | 1;
+            let mut rnd = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            loop {
+                // Everything the client queued so far, answered backwards.
+                let Some(first) = next_req(&mut srx, &mut buf).await else {
+                    return;
+                };
+                let mut batch = vec![first];
+                tokio::task::yield_now().await;
+                while let Ok(c) = srx.try_recv() {
+                    buf.extend_from_slice(&c);
+                }
+                while buf.len() >= 4 {
+                    let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    if buf.len() < 4 + n {
+                        break;
+                    }
+                    batch.push(next_req(&mut srx, &mut buf).await.unwrap());
+                }
+                for p in batch.into_iter().rev() {
+                    let (id, r) = Request::decode(p).unwrap();
+                    let reply = match r {
+                        Request::Read { offset, len, .. } => {
+                            let off = offset as usize;
+                            if off >= content.len() {
+                                Reply::Status(Status::new(status::EOF))
+                            } else {
+                                let avail = content.len() - off;
+                                let pick = if allow_empty {
+                                    rnd() % 5
+                                } else {
+                                    1 + rnd() % 4
+                                };
+                                let n = match pick {
+                                    0 => 0,                         // empty DATA
+                                    1 => (len as usize / 3).max(1), // short read
+                                    2 => len as usize + 100,        // over-long
+                                    _ => len as usize,
+                                }
+                                .min(avail);
+                                if n == 0 && rnd() % 2 == 0 {
+                                    // Empty DATA is legal but useless; keep
+                                    // the transfer moving half of the time.
+                                    Reply::Data(crate::proto::Payload::from_bytes(
+                                        Bytes::copy_from_slice(
+                                            &content[off..off + avail.min(len as usize)],
+                                        ),
+                                    ))
+                                } else {
+                                    Reply::Data(crate::proto::Payload::from_bytes(
+                                        Bytes::copy_from_slice(&content[off..off + n]),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => Reply::Status(Status::new(status::OK)),
+                    };
+                    stx.send(reply.encode(id)).unwrap();
+                }
+            }
+        });
+        let s = Session::start(
+            tx,
+            rx,
+            SessionOptions {
+                read_chunk: Some(1024),
+                ..Default::default()
+            },
+            "t".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        let info = FileInfo::file("/f", announced);
+        let h = SftpReadHandle::new(
+            Lease::new(s),
+            Bytes::from_static(b"H"),
+            info,
+            16,
+            Arc::new(Stats::new()),
+        );
+        let got = h.read_at(0, announced as usize).await.unwrap();
+        // An empty DATA reply is treated as EOF at that offset, so the result
+        // is a prefix of the real content; with no empty replies it is all.
+        // Never more than the size at open time (the contract) or the real
+        // content.
+        let lim = real.min(announced as usize);
+        assert!(got.len() <= lim);
+        assert_eq!(&got[..], &expect[..got.len()], "seed {seed}");
+        if !allow_empty {
+            assert_eq!(got.len(), lim, "seed {seed}");
+        }
+        // Ranged reads in the middle agree with the content too.
+        let mid = h.read_at(1500, 3000).await.unwrap();
+        assert_eq!(
+            &mid[..],
+            &expect[1500.min(lim)..(1500 + mid.len()).min(lim)]
+        );
+        if !allow_empty {
+            assert_eq!(mid.len(), 3000.min(lim.saturating_sub(1500)), "seed {seed}");
+        }
+        drop(h);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn out_of_order_short_and_overlong_reads_reassemble() {
+        for seed in 1..40 {
+            quirky_reads(10_000 + seed as usize * 37, 20_000, seed, seed % 2 == 0).await;
+            // File exactly as announced, and a file read past its end.
+            quirky_reads(9_000, 9_000, seed, false).await;
+            quirky_reads(1_200, 1_000, seed, false).await;
         }
     }
 }

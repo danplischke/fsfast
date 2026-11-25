@@ -257,11 +257,13 @@ mod tests {
 
     #[test]
     fn kinds_follow_fsspec() {
-        let k = |p| FileAttributes {
-            permissions: p,
-            ..Default::default()
-        }
-        .kind();
+        let k = |p| {
+            FileAttributes {
+                permissions: p,
+                ..Default::default()
+            }
+            .kind()
+        };
         assert_eq!(k(Some(0o040_755)), Kind::Directory);
         assert_eq!(k(Some(0o120_777)), Kind::Symlink);
         assert_eq!(k(Some(0o100_644)), Kind::File);

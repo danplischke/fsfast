@@ -199,15 +199,18 @@ pub(crate) enum Listing {
 /// QUERY_DIRECTORY loop. The CLOSE is always part of an awaited request, so
 /// a later operation on another connection never races it.
 pub(crate) async fn list(ctx: &Ctx, p: &SmbPath) -> Result<Listing> {
-    let first = list_buffer(ctx, LIST_BUFFER);
-    let second = list_buffer(ctx, LIST_BUFFER_2);
+    let [first, second, probe] = list_buffer_sizes(
+        ctx.multi_credit(),
+        ctx.max_transact(),
+        ctx.live.conn.shared.credits.window(),
+    );
     let mut chain = ctx.chain();
     chain.push(&list_open(&p.rel, CreateOptions::empty()))?;
     chain.push(&query_dir(FileId::RELATED, true, first))?;
     chain.push(&query_dir(FileId::RELATED, false, second))?;
     // A small probe that answers STATUS_NO_MORE_FILES when the first two
     // pages held everything.
-    chain.push(&query_dir(FileId::RELATED, false, list_buffer(ctx, 4096)))?;
+    chain.push(&query_dir(FileId::RELATED, false, probe))?;
     chain.push(&close_related())?;
     let r = ctx.exec(chain).await?;
     let c: CreateResponse = match decode(&r[0], &p.name) {
@@ -322,6 +325,25 @@ fn list_buffer(ctx: &Ctx, want: usize) -> u32 {
         65536
     };
     ctx.credit_limited(want.min(cap).max(4096)) as u32
+}
+
+/// Output buffers of the three QUERY_DIRECTORYs of the listing compound.
+///
+/// The whole compound (CREATE, three QUERY_DIRECTORYs, CLOSE) is charged
+/// at once, so the two large buffers share what is left of the credit
+/// `window` after the three one-credit requests: capping each at half the
+/// window (as single requests are) could make the compound cost more than
+/// the window and never be sendable on a server that grants few credits.
+fn list_buffer_sizes(multi_credit: bool, max_transact: usize, window: usize) -> [u32; 3] {
+    if !multi_credit {
+        // CreditCharge is not used before 2.1: every request costs one
+        // credit and moves at most 64 KiB.
+        return [65536, 65536, 4096];
+    }
+    let per = window.saturating_sub(3) / 2;
+    let cap = per.max(1) * crate::credits::CREDIT_BYTES;
+    let size = |want: usize| want.min(max_transact).min(cap).max(4096) as u32;
+    [size(LIST_BUFFER), size(LIST_BUFFER_2), 4096]
 }
 
 fn query_dir(file_id: FileId, restart: bool, buf: u32) -> QueryDirectoryRequest {
@@ -680,4 +702,34 @@ pub(crate) async fn set_end_of_file(ctx: &Ctx, fid: FileId, eof: u64, path: &str
     )?)?;
     let r = ctx.exec(chain).await?;
     check(&r[0], path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credits::charge_for;
+
+    #[test]
+    fn listing_compound_fits_the_credit_window() {
+        for window in 5..3000usize {
+            let b = list_buffer_sizes(true, 8 << 20, window);
+            // CREATE + CLOSE charge one credit each.
+            let total: usize = 2 + b
+                .iter()
+                .map(|&n| usize::from(charge_for(n as usize)))
+                .sum::<usize>();
+            assert!(
+                total <= window,
+                "window {window}: compound charges {total} ({b:?})"
+            );
+        }
+        // A generous window keeps the large pages.
+        assert_eq!(
+            list_buffer_sizes(true, 8 << 20, 2048),
+            [LIST_BUFFER as u32, LIST_BUFFER_2 as u32, 4096]
+        );
+        // MaxTransactSize still applies.
+        assert_eq!(list_buffer_sizes(true, 65536, 2048), [65536, 65536, 4096]);
+        assert_eq!(list_buffer_sizes(false, 8 << 20, 1), [65536, 65536, 4096]);
+    }
 }

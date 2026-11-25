@@ -55,6 +55,10 @@ with tempfile.TemporaryDirectory() as d:
     print(f"put_file {size_mib} MiB:        {size / pf / 1e6:.0f} MB/s")
     print(f"get_file {size_mib} MiB:        {size / gf / 1e6:.0f} MB/s")
 
+if os.environ.get("FSFAST_BENCH_ONLY") == "large":
+    fs.rm(bucket, recursive=True)
+    sys.exit(0)
+
 n = 1000
 small = [f"{bucket}/small/{i:05}" for i in range(n)]
 fs.pipe({p: b"*" * 4096 for p in small})

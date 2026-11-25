@@ -35,6 +35,9 @@
 //!
 //! * `cat_file` of a range starting at or after the end of the object
 //!   returns empty bytes (fsfast contract); gcsfs raises from GCS's 416.
+//! * `rmdir` of a non-empty bucket is `DirectoryNotEmpty`
+//!   (`OSError(ENOTEMPTY)`); gcsfs raises `HttpError` for GCS's 409 (and
+//!   `FileExistsError` for fake-gcs-server's 412).
 //! * Object names starting with `/` are reported as `bucket//name` (gcsfs's
 //!   `posixpath.join` would drop the bucket, so the name would not round
 //!   trip); `info("")` is an empty directory entry.
@@ -90,8 +93,8 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fsfast_core::{
-    ByteRange, Capabilities, Error, FileInfo, FileSystem, FindOptions, IoHints, Options, ReadHandle,
-    ReadOptions, Result, WriteHandle, WriteOptions,
+    ByteRange, Capabilities, Error, FileInfo, FileSystem, FindOptions, IoHints, Options,
+    ReadHandle, ReadOptions, Result, WriteHandle, WriteOptions,
 };
 use fsfast_engine::budget::MemoryBudget;
 use fsfast_engine::stats::Stats;
@@ -218,7 +221,10 @@ impl GCSFileSystem {
 
     /// gcsfs `default_block_size` (block size of file objects).
     pub fn default_block_size(&self) -> usize {
-        self.inner.opts.block_size.unwrap_or(options::DEFAULT_BLOCK_SIZE)
+        self.inner
+            .opts
+            .block_size
+            .unwrap_or(options::DEFAULT_BLOCK_SIZE)
     }
 
     /// gcsfs `version_aware`.
@@ -271,13 +277,21 @@ impl GCSFileSystem {
 
     /// A V4 signed URL for `method` (e.g. `GET`, `PUT`) valid for
     /// `expires` from `now`.
-    pub fn sign_with(&self, path: &str, method: &str, expires: Duration, now: SystemTime) -> Result<String> {
+    pub fn sign_with(
+        &self,
+        path: &str,
+        method: &str,
+        expires: Duration,
+        now: SystemTime,
+    ) -> Result<String> {
         let key = self.inner.client.creds.signer().ok_or_else(|| {
             Error::unsupported("sign without service-account credentials (a private key is needed)")
         })?;
         let p = path::split_path(path, self.inner.opts.version_aware);
         if p.key.is_empty() {
-            return Err(Error::invalid_input(format!("cannot sign a bucket: {path:?}")));
+            return Err(Error::invalid_input(format!(
+                "cannot sign a bucket: {path:?}"
+            )));
         }
         let secs = expires.as_secs_f64().ceil() as u64;
         sign::signed_url_v4(

@@ -101,6 +101,35 @@ def sign_case(name, method, url, headers, body=b"", payload="sha256", token=None
     }
 
 
+def sts_case(name, url, body, region, token=None):
+    creds = Credentials(AK, SK, token)
+    headers = [("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")]
+    req = AWSRequest(method="POST", url=url, headers=dict(headers), data=body)
+    signer = botocore.auth.SigV4Auth(creds, "sts", region)
+    signer.add_auth(req)
+    authorization = req.headers["Authorization"]
+    del req.headers["Authorization"]
+    req.context["timestamp"] = FIXED.strftime("%Y%m%dT%H%M%SZ")
+    cr = signer.canonical_request(req)
+    return {
+        "kind": "sign",
+        "service": "sts",
+        "name": name,
+        "method": "POST",
+        "url": url,
+        "region": region,
+        "token": token,
+        "headers": [[k, v] for k, v in headers],
+        "body_hex": body.hex(),
+        "payload": "sha256",
+        "canonical_request": cr,
+        "string_to_sign": signer.string_to_sign(req, cr),
+        "authorization": authorization,
+        "x_amz_date": req.headers["X-Amz-Date"],
+        "x_amz_content_sha256": None,
+    }
+
+
 class Stop(Exception):
     pass
 
@@ -252,6 +281,12 @@ def main():
          ("x-amz-request-payer", "requester")],
         payload="sha256"))
     cases.append(sign_case("list-buckets-root", "GET", ep + "/", [], payload="sha256"))
+    cases.append(sign_case(
+        "metadata-tagging", "PUT", ep + "/bucket/" + percent_encode("m ü", safe="/~"),
+        [("x-amz-meta-Mixed-Case", "a\tb   c\t"), ("x-amz-tagging", "k%201=v%2B1&k2="),
+         ("x-amz-meta-empty", ""), ("Content-Type", "text/plain; charset=utf-8"),
+         ("Cache-Control", "no-cache,  no-store"), ("x-amz-storage-class", "STANDARD_IA")],
+        body=b"data", payload="sha256", token=TOKEN, region="ap-southeast-2"))
     cases.append(sign_case("ipv6-host", "GET", "http://[::1]:9000/bucket/k", [], payload="sha256"))
     cases.append(sign_case("default-port-https", "GET", "https://example.com/bucket/k", [], payload="sha256"))
 
@@ -288,6 +323,19 @@ def main():
     cases.append(presign_case("presign-version", ep, "us-east-1", "bucket", "k", 604800,
                               version_id="3/L4kq+tJ"))
     cases.append(presign_case("presign-aws", None, "eu-west-1", "my-bucket", "dir/a b", 900))
+    # Every awkward key, with a session token and the longest validity.
+    for i, key in enumerate(KEYS):
+        cases.append(presign_case(f"presign-key-{i}", ep, "eu-west-1", "bucket", key, 604800,
+                                  token=TOKEN))
+
+    # STS (the assume-role provider): SigV4Auth for service "sts", form body.
+    form = ("Action=AssumeRole&Version=2011-06-15&RoleArn="
+            + percent_encode("arn:aws:iam::123456789012:role/r+x")
+            + "&RoleSessionName=" + percent_encode("s@me session")).encode()
+    cases.append(sts_case("sts-assume-role", "https://sts.eu-west-1.amazonaws.com/", form,
+                          "eu-west-1", token=TOKEN))
+    cases.append(sts_case("sts-assume-role-global", "https://sts.amazonaws.com/", form,
+                          "us-east-1"))
     json.dump(cases, sys.stdout, indent=1, ensure_ascii=False)
     sys.stdout.write("\n")
 

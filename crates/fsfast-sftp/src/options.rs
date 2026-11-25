@@ -571,7 +571,10 @@ mod tests {
         assert_eq!(c.known_hosts, Some(vec![]));
         assert_eq!(c.ssh_config, SshConfigSource::Disabled);
         assert_eq!(c.connections, 2);
-        assert!(!format!("{c:?}").contains("pw\""), "password leaked in Debug");
+        assert!(
+            !format!("{c:?}").contains("pw\""),
+            "password leaked in Debug"
+        );
     }
 
     #[test]
@@ -601,7 +604,11 @@ mod tests {
             .to_string()
             .contains("cyphers")
         );
-        assert!(bad(&[("read_chunk_size", Value::Int(10))]).to_string().contains("1024"));
+        assert!(
+            bad(&[("read_chunk_size", Value::Int(10))])
+                .to_string()
+                .contains("1024")
+        );
         assert!(bad(&[("pkey", Value::Int(1))]).to_string().contains("pkey"));
     }
 }

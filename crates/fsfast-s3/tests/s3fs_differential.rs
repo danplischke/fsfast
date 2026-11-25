@@ -188,6 +188,15 @@ async fn matches_s3fs() {
         format!("{b}/missing/deeper"),
         format!("{b}/plain.txt/child"),
         format!("{b}/dir/"),
+        // Trailing slashes on files and directories, protocol prefixes.
+        format!("{b}/plain.txt/"),
+        format!("{b}/dir/sub/"),
+        format!("{b}/both/"),
+        format!("{b}/emptydir"),
+        format!("s3://{b}/dir/a.txt"),
+        format!("s3://{b}/dir"),
+        format!("s3a://{b}/space dir/"),
+        format!("s3://{b}"),
         "fsfast-no-such-bucket-diff".into(),
         "fsfast-no-such-bucket-diff/key".into(),
     ]);

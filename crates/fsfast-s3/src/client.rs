@@ -370,6 +370,10 @@ impl Client {
         loop {
             let url = self.endpoint.url(bucket, key, &query, &region)?;
             let mut h = headers.clone();
+            // The credentials this attempt is signed with: an expiry
+            // rejection refers to them, not to whatever the cache holds by
+            // then (another request may already have refreshed it).
+            let mut used = None;
             if let Some(c) = &self.creds {
                 let creds = c.get().await.map_err(|e| finish_error(e, Some(path)))?;
                 self.signer.sign(
@@ -381,6 +385,7 @@ impl Client {
                     &region,
                     SystemTime::now(),
                 )?;
+                used = Some(creds);
             }
             let mut req = Request::from_url(method.clone(), url)?
                 .op(op_kind(op))
@@ -438,11 +443,11 @@ impl Client {
             }
             if !refreshed
                 && is_expired_credentials(&err)
-                && let Some(c) = &self.creds
-                && c.is_refreshable()
+                && let (Some(c), Some(used)) = (&self.creds, &used)
+                && used.expiry().is_some()
             {
                 tracing::debug!("credentials rejected as expired; refreshing");
-                c.invalidate();
+                c.invalidate_if_current(used);
                 refreshed = true;
                 continue;
             }

@@ -111,7 +111,7 @@ pub async fn rm_tree(fs: &SftpFileSystem, dir: &str) {
         return;
     };
     let mut entries = all;
-    entries.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.name.len()));
     for e in entries {
         if e.is_dir() {
             let _ = fs.rmdir(&e.name).await;

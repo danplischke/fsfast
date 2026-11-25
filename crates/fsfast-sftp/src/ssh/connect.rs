@@ -98,7 +98,10 @@ impl Target {
             remote_user: cfg.username.clone(),
         };
         let hc = sshconf::resolve(&cfg.host, &files, &ctx)?;
-        for (kw, v) in [("ProxyJump", &hc.proxy_jump), ("ProxyCommand", &hc.proxy_command)] {
+        for (kw, v) in [
+            ("ProxyJump", &hc.proxy_jump),
+            ("ProxyCommand", &hc.proxy_command),
+        ] {
             if let Some(v) = v
                 && !v.eq_ignore_ascii_case("none")
             {
@@ -166,12 +169,12 @@ impl Target {
                 }
             }
         };
-        let policy = cfg.host_key_policy.unwrap_or_else(|| {
-            match hc.strict_host_key_checking.as_deref() {
+        let policy = cfg
+            .host_key_policy
+            .unwrap_or(match hc.strict_host_key_checking.as_deref() {
                 Some("yes" | "ask") => HostKeyPolicy::Reject,
                 _ => HostKeyPolicy::AutoAdd,
-            }
-        });
+            });
 
         let mut identity_files: Vec<PathBuf> =
             cfg.key_filenames.iter().map(|k| expand(k)).collect();
@@ -208,7 +211,10 @@ impl Target {
 
         Ok(Target {
             alias: cfg.host.clone(),
-            key_host: hc.host_key_alias.clone().unwrap_or_else(|| connect_host.clone()),
+            key_host: hc
+                .host_key_alias
+                .clone()
+                .unwrap_or_else(|| connect_host.clone()),
             connect_host,
             port,
             known_hosts_files,
@@ -537,35 +543,37 @@ impl SshConnection {
         timeout: Duration,
     ) -> Result<(ChannelReadHalf, ChannelWriteHalf<Msg>)> {
         let desc = self.desc.clone();
-        within(Some(timeout), &format!("opening the SFTP channel to {desc}"), async {
-            let mut ch = self
-                .handle
-                .channel_open_session()
-                .await
-                .map_err(|e| map_ssh_error(e, &format!("opening a session channel to {desc}")))?;
-            ch.request_subsystem(true, "sftp")
-                .await
-                .map_err(|e| map_ssh_error(e, "requesting the sftp subsystem"))?;
-            loop {
-                match ch.wait().await {
-                    Some(ChannelMsg::Success) => break,
-                    Some(ChannelMsg::Failure) => {
-                        return Err(Error::new(
-                            ErrorKind::Unsupported,
-                            format!("{desc} refused the sftp subsystem"),
-                        )
-                        .with_detail(Detail::Code("SubsystemRefused".into())));
+        within(
+            Some(timeout),
+            &format!("opening the SFTP channel to {desc}"),
+            async {
+                let mut ch = self.handle.channel_open_session().await.map_err(|e| {
+                    map_ssh_error(e, &format!("opening a session channel to {desc}"))
+                })?;
+                ch.request_subsystem(true, "sftp")
+                    .await
+                    .map_err(|e| map_ssh_error(e, "requesting the sftp subsystem"))?;
+                loop {
+                    match ch.wait().await {
+                        Some(ChannelMsg::Success) => break,
+                        Some(ChannelMsg::Failure) => {
+                            return Err(Error::new(
+                                ErrorKind::Unsupported,
+                                format!("{desc} refused the sftp subsystem"),
+                            )
+                            .with_detail(Detail::Code("SubsystemRefused".into())));
+                        }
+                        Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                            return Err(Error::connection(format!(
+                                "{desc} closed the channel while starting the sftp subsystem"
+                            )));
+                        }
+                        Some(_) => {}
                     }
-                    Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                        return Err(Error::connection(format!(
-                            "{desc} closed the channel while starting the sftp subsystem"
-                        )));
-                    }
-                    Some(_) => {}
                 }
-            }
-            Ok(ch.split())
-        })
+                Ok(ch.split())
+            },
+        )
         .await
     }
 

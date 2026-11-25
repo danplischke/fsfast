@@ -240,7 +240,10 @@ async fn error_mapping() {
         ErrorKind::NotFound
     );
     assert_eq!(kind(fs.rmdir(&s.dir).await), ErrorKind::DirectoryNotEmpty);
-    assert_eq!(kind(fs.rmdir(&s.p("file")).await), ErrorKind::NotADirectory);
+    // fsspec: FileNotFoundError (OpenSSH reports ENOTDIR as NO_SUCH_FILE).
+    let e = fs.rmdir(&s.p("file")).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    assert!(e.to_string().contains("is not a directory"), "{e}");
     assert_eq!(kind(fs.rmdir(&s.p("nope")).await), ErrorKind::NotFound);
     assert_eq!(kind(fs.rm_file(&s.p("dir")).await), ErrorKind::IsADirectory);
     assert_eq!(kind(fs.rm_file(&s.p("nope")).await), ErrorKind::NotFound);
@@ -268,10 +271,17 @@ async fn error_mapping() {
             ErrorKind::AlreadyExists
         );
     }
-    assert_eq!(kind(fs.mkdir(&s.p("a/b"), false).await), ErrorKind::NotFound);
     assert_eq!(
-        kind(fs.mkdir(&s.p("file/sub/deeper"), true).await),
-        ErrorKind::NotADirectory
+        kind(fs.mkdir(&s.p("a/b"), false).await),
+        ErrorKind::NotFound
+    );
+    // fsspec: FileNotFoundError; the message names the file in the way.
+    let e = fs.mkdir(&s.p("file/sub/deeper"), true).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    assert!(
+        e.to_string()
+            .contains(&format!("{} is not a directory", s.p("file"))),
+        "{e}"
     );
     assert_eq!(
         kind(fs.makedirs(&s.p("file"), true).await),
@@ -290,7 +300,11 @@ async fn error_mapping() {
             .kind(),
         ErrorKind::AlreadyExists
     );
-    for m in [WriteMode::Overwrite, WriteMode::CreateNew, WriteMode::Append] {
+    for m in [
+        WriteMode::Overwrite,
+        WriteMode::CreateNew,
+        WriteMode::Append,
+    ] {
         let e = fs.open_write(&s.p("dir"), &ow(m)).await.unwrap_err();
         assert!(
             matches!(e.kind(), ErrorKind::IsADirectory | ErrorKind::AlreadyExists),
@@ -318,7 +332,10 @@ async fn error_mapping() {
         kind(fs.mv_file(&s.p("file"), &s.p("dir")).await),
         ErrorKind::IsADirectory
     );
-    assert_eq!(kind(fs.touch(&s.p("dir"), true).await), ErrorKind::IsADirectory);
+    assert_eq!(
+        kind(fs.touch(&s.p("dir"), true).await),
+        ErrorKind::IsADirectory
+    );
     assert_eq!(
         kind(fs.cp_file(&s.p("dir"), &s.p("copy")).await),
         ErrorKind::IsADirectory
@@ -337,7 +354,10 @@ async fn writes_appends_aborts_and_touch() {
     // Odd-sized writes spanning chunk boundaries.
     let mut w = fs.open_write(&p, &WriteOptions::default()).await.unwrap();
     let mut off = 0;
-    for (i, n) in [1usize, 7, 300_000, 3, 261_119, 1, 261_121, 177_751].iter().enumerate() {
+    for (i, n) in [1usize, 7, 300_000, 3, 261_119, 1, 261_121, 177_751]
+        .iter()
+        .enumerate()
+    {
         let n = (*n).min(data.len() - off);
         w.write(data.slice(off..off + n)).await.unwrap();
         off += n;
@@ -428,14 +448,19 @@ async fn copy_move_links_and_paths() {
     let before = fs.stats().snapshot().bytes_read;
     fs.cp_file(&src, &s.p("dst.bin")).await.unwrap();
     assert!(fs.stats().snapshot().bytes_read - before < 1000);
-    assert_eq!(fs.cat_file(&s.p("dst.bin"), ByteRange::Full).await.unwrap(), data);
+    assert_eq!(
+        fs.cat_file(&s.p("dst.bin"), ByteRange::Full).await.unwrap(),
+        data
+    );
     // Copy over a longer file truncates; copy onto itself is harmless, also
     // under another name for the same file.
     put(&fs, &s.p("long"), pattern(6, 5_000_000)).await;
     fs.cp_file(&src, &s.p("long")).await.unwrap();
     assert_eq!(fs.info(&s.p("long")).await.unwrap().size, data.len() as u64);
     fs.cp_file(&src, &src).await.unwrap();
-    fs.cp_file(&src, &format!("{}/./src.bin", s.dir)).await.unwrap();
+    fs.cp_file(&src, &format!("{}/./src.bin", s.dir))
+        .await
+        .unwrap();
     assert_eq!(fs.cat_file(&src, ByteRange::Full).await.unwrap(), data);
     fs.symlink(&src, &s.p("alias")).await.unwrap();
     fs.cp_file(&s.p("alias"), &src).await.unwrap();
@@ -461,7 +486,10 @@ async fn copy_move_links_and_paths() {
     fs.mkdir(&rel, false).await.unwrap();
     put(&fs, &format!("{rel}/r.txt"), &b"rel"[..]).await;
     let abs = format!("{}/{rel}/r.txt", env.home);
-    assert_eq!(fs.cat_file(&abs, ByteRange::Full).await.unwrap(), &b"rel"[..]);
+    assert_eq!(
+        fs.cat_file(&abs, ByteRange::Full).await.unwrap(),
+        &b"rel"[..]
+    );
     let l = fs.ls(&rel).await.unwrap();
     assert_eq!(l[0].name, format!("{rel}/r.txt"));
     fs.rm_file(&format!("{rel}/r.txt")).await.unwrap();
@@ -489,7 +517,11 @@ async fn put_get_files_and_directories() {
     assert_eq!(std::fs::read(&dst).unwrap(), data);
     // A missing local source creates nothing remotely.
     let e = fs
-        .put_file(&local.path().join("nope"), &s.p("x/never"), &WriteOptions::default())
+        .put_file(
+            &local.path().join("nope"),
+            &s.p("x/never"),
+            &WriteOptions::default(),
+        )
         .await
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::NotFound);
@@ -501,7 +533,10 @@ async fn put_get_files_and_directories() {
     // A missing remote leaves no local file.
     let never = local.path().join("never");
     assert_eq!(
-        fs.get_file(&s.p("missing"), &never).await.unwrap_err().kind(),
+        fs.get_file(&s.p("missing"), &never)
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::NotFound
     );
     assert!(!never.exists());
@@ -523,7 +558,9 @@ async fn concurrent_reads_on_one_handle() {
     let mut x = 12345u64;
     let ranges: Vec<(u64, usize)> = (0..200)
         .map(|_| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let off = (x >> 20) % size as u64;
             let len = ((x >> 8) % (3 << 20)) as usize + 1;
             (off, len)
@@ -543,7 +580,10 @@ async fn concurrent_reads_on_one_handle() {
         assert!(got == data.slice(off as usize..end), "data at {off}");
     }
     // read_ranges and the engine's parallel reader on the same handle.
-    let rr = h.read_ranges(&[0..10, 5..100_000, (size as u64 - 3)..(size as u64 + 9)]).await.unwrap();
+    let rr = h
+        .read_ranges(&[0..10, 5..100_000, (size as u64 - 3)..(size as u64 + 9)])
+        .await
+        .unwrap();
     assert_eq!(rr[1], data.slice(5..100_000));
     assert_eq!(rr[2].len(), 3);
     let all = fsfast_engine::read_parallel(&h, 0..size as u64, 4 << 20, 8, None)
@@ -595,7 +635,9 @@ async fn many_files_in_parallel_grow_the_pool() {
     let fs = env.fs(&[("connections", Value::Int(3))]);
     let s = Scratch::new(&env, &fs, "many").await;
     let n = 400;
-    let paths: Vec<String> = (0..n).map(|i| s.p(&format!("d{}/f{i:04}", i % 7))).collect();
+    let paths: Vec<String> = (0..n)
+        .map(|i| s.p(&format!("d{}/f{i:04}", i % 7)))
+        .collect();
     for d in 0..7 {
         fs.mkdir(&s.p(&format!("d{d}")), false).await.unwrap();
     }
@@ -620,7 +662,11 @@ async fn many_files_in_parallel_grow_the_pool() {
     }
     // Background growth happened under concurrency.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(fs.connections() >= 2, "pool did not grow: {}", fs.connections());
+    assert!(
+        fs.connections() >= 2,
+        "pool did not grow: {}",
+        fs.connections()
+    );
     assert!(fs.connections() <= 3);
     let found = fs
         .find(&s.dir, &fsfast_core::FindOptions::default())
@@ -685,7 +731,10 @@ async fn ssh_config_alias() {
     let fs = SftpFileSystem::from_options(o.clone()).unwrap();
     assert!(fs.info(&env.home).await.unwrap().is_dir());
     let label = fs.connection_info().await.unwrap().label;
-    assert!(label.starts_with(&format!("{}@{}:{}", env.user, env.host, env.port)), "{label}");
+    assert!(
+        label.starts_with(&format!("{}@{}:{}", env.user, env.host, env.port)),
+        "{label}"
+    );
 
     // ProxyJump is refused instead of silently bypassed.
     std::fs::write(

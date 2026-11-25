@@ -22,13 +22,15 @@ fn attrs_strategy() -> impl Strategy<Value = FileAttributes> {
         proptest::option::of((any::<u32>(), any::<u32>())),
         proptest::collection::vec((bytes_strategy(12), bytes_strategy(12)), 0..3),
     )
-        .prop_map(|(size, uid_gid, permissions, times, extended)| FileAttributes {
-            size,
-            uid_gid,
-            permissions,
-            times,
-            extended,
-        })
+        .prop_map(
+            |(size, uid_gid, permissions, times, extended)| FileAttributes {
+                size,
+                uid_gid,
+                permissions,
+                times,
+                extended,
+            },
+        )
 }
 
 fn request_strategy() -> impl Strategy<Value = Request> {

@@ -20,7 +20,6 @@ use fsfast_core::{Detail, ErrorKind, FileSystem, Value};
 
 struct Sshd {
     child: Child,
-    port: u16,
 }
 
 impl Drop for Sshd {
@@ -69,7 +68,7 @@ fn start(dir: &Path, port: u16, key: &Path) -> Option<Sshd> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let sshd = Sshd { child, port };
+    let sshd = Sshd { child };
     for _ in 0..200 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return Some(sshd);

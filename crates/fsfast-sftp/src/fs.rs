@@ -22,7 +22,7 @@ use crate::options::SftpConfig;
 use crate::pool::{Lease, Pool};
 use crate::proto::{FileAttributes, Limits, NameEntry, Request, Statvfs, open_flags, status};
 use crate::session::{
-    PendingCall, Session, attrs_reply, handle_reply, readdir_reply, status_reply,
+    HandleGuard, PendingCall, Session, attrs_reply, handle_reply, readdir_reply, status_reply,
 };
 
 /// What the server negotiated (diagnostics; see
@@ -81,6 +81,18 @@ fn now_secs() -> u32 {
 
 fn bytes_of(s: &str) -> Bytes {
     Bytes::copy_from_slice(s.as_bytes())
+}
+
+/// OpenSSH's report of ENOTDIR: `NO_SUCH_FILE`, i.e. NotFound (fsspec's
+/// `FileNotFoundError`), with a message naming the component `what` that is
+/// not a directory.
+fn enotdir(op: &str, what: &str, path: &str) -> Error {
+    Error::new(
+        ErrorKind::NotFound,
+        format!("{op}: {what} is not a directory"),
+    )
+    .with_detail(fsfast_core::Detail::Sftp(status::NO_SUCH_FILE))
+    .with_path(path)
 }
 
 /// The listing name of `entry` in directory `base` (fsspec:
@@ -176,7 +188,9 @@ impl SftpFileSystem {
                 r => break r,
             }
         };
-        self.inner.stats.record_request(op, start.elapsed(), r.is_ok());
+        self.inner
+            .stats
+            .record_request(op, start.elapsed(), r.is_ok());
         if r.is_err() {
             self.inner.stats.add_error();
         }
@@ -324,16 +338,13 @@ impl SftpFileSystem {
                     Ok(h) => Ok((h, 0, Undo::Remove)),
                     Err(e) if Self::is_failure(&e) || e.kind() == ErrorKind::AlreadyExists => {
                         match s.open(p, WRITE | APPEND, FileAttributes::default()).await {
-                            Ok(h) => match s.fstat(&h, p).await {
-                                Ok(a) => {
-                                    let size = a.size.unwrap_or(0);
-                                    Ok((h, size, Undo::Truncate(size)))
-                                }
-                                Err(e) => {
-                                    s.close_nowait(h);
-                                    Err(e)
-                                }
-                            },
+                            Ok(h) => {
+                                // Closed if FSTAT fails or is cancelled.
+                                let h = HandleGuard::new(s, h);
+                                let a = s.fstat(h.handle(), p).await?;
+                                let size = a.size.unwrap_or(0);
+                                Ok((h.disarm(), size, Undo::Truncate(size)))
+                            }
                             Err(e) => Err(e),
                         }
                     }
@@ -388,10 +399,11 @@ impl SftpFileSystem {
             },
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 // A component exists but is not a directory (ENOTDIR maps to
-                // NO_SUCH_FILE): name it if we can.
+                // NO_SUCH_FILE): name it in the message if we can. The kind
+                // stays NotFound, the FileNotFoundError fsspec raises here.
                 for (d, r) in results {
                     if r.is_err() && Self::lstat_kind(s, &d).await == Some(false) {
-                        return Err(Error::not_a_directory(d));
+                        return Err(enotdir("mkdir", &d, p));
                     }
                 }
                 Err(e)
@@ -401,12 +413,11 @@ impl SftpFileSystem {
     }
 
     async fn list_dir(s: &Session, p: &str) -> Result<Vec<NameEntry>> {
-        let h = s.opendir(p).await?;
-        let r = Self::read_dir(s, &h, p).await;
-        // Nothing useful can come back from closing a directory handle:
-        // do not wait for the reply.
-        s.close_nowait(h);
-        r
+        // The guard closes the handle when this function returns *or* is
+        // cancelled. Nothing useful can come back from closing a directory
+        // handle: the CLOSE is not waited for.
+        let h = HandleGuard::new(s, s.opendir(p).await?);
+        Self::read_dir(s, h.handle(), p).await
     }
 
     async fn read_dir(s: &Session, h: &Bytes, p: &str) -> Result<Vec<NameEntry>> {
@@ -432,12 +443,7 @@ impl SftpFileSystem {
         }
     }
 
-    async fn open_read_on(
-        &self,
-        s: Lease,
-        p: &str,
-        opts: &ReadOptions,
-    ) -> Result<SftpReadHandle> {
+    async fn open_read_on(&self, s: Lease, p: &str, opts: &ReadOptions) -> Result<SftpReadHandle> {
         if opts.version.is_some() {
             return Err(Error::unsupported("reading a specific version over SFTP"));
         }
@@ -539,8 +545,11 @@ impl FileSystem for SftpFileSystem {
     fn capabilities(&self) -> Capabilities {
         // Before the first connection assume an OpenSSH server
         // (posix-rename, no copy-data); afterwards report what it offers.
-        let (posix_rename, copy_data, _) =
-            self.inner.pool.known_extensions().unwrap_or((true, false, false));
+        let (posix_rename, copy_data, _) = self
+            .inner
+            .pool
+            .known_extensions()
+            .unwrap_or((true, false, false));
         Capabilities {
             hierarchical: true,
             atomic_rename: posix_rename,
@@ -682,7 +691,10 @@ impl FileSystem for SftpFileSystem {
             Ok(s) => s,
             Err(e) => {
                 let (k, m) = (e.kind(), e.message().to_owned());
-                return paths.iter().map(|_| Err(Error::new(k, m.clone()))).collect();
+                return paths
+                    .iter()
+                    .map(|_| Err(Error::new(k, m.clone())))
+                    .collect();
             }
         };
         let start = Instant::now();
@@ -698,7 +710,10 @@ impl FileSystem for SftpFileSystem {
                 let sess = &*s;
                 inflight.push_back(async move {
                     let r = match call {
-                        Ok(c) => sess.finish(c).await.and_then(|r| status_reply(r, "remove", p)),
+                        Ok(c) => sess
+                            .finish(c)
+                            .await
+                            .and_then(|r| status_reply(r, "remove", p)),
                         Err(e) => Err(e),
                     };
                     (p, r)
@@ -716,9 +731,11 @@ impl FileSystem for SftpFileSystem {
             };
             out.push(r);
         }
-        self.inner
-            .stats
-            .record_request(OpKind::Delete, start.elapsed(), out.iter().all(Result::is_ok));
+        self.inner.stats.record_request(
+            OpKind::Delete,
+            start.elapsed(),
+            out.iter().all(Result::is_ok),
+        );
         out
     }
 
@@ -757,7 +774,10 @@ impl FileSystem for SftpFileSystem {
                     attrs: FileAttributes::default(),
                 })?;
                 let st = s.finish(st).await.and_then(|r| attrs_reply(r, "stat", &p));
-                let mk = s.finish(mk).await.and_then(|r| status_reply(r, "mkdir", &p));
+                let mk = s
+                    .finish(mk)
+                    .await
+                    .and_then(|r| status_reply(r, "mkdir", &p));
                 match (st, mk) {
                     (Ok(a), _) => {
                         if a.is_dir() && exist_ok {
@@ -808,10 +828,11 @@ impl FileSystem for SftpFileSystem {
                         Some(false) => Err(refine(e, ErrorKind::NotADirectory)),
                         None => Err(e),
                     },
-                    // ENOTDIR becomes NO_SUCH_FILE.
+                    // ENOTDIR becomes NO_SUCH_FILE, which fsspec raises as
+                    // FileNotFoundError: keep the kind, say why.
                     Err(e) if e.kind() == ErrorKind::NotFound => {
                         match Self::lstat_kind(&s, &p).await {
-                            Some(false) => Err(refine(e, ErrorKind::NotADirectory)),
+                            Some(false) => Err(enotdir("rmdir", &p, &p)),
                             _ => Err(e),
                         }
                     }
@@ -865,7 +886,11 @@ impl FileSystem for SftpFileSystem {
                 let session: Session = (*s).clone();
                 let rh = self.open_read_on(s, &src, &ReadOptions::default()).await?;
                 let wh = match session
-                    .open(&dst, open_flags::WRITE | open_flags::CREAT, FileAttributes::default())
+                    .open(
+                        &dst,
+                        open_flags::WRITE | open_flags::CREAT,
+                        FileAttributes::default(),
+                    )
                     .await
                 {
                     Ok(h) => h,
@@ -878,15 +903,17 @@ impl FileSystem for SftpFileSystem {
                     Err(e) => return Err(e),
                 };
                 let size = rh.info().size;
+                // Closes the destination handle if the copy is cancelled.
+                let wh = HandleGuard::new(&session, wh);
                 let r = async {
-                    self.copy_between(&session, &rh, &wh, &dst).await?;
+                    self.copy_between(&session, &rh, wh.handle(), &dst).await?;
                     // Cut whatever the old destination had past the copy.
                     session
-                        .fsetstat(&wh, FileAttributes::with_size(size), &dst)
+                        .fsetstat(wh.handle(), FileAttributes::with_size(size), &dst)
                         .await
                 }
                 .await;
-                let closed = session.close(wh, &dst).await;
+                let closed = session.close(wh.disarm(), &dst).await;
                 drop(rh);
                 match r.and(closed) {
                     Ok(()) => {
@@ -932,7 +959,9 @@ impl FileSystem for SftpFileSystem {
         let mut file = Some(file);
         let res = async {
             loop {
-                let mut f = file.take().ok_or_else(|| Error::new(ErrorKind::Other, "file lost"))?;
+                let mut f = file
+                    .take()
+                    .ok_or_else(|| Error::new(ErrorKind::Other, "file lost"))?;
                 let (f, buf) = tokio::task::spawn_blocking(move || {
                     let mut buf = Vec::with_capacity(block);
                     let r = (&mut f).take(block as u64).read_to_end(&mut buf);
@@ -1050,10 +1079,16 @@ impl FileSystem for SftpFileSystem {
         };
         let close = s.start_call(&Request::Close { handle: h })?;
         let set_r = match set {
-            Some(c) => s.finish(c).await.and_then(|r| status_reply(r, "fsetstat", p)),
+            Some(c) => s
+                .finish(c)
+                .await
+                .and_then(|r| status_reply(r, "fsetstat", p)),
             None => Ok(()),
         };
-        let close_r = s.finish(close).await.and_then(|r| status_reply(r, "close", p));
+        let close_r = s
+            .finish(close)
+            .await
+            .and_then(|r| status_reply(r, "close", p));
         set_r.and(close_r)
     }
 

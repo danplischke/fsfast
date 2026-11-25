@@ -166,13 +166,21 @@ mod tests {
         assert_eq!(e.kind, None);
         assert_eq!(e.code.as_deref(), Some("forbidden"));
         // Newer error shape with only a status.
-        let e = parse(409, r#"{"error":{"code":409,"message":"exists","status":"ALREADY_EXISTS"}}"#).unwrap();
+        let e = parse(
+            409,
+            r#"{"error":{"code":409,"message":"exists","status":"ALREADY_EXISTS"}}"#,
+        )
+        .unwrap();
         assert_eq!(e.code.as_deref(), Some("ALREADY_EXISTS"));
     }
 
     #[test]
     fn oauth_and_xml_errors() {
-        let e = parse(400, r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#).unwrap();
+        let e = parse(
+            400,
+            r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#,
+        )
+        .unwrap();
         assert_eq!(e.code.as_deref(), Some("invalid_grant"));
         assert_eq!(e.message.as_deref(), Some("Invalid JWT Signature."));
         let e = parse(

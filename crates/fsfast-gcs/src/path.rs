@@ -109,9 +109,7 @@ pub fn split_path(path: &str, version_aware: bool) -> GcsPath {
         };
         let candidate = match fragment.filter(|f| !f.is_empty()) {
             Some(f) => Some(f.to_owned()),
-            None => query
-                .filter(|q| !q.is_empty())
-                .and_then(query_generation),
+            None => query.filter(|q| !q.is_empty()).and_then(query_generation),
         };
         if let Some(g) = candidate.filter(|g| is_python_int(g)) {
             generation = Some(g);
@@ -262,5 +260,48 @@ mod tests {
         assert!(check_object_name("..", "x").is_err());
         assert!(check_object_name("a\nb", "x").is_err());
         assert!(check_object_name(&"x".repeat(1025), "x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `quote` emits only unreserved characters and `%XX` escapes, and
+        /// decodes back to the input (object names are one URL segment).
+        #[test]
+        fn quote_round_trips(s in "\\PC{0,40}") {
+            let q = quote(&s);
+            prop_assert!(q.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b)));
+            let back = percent_encoding::percent_decode_str(&q).decode_utf8().unwrap();
+            prop_assert_eq!(back, s.as_str());
+        }
+
+        /// Without version awareness, `bucket/key` splits at the first `/`
+        /// and joins back to the same string, whatever the key contains.
+        #[test]
+        fn split_join(bucket in "[a-z0-9][a-z0-9._-]{0,20}", key in "[^\\r\\n]{1,40}") {
+            let p = split_path(&format!("gs://{bucket}/{key}"), false);
+            prop_assert_eq!(&p.bucket, &bucket);
+            prop_assert_eq!(&p.key, &key);
+            prop_assert_eq!(p.generation.as_deref(), None);
+            prop_assert_eq!(p.full(), format!("{bucket}/{key}"));
+        }
+
+        /// With version awareness, `#<gen>` and `?generation=<gen>` are
+        /// split off keys that contain neither `#` nor `?`.
+        #[test]
+        fn generations_split_off(key in "[^#?\\r\\n]{1,30}", generation in any::<u64>()) {
+            for p in [format!("b/{key}#{generation}"), format!("b/{key}?generation={generation}")] {
+                let sp = split_path(&p, true);
+                prop_assert_eq!(&sp.key, &key);
+                prop_assert_eq!(sp.generation, Some(generation.to_string()));
+            }
+            // And are part of the name otherwise.
+            let sp = split_path(&format!("b/{key}#{generation}"), false);
+            prop_assert_eq!(sp.key, format!("{key}#{generation}"));
+        }
     }
 }

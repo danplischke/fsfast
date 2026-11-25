@@ -44,6 +44,14 @@ use crate::error::GcsErrorParser;
 /// gcsfs's `LOCAL_REFRESH_BUFFER`: refresh tokens expiring within 300 s.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
+/// A cached token is still sent after a failed refresh while it has at
+/// least this long to live (a request may take a while to reach GCS).
+const STALE_TOKEN_MIN_LIFETIME: Duration = Duration::from_secs(30);
+
+/// After a failed refresh, the next attempt waits this long (while the
+/// cached token stays usable).
+const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(10);
+
 /// gcsfs `access` levels and their OAuth scopes.
 pub fn scope_for_access(access: &str) -> Result<String> {
     match access {
@@ -139,8 +147,13 @@ impl fmt::Debug for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Source::Static(_) => f.write_str("Static"),
-            Source::ServiceAccount(k) => f.debug_tuple("ServiceAccount").field(&k.client_email).finish(),
-            Source::AuthorizedUser(u) => f.debug_tuple("AuthorizedUser").field(&u.client_id).finish(),
+            Source::ServiceAccount(k) => f
+                .debug_tuple("ServiceAccount")
+                .field(&k.client_email)
+                .finish(),
+            Source::AuthorizedUser(u) => {
+                f.debug_tuple("AuthorizedUser").field(&u.client_id).finish()
+            }
             Source::Metadata(m, s) => f.debug_tuple("Metadata").field(&m.host).field(s).finish(),
         }
     }
@@ -171,7 +184,8 @@ impl Source {
                     .unwrap_or_default()
                     .as_secs();
                 let assertion = key.assertion(scope, iat)?;
-                let body = form_urlencode(&[("assertion", &assertion), ("grant_type", JWT_GRANT_TYPE)]);
+                let body =
+                    form_urlencode(&[("assertion", &assertion), ("grant_type", JWT_GRANT_TYPE)]);
                 token_request(http, &key.token_uri, body).await
             }
             Source::AuthorizedUser(u) => {
@@ -209,7 +223,13 @@ async fn token_request(http: &HttpClient, uri: &str, body: String) -> Result<Acc
         .status_kind(404, ErrorKind::PermissionDenied)
         // Exchanging the same grant twice is harmless.
         .retry_safe(true)
-        .path(format!("token endpoint {}", fsfast_http_transport::redact_url(&fsfast_http_transport::Url::parse(uri).map_err(|e| Error::invalid_input(format!("invalid token_uri {uri:?}: {e}")))?)));
+        .path(format!(
+            "token endpoint {}",
+            fsfast_http_transport::redact_url(
+                &fsfast_http_transport::Url::parse(uri)
+                    .map_err(|e| Error::invalid_input(format!("invalid token_uri {uri:?}: {e}")))?
+            )
+        ));
     let resp = http.send(req).await?;
     let started = Instant::now();
     let data = Zeroizing::new(resp.bytes().await?.to_vec());
@@ -221,6 +241,9 @@ async fn token_request(http: &HttpClient, uri: &str, body: String) -> Result<Acc
 #[derive(Debug)]
 pub struct TokenCache {
     source: Source,
+    /// Quota project overriding the source's (`GOOGLE_CLOUD_QUOTA_PROJECT`
+    /// for application default credentials).
+    quota_project: Option<String>,
     current: parking_lot::Mutex<Option<AccessToken>>,
     refresh: tokio::sync::Mutex<()>,
 }
@@ -234,9 +257,18 @@ impl TokenCache {
         };
         TokenCache {
             source,
+            quota_project: None,
             current: parking_lot::Mutex::new(current),
             refresh: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Send `project` as the quota project instead of the source's.
+    pub fn with_quota_project(mut self, project: Option<String>) -> Self {
+        if project.is_some() {
+            self.quota_project = project;
+        }
+        self
     }
 
     /// The source.
@@ -253,17 +285,60 @@ impl TokenCache {
             .map(|t| t.header.clone())
     }
 
+    /// The cached token's header if it is due for refresh but still valid
+    /// for a while.
+    fn still_valid(&self) -> Option<HeaderValue> {
+        let now = Instant::now();
+        self.current.lock().as_ref().and_then(|t| {
+            t.expires_at
+                .is_some_and(|x| x > now + STALE_TOKEN_MIN_LIFETIME)
+                .then(|| t.header.clone())
+        })
+    }
+
     /// The `Authorization` header to send, refreshing the token if needed.
+    ///
+    /// Refreshing starts minutes before the token expires: meanwhile one
+    /// request refreshes and the others keep using the still-valid token
+    /// instead of queueing behind the token endpoint; once it has expired,
+    /// everyone waits for the one refresh.
     pub async fn header(&self, http: &HttpClient, scope: &str) -> Result<HeaderValue> {
         if let Some(h) = self.fresh() {
             return Ok(h);
         }
-        let _g = self.refresh.lock().await;
+        let _g = match self.still_valid() {
+            Some(h) => match self.refresh.try_lock() {
+                Ok(g) => g,
+                // Another request is refreshing.
+                Err(_) => return Ok(h),
+            },
+            None => self.refresh.lock().await,
+        };
         if let Some(h) = self.fresh() {
             return Ok(h);
         }
         tracing::debug!(source = ?self.source, "refreshing GCS access token");
-        let t = self.source.fetch(http, scope).await?;
+        let t = match self.source.fetch(http, scope).await {
+            Ok(t) => t,
+            Err(e) => {
+                // A failed refresh (a token endpoint or metadata server
+                // hiccup) must not fail requests while the cached token is
+                // valid; try again a little later rather than on every
+                // request.
+                let now = Instant::now();
+                let mut cur = self.current.lock();
+                if let Some(t) = cur.as_mut()
+                    && let Some(exp) = t.expires_at
+                    && exp > now + STALE_TOKEN_MIN_LIFETIME
+                {
+                    let retry_at = (now + REFRESH_RETRY_DELAY).min(exp - STALE_TOKEN_MIN_LIFETIME);
+                    t.refresh_at = Some(retry_at);
+                    tracing::warn!(error = %e, "cannot refresh the GCS access token; using the cached one until it expires");
+                    return Ok(t.header.clone());
+                }
+                return Err(e);
+            }
+        };
         let h = t.header.clone();
         *self.current.lock() = Some(t);
         Ok(h)
@@ -285,7 +360,9 @@ impl TokenCache {
 
     /// `x-goog-user-project` from the credentials' quota project.
     pub fn quota_project(&self) -> Option<&str> {
-        self.source.quota_project()
+        self.quota_project
+            .as_deref()
+            .or_else(|| self.source.quota_project())
     }
 }
 
@@ -387,6 +464,9 @@ pub struct Credentials {
     /// `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` (google-auth's explicit
     /// project, overriding detected ones).
     env_project: Option<String>,
+    /// `GOOGLE_CLOUD_QUOTA_PROJECT`, which google-auth's `default()` applies
+    /// to the credentials it finds (set only for those).
+    adc_quota_project: Option<String>,
     resolved: OnceCell<Arc<Resolved>>,
     method: &'static str,
 }
@@ -420,9 +500,18 @@ impl Credentials {
     /// Build from the `token`, `project` and `access` options.
     /// `on_google` is gcsfs's check that the endpoint is Google's (the
     /// `cloud` method is skipped for emulators).
-    pub fn new(spec: TokenSpec, project: Option<String>, access: &str, env: &GcsEnv, on_google: bool) -> Result<Self> {
+    pub fn new(
+        spec: TokenSpec,
+        project: Option<String>,
+        access: &str,
+        env: &GcsEnv,
+        on_google: bool,
+    ) -> Result<Self> {
         let scope = scope_for_access(access)?;
         let metadata = Arc::new(MetadataServer::from_env(env)?);
+        let adc_quota = env
+            .non_empty("GOOGLE_CLOUD_QUOTA_PROJECT")
+            .map(str::to_owned);
         let explicit_env_project = env
             .non_empty("GOOGLE_CLOUD_PROJECT")
             .or_else(|| env.non_empty("GCLOUD_PROJECT"))
@@ -434,6 +523,7 @@ impl Credentials {
             signer: None,
             metadata,
             env_project: explicit_env_project.clone(),
+            adc_quota_project: None,
             resolved: OnceCell::new(),
             method: "anon",
         };
@@ -468,25 +558,25 @@ impl Credentials {
                 };
                 creds.method = "cloud";
             }
-            TokenSpec::GoogleDefault => {
-                match adc::find_adc_file(env)? {
-                    Some(found) => {
-                        let p = explicit_env_project.or(found.project.clone());
-                        adc_project_check(project.as_deref(), p.as_deref())?;
-                        creds.set_file(&found.credentials, "google_default");
-                        creds.fixed_project = p;
-                    }
-                    None => {
-                        creds.plan = Plan::Lazy {
-                            gce_default: true,
-                            cloud: false,
-                            anon_fallback: false,
-                            user_project: project,
-                        };
-                        creds.method = "google_default";
-                    }
+            TokenSpec::GoogleDefault => match adc::find_adc_file(env)? {
+                Some(found) => {
+                    let p = explicit_env_project.or(found.project.clone());
+                    adc_project_check(project.as_deref(), p.as_deref())?;
+                    creds.set_file(&found.credentials, "google_default");
+                    creds.fixed_project = p;
+                    creds.adc_quota_project = adc_quota;
                 }
-            }
+                None => {
+                    creds.plan = Plan::Lazy {
+                        gce_default: true,
+                        cloud: false,
+                        anon_fallback: false,
+                        user_project: project,
+                    };
+                    creds.method = "google_default";
+                    creds.adc_quota_project = adc_quota;
+                }
+            },
             TokenSpec::Auto => {
                 let found = adc::find_adc_file(env).and_then(|f| {
                     if let Some(found) = &f {
@@ -499,6 +589,7 @@ impl Credentials {
                     Ok(Some(found)) => {
                         creds.set_file(&found.credentials, "google_default");
                         creds.fixed_project = explicit_env_project.or(found.project);
+                        creds.adc_quota_project = adc_quota;
                     }
                     Ok(None) => {
                         creds.plan = Plan::Lazy {
@@ -508,6 +599,7 @@ impl Credentials {
                             user_project: project,
                         };
                         creds.method = "auto";
+                        creds.adc_quota_project = adc_quota;
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "google_default credentials failed; trying the next method");
@@ -573,7 +665,9 @@ impl Credentials {
     async fn do_resolve(&self, http: &HttpClient) -> Result<Resolved> {
         match &self.plan {
             Plan::Fixed(src) => Ok(Resolved {
-                tokens: src.clone().map(TokenCache::new),
+                tokens: src
+                    .clone()
+                    .map(|s| TokenCache::new(s).with_quota_project(self.adc_quota_project.clone())),
                 project: self.fixed_project.clone(),
             }),
             Plan::Lazy {
@@ -606,7 +700,9 @@ impl Credentials {
                         }
                         Err(e) => {
                             tracing::debug!(error = %e, "GCE metadata credentials unavailable");
-                            last_err = Some(Error::invalid_input(format!("Invalid gcloud credentials: {e}")));
+                            last_err = Some(Error::invalid_input(format!(
+                                "Invalid gcloud credentials: {e}"
+                            )));
                         }
                     }
                 }
@@ -638,10 +734,13 @@ impl Credentials {
         };
         adc_project_check(user_project, project.as_deref())?;
         Ok(Resolved {
-            tokens: Some(TokenCache::new(Source::Metadata(
-                self.metadata.clone(),
-                Some(self.scope.clone()),
-            ))),
+            tokens: Some(
+                TokenCache::new(Source::Metadata(
+                    self.metadata.clone(),
+                    Some(self.scope.clone()),
+                ))
+                .with_quota_project(self.adc_quota_project.clone()),
+            ),
             project,
         })
     }
@@ -663,13 +762,21 @@ mod tests {
     #[test]
     fn token_responses() {
         let now = Instant::now();
-        let t = AccessToken::from_token_response(br#"{"access_token":"ya29.x","expires_in":3599,"token_type":"Bearer"}"#, Some(now)).unwrap();
+        let t = AccessToken::from_token_response(
+            br#"{"access_token":"ya29.x","expires_in":3599,"token_type":"Bearer"}"#,
+            Some(now),
+        )
+        .unwrap();
         assert_eq!(t.header.to_str().unwrap(), "Bearer ya29.x");
         assert!(t.header.is_sensitive());
         assert_eq!(t.expires_at, Some(now + Duration::from_secs(3599)));
         assert_eq!(t.refresh_at, Some(now + Duration::from_secs(3299)));
         // Short-lived: refresh half-way.
-        let t = AccessToken::from_token_response(br#"{"access_token":"a","expires_in":"200"}"#, Some(now)).unwrap();
+        let t = AccessToken::from_token_response(
+            br#"{"access_token":"a","expires_in":"200"}"#,
+            Some(now),
+        )
+        .unwrap();
         assert_eq!(t.refresh_at, Some(now + Duration::from_secs(100)));
         assert!(t.is_fresh(now));
         assert!(!t.is_fresh(now + Duration::from_secs(101)));
@@ -682,23 +789,88 @@ mod tests {
 
     #[test]
     fn token_specs() {
-        assert!(matches!(TokenSpec::from_value(None).unwrap(), TokenSpec::Auto));
-        assert!(matches!(TokenSpec::from_value(Some(Value::from("anon"))).unwrap(), TokenSpec::Anon));
-        assert!(matches!(TokenSpec::from_value(Some(Value::from("cloud"))).unwrap(), TokenSpec::Cloud));
+        assert!(matches!(
+            TokenSpec::from_value(None).unwrap(),
+            TokenSpec::Auto
+        ));
+        assert!(matches!(
+            TokenSpec::from_value(Some(Value::from("anon"))).unwrap(),
+            TokenSpec::Anon
+        ));
+        assert!(matches!(
+            TokenSpec::from_value(Some(Value::from("cloud"))).unwrap(),
+            TokenSpec::Cloud
+        ));
         assert!(matches!(
             TokenSpec::from_value(Some(Value::from("google_default"))).unwrap(),
             TokenSpec::GoogleDefault
         ));
         assert_eq!(
-            TokenSpec::from_value(Some(Value::from("cache"))).unwrap_err().kind(),
+            TokenSpec::from_value(Some(Value::from("cache")))
+                .unwrap_err()
+                .kind(),
             ErrorKind::Unsupported
         );
         assert_eq!(
-            TokenSpec::from_value(Some(Value::from("browser"))).unwrap_err().kind(),
+            TokenSpec::from_value(Some(Value::from("browser")))
+                .unwrap_err()
+                .kind(),
             ErrorKind::Unsupported
         );
         assert!(TokenSpec::from_value(Some(Value::Int(1))).is_err());
-        assert!(format!("{:?}", TokenSpec::from_value(Some(Value::from("ya29.secret"))).unwrap()).contains("redacted"));
+        assert!(
+            format!(
+                "{:?}",
+                TokenSpec::from_value(Some(Value::from("ya29.secret"))).unwrap()
+            )
+            .contains("redacted")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_a_still_valid_token() {
+        // A token endpoint nothing listens on.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/token", l.local_addr().unwrap());
+        drop(l);
+        let user = AuthorizedUser {
+            client_id: "c".into(),
+            client_secret: Zeroizing::new("s".into()),
+            refresh_token: Zeroizing::new("r".into()),
+            token_uri: uri,
+            quota_project_id: None,
+        };
+        let http = HttpClient::new(fsfast_http_transport::HttpConfig {
+            max_retries: 0,
+            proxy: fsfast_http_transport::ProxyConfig::Disabled,
+            ..Default::default()
+        })
+        .unwrap();
+        let cache = TokenCache::new(Source::AuthorizedUser(user));
+        // Nothing cached: the failure is reported.
+        assert!(cache.header(&http, "s").await.is_err());
+        // Due for refresh but valid for minutes: still used.
+        let now = Instant::now();
+        let mut t = AccessToken::bearer("old").unwrap();
+        t.refresh_at = Some(now - Duration::from_secs(1));
+        t.expires_at = Some(now + Duration::from_secs(200));
+        *cache.current.lock() = Some(t.clone());
+        assert_eq!(cache.header(&http, "s").await.unwrap(), t.header);
+        // The next attempt is postponed instead of repeated per request.
+        let next = cache.current.lock().as_ref().unwrap().refresh_at.unwrap();
+        assert!(next > now + Duration::from_secs(5));
+        assert_eq!(cache.fresh(), Some(t.header.clone()));
+        // While one request refreshes, the others use the valid token.
+        t.refresh_at = Some(now - Duration::from_secs(1));
+        *cache.current.lock() = Some(t.clone());
+        {
+            let _busy = cache.refresh.lock().await;
+            assert_eq!(cache.header(&http, "s").await.unwrap(), t.header);
+        }
+        // About to expire: the failure is reported.
+        t.expires_at = Some(now + Duration::from_secs(5));
+        *cache.current.lock() = Some(t);
+        assert!(cache.header(&http, "s").await.is_err());
     }
 
     #[test]

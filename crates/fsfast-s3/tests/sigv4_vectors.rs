@@ -59,14 +59,20 @@ fn header_signing_matches_botocore() {
             "unsigned" => UNSIGNED_PAYLOAD.to_owned(),
             _ => sha256_hex(&body),
         };
-        assert_eq!(
-            payload,
-            s(v, "x_amz_content_sha256"),
-            "{name}: payload hash"
-        );
+        let service = match v["service"].as_str() {
+            Some("sts") => "sts",
+            _ => "s3",
+        };
+        if service == "s3" {
+            assert_eq!(
+                payload,
+                s(v, "x_amz_content_sha256"),
+                "{name}: payload hash"
+            );
+        }
         let token = v["token"].as_str().map(str::to_owned);
         let creds = Credentials::new(AK, SK, token, None);
-        let out = Signer::new("s3")
+        let out = Signer::new(service)
             .sign(
                 s(v, "method"),
                 &url,
@@ -93,9 +99,12 @@ fn header_signing_matches_botocore() {
             "{name}: authorization"
         );
         assert_eq!(headers["x-amz-date"], s(v, "x_amz_date"), "{name}");
+        if service == "sts" {
+            assert!(!headers.contains_key("x-amz-content-sha256"), "{name}");
+        }
         n += 1;
     }
-    assert!(n >= 25, "only {n} signing vectors");
+    assert!(n >= 28, "only {n} signing vectors");
 }
 
 fn endpoint_for(v: &Value) -> Endpoint {
@@ -261,5 +270,5 @@ fn presigned_urls_match_botocore() {
         );
         n += 1;
     }
-    assert!(n >= 7, "only {n} presign vectors");
+    assert!(n >= 23, "only {n} presign vectors");
 }

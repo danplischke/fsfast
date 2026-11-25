@@ -154,7 +154,11 @@ async fn public_key_authentication() {
             vec!["-t", "rsa", "-b", "2048", "-m", "PEM"],
             PASSPHRASE,
         ),
-        ("ecdsa_pkcs8", vec!["-t", "ecdsa", "-b", "256", "-m", "PKCS8"], ""),
+        (
+            "ecdsa_pkcs8",
+            vec!["-t", "ecdsa", "-b", "256", "-m", "PKCS8"],
+            "",
+        ),
         (
             "ecdsa_pkcs8_enc",
             vec!["-t", "ecdsa", "-b", "256", "-m", "PKCS8"],
@@ -198,9 +202,12 @@ async fn public_key_authentication() {
         .unwrap_or_else(|e| panic!("key_filename {name}: {e}"));
         // The same key given as text.
         let text = std::fs::read_to_string(path).unwrap();
-        connect(&env, &key_opts(&[("pkey", Value::Str(text)), ("passphrase", pass)]))
-            .await
-            .unwrap_or_else(|e| panic!("pkey {name}: {e}"));
+        connect(
+            &env,
+            &key_opts(&[("pkey", Value::Str(text)), ("passphrase", pass)]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("pkey {name}: {e}"));
         if *encrypted {
             // paramiko falls back to the password as passphrase.
             connect(
@@ -239,7 +246,10 @@ async fn public_key_authentication() {
     // still gets its turn.
     let e = connect(
         &env,
-        &key_opts(&[("key_filename", by_name("not_installed").display().to_string().into())]),
+        &key_opts(&[(
+            "key_filename",
+            by_name("not_installed").display().to_string().into(),
+        )]),
     )
     .await
     .unwrap_err();
@@ -297,7 +307,10 @@ async fn public_key_authentication() {
     let cfg = d.join("config");
     std::fs::write(
         &cfg,
-        format!("Host *\n  IdentityFile {}\n", by_name("ecdsa_pkcs8").display()),
+        format!(
+            "Host *\n  IdentityFile {}\n",
+            by_name("ecdsa_pkcs8").display()
+        ),
     )
     .unwrap();
     connect(
@@ -322,7 +335,11 @@ async fn public_key_authentication() {
         .map(|s| s.success())
         .unwrap_or(false);
     assert!(added, "ssh-add failed");
-    std::fs::write(&cfg, format!("Host *\n  IdentityAgent {}\n", agent.1.display())).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("Host *\n  IdentityAgent {}\n", agent.1.display()),
+    )
+    .unwrap();
     connect(
         &env,
         &[

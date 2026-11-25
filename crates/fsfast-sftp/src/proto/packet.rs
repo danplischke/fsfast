@@ -215,14 +215,18 @@ impl ExtRequest {
         } else if n == ext::STATVFS.as_bytes() {
             ExtRequest::Statvfs { path: c.string()? }
         } else if n == ext::FSTATVFS.as_bytes() {
-            ExtRequest::Fstatvfs { handle: c.string()? }
+            ExtRequest::Fstatvfs {
+                handle: c.string()?,
+            }
         } else if n == ext::HARDLINK.as_bytes() {
             ExtRequest::Hardlink {
                 old: c.string()?,
                 new: c.string()?,
             }
         } else if n == ext::FSYNC.as_bytes() {
-            ExtRequest::Fsync { handle: c.string()? }
+            ExtRequest::Fsync {
+                handle: c.string()?,
+            }
         } else if n == ext::LSETSTAT.as_bytes() {
             ExtRequest::Lsetstat {
                 path: c.string()?,
@@ -403,9 +407,9 @@ impl Request {
     fn head_body_len(&self) -> usize {
         match self {
             Request::Open { path, attrs, .. } => string_len(path.len()) + 4 + attrs.encoded_len(),
-            Request::Close { handle }
-            | Request::Fstat { handle }
-            | Request::Readdir { handle } => string_len(handle.len()),
+            Request::Close { handle } | Request::Fstat { handle } | Request::Readdir { handle } => {
+                string_len(handle.len())
+            }
             Request::Read { handle, .. } => string_len(handle.len()) + 12,
             Request::Write { handle, .. } => string_len(handle.len()) + 8 + 4,
             Request::Lstat { path }
@@ -448,9 +452,9 @@ impl Request {
                 b.put_u32(*pflags);
                 attrs.encode(&mut b);
             }
-            Request::Close { handle }
-            | Request::Fstat { handle }
-            | Request::Readdir { handle } => put_string(&mut b, handle),
+            Request::Close { handle } | Request::Fstat { handle } | Request::Readdir { handle } => {
+                put_string(&mut b, handle)
+            }
             Request::Read {
                 handle,
                 offset,
@@ -519,7 +523,9 @@ impl Request {
                 pflags: c.u32()?,
                 attrs: FileAttributes::decode(&mut c)?,
             },
-            fxp::CLOSE => Request::Close { handle: c.string()? },
+            fxp::CLOSE => Request::Close {
+                handle: c.string()?,
+            },
             fxp::READ => Request::Read {
                 handle: c.string()?,
                 offset: c.u64()?,
@@ -531,7 +537,9 @@ impl Request {
                 data: c.string()?,
             },
             fxp::LSTAT => Request::Lstat { path: c.string()? },
-            fxp::FSTAT => Request::Fstat { handle: c.string()? },
+            fxp::FSTAT => Request::Fstat {
+                handle: c.string()?,
+            },
             fxp::SETSTAT => Request::Setstat {
                 path: c.string()?,
                 attrs: FileAttributes::decode(&mut c)?,
@@ -541,7 +549,9 @@ impl Request {
                 attrs: FileAttributes::decode(&mut c)?,
             },
             fxp::OPENDIR => Request::Opendir { path: c.string()? },
-            fxp::READDIR => Request::Readdir { handle: c.string()? },
+            fxp::READDIR => Request::Readdir {
+                handle: c.string()?,
+            },
             fxp::REMOVE => Request::Remove { path: c.string()? },
             fxp::MKDIR => Request::Mkdir {
                 path: c.string()?,

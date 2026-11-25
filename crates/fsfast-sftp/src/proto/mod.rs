@@ -18,7 +18,7 @@ use std::fmt;
 pub use attrs::{FileAttributes, Kind};
 pub use frame::{Frame, FrameAssembler};
 pub use packet::{
-    Encoded, ExtRequest, Limits, NameEntry, Payload, Reply, Request, Statvfs, Status, Version,
+    Encoded, ExtRequest, Limits, NameEntry, Payload, Reply, Request, Status, Statvfs, Version,
     encode_init, open_flags,
 };
 

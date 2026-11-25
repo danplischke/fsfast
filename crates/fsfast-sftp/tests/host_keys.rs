@@ -108,7 +108,11 @@ async fn host_key_policies() {
             forget_learned_keys();
             let e = try_connect(&env, &kh, policy, &[]).await.unwrap_err();
             assert_eq!(e.kind(), ErrorKind::ConnectionFailed, "{policy}: {e}");
-            assert_eq!(code(&e).as_deref(), Some("HostKeyMismatch"), "{policy}: {e}");
+            assert_eq!(
+                code(&e).as_deref(),
+                Some("HostKeyMismatch"),
+                "{policy}: {e}"
+            );
             assert!(!e.is_retryable());
         }
     }
@@ -136,10 +140,19 @@ async fn host_key_policies() {
         // warning did not remember the key...
         let e = try_connect(&env, &kh, "reject", &[]).await.unwrap_err();
         assert_eq!(code(&e).as_deref(), Some("HostKeyUnknown"), "{e}");
-        // ...auto_add does, for the rest of the process.
+        // ...auto_add does, for the rest of the process, but a key it
+        // accepted unverified never satisfies `reject`, which trusts only
+        // the known-hosts files.
         try_connect(&env, &kh, "auto_add", &[]).await.unwrap();
-        try_connect(&env, &kh, "reject", &[]).await.unwrap();
+        let e = try_connect(&env, &kh, "reject", &[]).await.unwrap_err();
+        assert_eq!(code(&e).as_deref(), Some("HostKeyUnknown"), "{e}");
     }
+    forget_learned_keys();
+
+    // The default policy (no host_key_policy) is fsspec's auto_add.
+    write(String::new());
+    let fs = env.fs(&[("known_hosts", Value::Str(kh.display().to_string()))]);
+    fs.info(&env.home).await.unwrap();
     forget_learned_keys();
 
     // known_hosts=False loads nothing: only auto_add/warning connect.
@@ -156,7 +169,10 @@ async fn host_key_policies() {
     let cfg = dir.path().join("config");
     std::fs::write(
         &cfg,
-        format!("Host *\n  HostKeyAlias fsfast-alias\n  UserKnownHostsFile {}\n", kh.display()),
+        format!(
+            "Host *\n  HostKeyAlias fsfast-alias\n  UserKnownHostsFile {}\n",
+            kh.display()
+        ),
     )
     .unwrap();
     let alias_name = if env.port == 22 {
@@ -164,7 +180,9 @@ async fn host_key_policies() {
     } else {
         format!("[fsfast-alias]:{}", env.port)
     };
-    write(format!("{alias_name} {ktype} {key}\n{name} {ktype} {OTHER_ED25519}\n"));
+    write(format!(
+        "{alias_name} {ktype} {key}\n{name} {ktype} {OTHER_ED25519}\n"
+    ));
     let fs = env.fs(&[
         ("ssh_config", Value::Str(cfg.display().to_string())),
         ("host_key_policy", "reject".into()),

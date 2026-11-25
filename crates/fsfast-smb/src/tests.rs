@@ -857,3 +857,90 @@ async fn tampered_direct_reads_are_rejected() {
         assert!(conn.is_dead());
     }
 }
+
+/// [MS-SMB2] §3.2.5.1.3: on a signing session the response must carry the
+/// request's SessionId and a valid signature. A man in the middle that
+/// zeroes the SessionId of an unsigned (forged) response must not get it
+/// accepted — neither on the regular path nor on the direct READ path.
+#[tokio::test]
+async fn forged_session_id_does_not_bypass_signature_checks() {
+    let k = keys();
+    for (len, cap) in [(10u32, 4096usize), (200_000, 200_000)] {
+        let (conn, mut server) = pair(Some(&k), None, None).await;
+        handshake(&conn, &mut server, 64).await;
+        let c = crypto(&k, true, false);
+        conn.set_crypto(Some(c.clone()));
+        let sec = Security {
+            session: Some(c),
+            encrypt: false,
+            force_sign: false,
+        };
+        let t = spawn_read_into(&conn, sec, len, cap);
+        let inc = server.next().await;
+        let mut h = resp(inc.msgs[0].header(), NtStatus::SUCCESS, 5);
+        h.session_id = 0; // forged: "no session", so "no signature needed"
+        let body = ReadResponse {
+            data: Bytes::from(vec![7u8; len as usize]),
+            ..Default::default()
+        };
+        server.send(vec![encode_message(&h, &body).unwrap()], false, false);
+        let e = t
+            .await
+            .unwrap()
+            .expect_err("forged unsigned response accepted");
+        assert_eq!(e.kind(), ErrorKind::Protocol, "len={len}: {e}");
+        assert!(conn.is_dead());
+    }
+}
+
+/// A sealed READ response whose caller has gone away must still be
+/// authenticated: the reader routes it by an unauthenticated peek, so
+/// discarding it unchecked would accept forged frames (and their credit
+/// grants) on an encrypted session.
+#[tokio::test]
+async fn sealed_reads_of_dropped_callers_are_still_authenticated() {
+    let k = keys();
+    let (conn, mut server) = pair(Some(&k), None, None).await;
+    handshake(&conn, &mut server, 64).await;
+    let c = crypto(&k, false, true);
+    conn.set_crypto(Some(c.clone()));
+    let sec = Security {
+        session: Some(c),
+        encrypt: true,
+        force_sign: false,
+    };
+    // A second READ keeps a destination registered, so the reader keeps
+    // peeking at encrypted frames.
+    let keep = spawn_read_into(&conn, sec.clone(), 200_000, 200_000);
+    let keep_req = server.next().await;
+    let t = spawn_read_into(&conn, sec, 200_000, 200_000);
+    let inc = server.next().await;
+    t.abort();
+    let _ = t.await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut h = resp(inc.msgs[0].header(), NtStatus::SUCCESS, 5);
+    h.session_id = 0x55;
+    let body = ReadResponse {
+        data: Bytes::from(vec![1u8; 200_000]),
+        ..Default::default()
+    };
+    let m = encode_message(&h, &body).unwrap();
+    let b = server
+        .encryptor
+        .as_ref()
+        .unwrap()
+        .encrypt_messages(0x55, &[m])
+        .unwrap();
+    let mut wire = OutgoingFrame::from_bytes(b.freeze()).unwrap().to_vec();
+    let n = wire.len();
+    wire[n - 10] ^= 0x40; // break the tag check
+    let _ = server.tx.send(Out::Frame(wire));
+    let e = tokio::time::timeout(Duration::from_secs(5), keep)
+        .await
+        .expect("tampered frame went unnoticed")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::ConnectionFailed, "{e}");
+    assert!(conn.is_dead());
+    drop(keep_req);
+}

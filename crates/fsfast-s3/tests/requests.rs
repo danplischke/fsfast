@@ -871,3 +871,170 @@ async fn servers_ignoring_if_none_match_make_create_only_unsupported() {
     );
     assert_eq!(f.ops(), vec!["PutObject"]);
 }
+
+#[tokio::test]
+async fn multipart_retries_parts_and_complete_errors_in_200_bodies() {
+    let f = fake().await;
+    let fs = s3(&f, &[("part_size", Value::Int(5 << 20))]);
+    let data: Vec<u8> = (0..(11u32 << 20)).map(|i| (i % 251) as u8).collect();
+    // One part fails transiently, and CompleteMultipartUpload answers
+    // "200 OK" with an <Error> body (S3 does this when the failure happens
+    // after the response started): both are retried, nothing else is.
+    f.faults
+        .lock()
+        .push(("UploadPart", 1, 500, "InternalError"));
+    f.faults
+        .lock()
+        .push(("CompleteMultipartUpload", 1, 200, "InternalError"));
+    fs.pipe_file("b/big", Bytes::from(data.clone()), &WriteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(f.requests("CreateMultipartUpload").len(), 1);
+    assert_eq!(f.requests("UploadPart").len(), 4, "3 parts + 1 retry");
+    assert_eq!(f.requests("CompleteMultipartUpload").len(), 2);
+    assert!(!f.ops().contains(&"AbortMultipartUpload"));
+    assert_eq!(f.store.lock().objects["b/big"].0, data);
+    // A non-retryable error in a 200 body fails the upload and aborts it.
+    f.clear();
+    f.faults
+        .lock()
+        .push(("CompleteMultipartUpload", 1, 200, "InvalidPart"));
+    let e = fs
+        .pipe_file("b/big2", Bytes::from(data), &WriteOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Io, "{e}");
+    assert_eq!(f.requests("CompleteMultipartUpload").len(), 1);
+    assert!(f.ops().contains(&"AbortMultipartUpload"));
+    assert!(!f.store.lock().objects.contains_key("b/big2"));
+}
+
+#[tokio::test]
+async fn multipart_boundaries() {
+    let f = fake().await;
+    let part = 5usize << 20;
+    let fs = s3(&f, &[("part_size", Value::Int(part as i64))]);
+    // Exactly one part: a single PutObject, through a handle too.
+    for (name, len) in [("b/exact", part), ("b/empty", 0)] {
+        f.clear();
+        let mut w = fs.open_write(name, &WriteOptions::default()).await.unwrap();
+        if len > 0 {
+            // Written in uneven pieces.
+            let d = vec![7u8; len];
+            w.write(Bytes::copy_from_slice(&d[..1000])).await.unwrap();
+            w.write(Bytes::copy_from_slice(&d[1000..])).await.unwrap();
+        }
+        w.close().await.unwrap();
+        assert_eq!(f.ops(), vec!["PutObject"], "{name}");
+        assert_eq!(f.store.lock().objects[name].0.len(), len);
+    }
+    // One byte more: two parts, the second of one byte.
+    f.clear();
+    let d: Vec<u8> = (0..part + 1).map(|i| (i % 253) as u8).collect();
+    let mut w = fs
+        .open_write("b/plus1", &WriteOptions::default())
+        .await
+        .unwrap();
+    w.write(Bytes::from(d.clone())).await.unwrap();
+    w.close().await.unwrap();
+    let parts = f.requests("UploadPart");
+    assert_eq!(parts.len(), 2);
+    let mut sizes: Vec<usize> = parts.iter().map(|p| p.body.len()).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![1, part]);
+    assert_eq!(f.store.lock().objects["b/plus1"].0, d);
+    // pipe_file of exactly one part is one PutObject as well.
+    f.clear();
+    fs.pipe_file(
+        "b/pipe-exact",
+        Bytes::from(vec![1u8; part]),
+        &WriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.ops(), vec!["PutObject"]);
+}
+
+/// Handles and filesystems may be `{:?}`-printed by applications (and by
+/// `tracing` fields): neither the environment's secrets nor the shared
+/// credentials file's contents may show up.
+#[tokio::test]
+async fn debug_output_never_contains_secrets() {
+    let f = fake().await;
+    let dir = tempfile::tempdir().unwrap();
+    let creds_file = dir.path().join("credentials");
+    std::fs::write(
+        &creds_file,
+        "[other]\naws_access_key_id = AKFILE\naws_secret_access_key = FILESECRET-abc\naws_session_token = FILETOKEN-abc\n",
+    )
+    .unwrap();
+    let env = Env::from_map([
+        ("AWS_ACCESS_KEY_ID", "AKENV"),
+        ("AWS_SECRET_ACCESS_KEY", "ENVSECRET-xyz"),
+        ("AWS_SESSION_TOKEN", "ENVTOKEN-xyz"),
+        ("AWS_SHARED_CREDENTIALS_FILE", creds_file.to_str().unwrap()),
+        ("AWS_CONFIG_FILE", "/nonexistent"),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ]);
+    let mut o = Options::new();
+    o.insert("endpoint_url".into(), Value::from(f.base.as_str()));
+    o.insert("part_size".into(), Value::Int(5 << 20));
+    o.insert(
+        "s3_additional_kwargs".into(),
+        map(&[
+            ("SSECustomerAlgorithm", Value::from("AES256")),
+            (
+                "SSECustomerKey",
+                Value::from("01234567890123456789012345678901"),
+            ),
+        ]),
+    );
+    let fs = S3FileSystem::with_options(S3Options::parse_with_env(o, env).unwrap());
+    fs.pipe_file("b/k", Bytes::from_static(b"v"), &WriteOptions::default())
+        .await
+        .unwrap();
+    let r = fs.open_read("b/k", &Default::default()).await.unwrap();
+    let mut w = fs
+        .open_write("b/w", &WriteOptions::default())
+        .await
+        .unwrap();
+    w.write(Bytes::from(vec![0u8; 6 << 20])).await.unwrap();
+    let printed = format!("{fs:?}\n{r:?}\n{w:?}\n{:?}", fs.options());
+    w.abort().await.unwrap();
+    for secret in [
+        "ENVSECRET-xyz",
+        "ENVTOKEN-xyz",
+        "FILESECRET-abc",
+        "FILETOKEN-abc",
+        "01234567890123456789012345678901",
+        // base64 of the SSE-C key.
+        "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+    ] {
+        assert!(!printed.contains(secret), "{secret} leaked in Debug output");
+    }
+}
+
+#[tokio::test]
+async fn conditional_write_conflicts_are_retried() {
+    let f = fake().await;
+    let fs = s3(&f, &[("probe_conditional_writes", false.into())]);
+    let cn = WriteOptions::default().with_mode(WriteMode::CreateNew);
+    // S3 answers 409 ConditionalRequestConflict when a conditional write
+    // races another write of the key; it was not applied, retry it.
+    f.faults
+        .lock()
+        .push(("PutObject", 1, 409, "ConditionalRequestConflict"));
+    fs.pipe_file("b/c", Bytes::from_static(b"1"), &cn)
+        .await
+        .unwrap();
+    assert_eq!(f.requests("PutObject").len(), 2);
+    // The retry of a lost race is then refused as existing.
+    f.faults
+        .lock()
+        .push(("PutObject", 1, 409, "ConditionalRequestConflict"));
+    let e = fs
+        .pipe_file("b/c", Bytes::from_static(b"2"), &cn)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::AlreadyExists, "{e}");
+}

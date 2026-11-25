@@ -26,7 +26,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
-use fsfast_core::{ByteRange, Detail, Error, ErrorKind, FileInfo, IoHints, ReadHandle, ReadOptions, Result};
+use fsfast_core::{
+    ByteRange, Detail, Error, ErrorKind, FileInfo, IoHints, ReadHandle, ReadOptions, Result,
+};
 use fsfast_engine::budget::MemoryBudget;
 use fsfast_engine::parallel::{read_parallel, read_parallel_into};
 use fsfast_http_transport::{Method, RangeBody, Response};
@@ -55,7 +57,9 @@ pub fn goog_hash_crc32c(resp_headers: &fsfast_http_transport::header::HeaderMap)
         let Ok(s) = v.to_str() else { continue };
         for part in s.split(',') {
             if let Some(b64) = part.trim().strip_prefix("crc32c=") {
-                let raw = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .ok()?;
                 let arr: [u8; 4] = raw.try_into().ok()?;
                 return Some(u32::from_be_bytes(arr));
             }
@@ -101,7 +105,9 @@ pub(crate) async fn get_range(
     pin: PinKind,
     path: &str,
 ) -> Result<Fetched> {
-    let q = Query::new().with("alt", "media").with_opt("generation", generation);
+    let q = Query::new()
+        .with("alt", "media")
+        .with_opt("generation", generation);
     let req = client
         .request(Method::GET, &client.download_url(bucket, key), &q)?
         .range(range)
@@ -185,7 +191,9 @@ impl ReadHandle for RangeReader {
             if got.is_empty() {
                 return Err(Error::new(
                     ErrorKind::Protocol,
-                    format!("object ended at {pos} bytes, but it had {size} bytes when it was opened"),
+                    format!(
+                        "object ended at {pos} bytes, but it had {size} bytes when it was opened"
+                    ),
                 )
                 .with_path(&self.path));
             }
@@ -257,7 +265,14 @@ impl ReadHandle for GcsReadHandle {
             return self.inner.read_at(offset, len).await;
         }
         let dyn_inner: Arc<dyn ReadHandle> = self.inner.clone();
-        read_parallel(&dyn_inner, offset..end, part, hints.max_concurrency, Some(&self.budget)).await
+        read_parallel(
+            &dyn_inner,
+            offset..end,
+            part,
+            hints.max_concurrency,
+            Some(&self.budget),
+        )
+        .await
     }
 
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
@@ -266,12 +281,15 @@ impl ReadHandle for GcsReadHandle {
 }
 
 impl GCSFileSystem {
-    pub(crate) async fn open_read_impl(&self, path: &str, opts: &ReadOptions) -> Result<GcsReadHandle> {
+    pub(crate) async fn open_read_impl(
+        &self,
+        path: &str,
+        opts: &ReadOptions,
+    ) -> Result<GcsReadHandle> {
         let sp = split_path(path, self.inner.opts.version_aware);
         if sp.key.is_empty() {
-            return Err(Error::is_a_directory(sp.bucket.clone()).with_detail(Detail::Code(
-                "Attempt to open a bucket".into(),
-            )));
+            return Err(Error::is_a_directory(sp.bucket.clone())
+                .with_detail(Detail::Code("Attempt to open a bucket".into())));
         }
         if !opts.extra.is_empty() {
             let keys: Vec<&str> = opts.extra.keys().map(String::as_str).collect();
@@ -281,7 +299,9 @@ impl GCSFileSystem {
             )));
         }
         let requested = coalesce_generation(opts.version.as_deref(), sp.generation.as_deref())?;
-        let info = self.get_object(&sp.bucket, &sp.key, requested.as_deref()).await?;
+        let info = self
+            .get_object(&sp.bucket, &sp.key, requested.as_deref())
+            .await?;
         let (generation, pin) = match requested {
             Some(g) => (Some(g), PinKind::Requested),
             None if opts.pin_version => match &info.version {
@@ -347,7 +367,9 @@ impl GCSFileSystem {
             path,
         )
         .await?;
-        let crc = first.crc32c.filter(|_| first.hashable && self.inner.opts.verify_crc32c);
+        let crc = first
+            .crc32c
+            .filter(|_| first.hashable && self.inner.opts.verify_crc32c);
         let data = first.body.data;
         if !first.body.ranged {
             // The server ignored the range and sent the whole object, of
@@ -359,10 +381,12 @@ impl GCSFileSystem {
                 Some(e) => ByteRange::Bounded { start, end: e },
                 None => ByteRange::From(start),
             };
-            return Ok(get_range(client, bucket, key, window, generation, first_pin, path)
-                .await?
-                .body
-                .data);
+            return Ok(
+                get_range(client, bucket, key, window, generation, first_pin, path)
+                    .await?
+                    .body
+                    .data,
+            );
         }
         let Some(total) = first.body.total else {
             return Err(Error::protocol("ranged response without the object size").with_path(path));
@@ -390,11 +414,13 @@ impl GCSFileSystem {
             pin,
             hints: self.inner.hints,
         });
-        let len = usize::try_from(want_end - start)
-            .map_err(|_| Error::new(ErrorKind::Io, "object too large for memory").with_path(path))?;
+        let len = usize::try_from(want_end - start).map_err(|_| {
+            Error::new(ErrorKind::Io, "object too large for memory").with_path(path)
+        })?;
         let mut buf = Vec::new();
-        buf.try_reserve_exact(len)
-            .map_err(|_| Error::new(ErrorKind::Io, format!("cannot allocate {len} bytes")).with_path(path))?;
+        buf.try_reserve_exact(len).map_err(|_| {
+            Error::new(ErrorKind::Io, format!("cannot allocate {len} bytes")).with_path(path)
+        })?;
         buf.extend_from_slice(&data);
         buf.resize(len, 0);
         let got = read_parallel_into(
@@ -416,7 +442,7 @@ impl GCSFileSystem {
     pub(crate) async fn cat_file_impl(&self, path: &str, range: ByteRange) -> Result<Bytes> {
         let sp = split_path(path, self.inner.opts.version_aware);
         if sp.key.is_empty() {
-            return Err(Error::is_a_directory(sp.bucket.clone()));
+            return Err(bucket_not_readable(&sp.bucket));
         }
         let name = sp.full();
         check_object_name(&sp.key, &name)?;
@@ -425,8 +451,14 @@ impl GCSFileSystem {
         }
         let generation = sp.generation.as_deref();
         match range {
-            ByteRange::Full => self.fetch_window(&sp.bucket, &sp.key, generation, 0, None, &name).await,
-            ByteRange::From(s) => self.fetch_window(&sp.bucket, &sp.key, generation, s, None, &name).await,
+            ByteRange::Full => {
+                self.fetch_window(&sp.bucket, &sp.key, generation, 0, None, &name)
+                    .await
+            }
+            ByteRange::From(s) => {
+                self.fetch_window(&sp.bucket, &sp.key, generation, s, None, &name)
+                    .await
+            }
             ByteRange::Bounded { start, end } => {
                 self.fetch_window(&sp.bucket, &sp.key, generation, start, Some(end), &name)
                     .await
@@ -437,10 +469,18 @@ impl GCSFileSystem {
                 } else {
                     PinKind::None
                 };
-                Ok(get_range(&self.inner.client, &sp.bucket, &sp.key, range, generation, pin, &name)
-                    .await?
-                    .body
-                    .data)
+                Ok(get_range(
+                    &self.inner.client,
+                    &sp.bucket,
+                    &sp.key,
+                    range,
+                    generation,
+                    pin,
+                    &name,
+                )
+                .await?
+                .body
+                .data)
             }
         }
     }
@@ -448,10 +488,14 @@ impl GCSFileSystem {
     /// `cat_ranges` for one object without a metadata request: coalesced
     /// ranged GETs in parallel, re-fetched pinned to one generation if a
     /// concurrent overwrite mixed versions.
-    pub(crate) async fn cat_ranges_impl(&self, path: &str, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+    pub(crate) async fn cat_ranges_impl(
+        &self,
+        path: &str,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<Bytes>> {
         let sp = split_path(path, self.inner.opts.version_aware);
         if sp.key.is_empty() {
-            return Err(Error::is_a_directory(sp.bucket.clone()));
+            return Err(bucket_not_readable(&sp.bucket));
         }
         let name = sp.full();
         check_object_name(&sp.key, &name)?;
@@ -459,34 +503,38 @@ impl GCSFileSystem {
             return Ok(Vec::new());
         }
         let hints = self.inner.hints;
-        let groups = fsfast_core::coalesce_ranges(ranges, hints.coalesce_gap, hints.max_coalesced.max(1));
+        let groups =
+            fsfast_core::coalesce_ranges(ranges, hints.coalesce_gap, hints.max_coalesced.max(1));
         let fetch_all = |generation: Option<String>, pin: PinKind| {
             let groups = &groups;
             let sp = &sp;
             let name = &name;
             async move {
-                let futs: Vec<_> = groups.iter().map(|g| {
-                    let generation = generation.clone();
-                    async move {
-                        if g.range.end <= g.range.start {
-                            return Ok::<_, Error>((Bytes::new(), None));
+                let futs: Vec<_> = groups
+                    .iter()
+                    .map(|g| {
+                        let generation = generation.clone();
+                        async move {
+                            if g.range.end <= g.range.start {
+                                return Ok::<_, Error>((Bytes::new(), None));
+                            }
+                            let f = get_range(
+                                &self.inner.client,
+                                &sp.bucket,
+                                &sp.key,
+                                ByteRange::Bounded {
+                                    start: g.range.start,
+                                    end: g.range.end,
+                                },
+                                generation.as_deref(),
+                                pin,
+                                name,
+                            )
+                            .await?;
+                            Ok((f.body.data, f.generation))
                         }
-                        let f = get_range(
-                            &self.inner.client,
-                            &sp.bucket,
-                            &sp.key,
-                            ByteRange::Bounded {
-                                start: g.range.start,
-                                end: g.range.end,
-                            },
-                            generation.as_deref(),
-                            pin,
-                            name,
-                        )
-                        .await?;
-                        Ok((f.body.data, f.generation))
-                    }
-                }).collect();
+                    })
+                    .collect();
                 stream::iter(futs)
                     .buffered(hints.max_concurrency.max(1))
                     .collect::<Vec<_>>()
@@ -538,7 +586,7 @@ impl GCSFileSystem {
         }
         let sp = split_path(remote, self.inner.opts.version_aware);
         if sp.key.is_empty() {
-            return Err(Error::is_a_directory(sp.bucket.clone()));
+            return Err(bucket_not_readable(&sp.bucket));
         }
         let name = sp.full();
         check_object_name(&sp.key, &name)?;
@@ -553,7 +601,10 @@ impl GCSFileSystem {
             client,
             &sp.bucket,
             &sp.key,
-            ByteRange::Bounded { start: 0, end: part },
+            ByteRange::Bounded {
+                start: 0,
+                end: part,
+            },
             sp.generation.as_deref(),
             first_pin,
             &name,
@@ -561,8 +612,16 @@ impl GCSFileSystem {
         .await?;
         let first = if !first.body.ranged && first.body.data.len() as u64 >= part {
             // The server ignores ranges: fetch the object whole.
-            get_range(client, &sp.bucket, &sp.key, ByteRange::Full, sp.generation.as_deref(), first_pin, &name)
-                .await?
+            get_range(
+                client,
+                &sp.bucket,
+                &sp.key,
+                ByteRange::Full,
+                sp.generation.as_deref(),
+                first_pin,
+                &name,
+            )
+            .await?
         } else {
             first
         };
@@ -574,7 +633,9 @@ impl GCSFileSystem {
                 (true, Some(t)) => t,
                 _ => first.body.data.len() as u64,
             };
-            let expected_crc = first.crc32c.filter(|_| first.hashable && self.inner.opts.verify_crc32c);
+            let expected_crc = first
+                .crc32c
+                .filter(|_| first.hashable && self.inner.opts.verify_crc32c);
             let file = Arc::new(tokio::fs::File::create(local).await?.into_std().await);
             let first_data = first.body.data.clone();
             let mut crc = crc32c::crc32c(&first_data);
@@ -621,7 +682,9 @@ impl GCSFileSystem {
                                 write_all_at(&f, r.start, &data).map(|()| crc32c::crc32c(&data))
                             })
                             .await
-                            .map_err(|e| Error::new(ErrorKind::Other, format!("file task failed: {e}")))??;
+                            .map_err(|e| {
+                                Error::new(ErrorKind::Other, format!("file task failed: {e}"))
+                            })??;
                             Ok::<_, Error>((r.start, part_crc, n))
                         }
                     })
@@ -664,6 +727,13 @@ pub(crate) fn coalesce_generation(a: Option<&str>, b: Option<&str>) -> Result<Op
         (Some(x), _) | (None, Some(x)) => Ok(Some(x.to_owned())),
         (None, None) => Ok(None),
     }
+}
+
+/// Reading a bucket as an object: gcsfs requests the media URL with an
+/// empty object name and raises `FileNotFoundError` from GCS's 404; the
+/// request is skipped here.
+fn bucket_not_readable(bucket: &str) -> Error {
+    Error::not_found(bucket).with_detail(Detail::Code("cannot read a bucket as an object".into()))
 }
 
 fn checksum_error(path: &str, want: u32, got: u32) -> Error {
@@ -731,10 +801,16 @@ mod tests {
     #[test]
     fn goog_hash() {
         let mut h = HeaderMap::new();
-        h.insert("x-goog-hash", HeaderValue::from_static("crc32c=yZRlqg==,md5=XrY7u+Ae7tCTyyK7j1rNww=="));
+        h.insert(
+            "x-goog-hash",
+            HeaderValue::from_static("crc32c=yZRlqg==,md5=XrY7u+Ae7tCTyyK7j1rNww=="),
+        );
         assert_eq!(goog_hash_crc32c(&h), Some(crc32c::crc32c(b"hello world")));
         let mut h = HeaderMap::new();
-        h.append("x-goog-hash", HeaderValue::from_static("md5=XrY7u+Ae7tCTyyK7j1rNww=="));
+        h.append(
+            "x-goog-hash",
+            HeaderValue::from_static("md5=XrY7u+Ae7tCTyyK7j1rNww=="),
+        );
         h.append("x-goog-hash", HeaderValue::from_static("crc32c=yZRlqg=="));
         assert_eq!(goog_hash_crc32c(&h), Some(crc32c::crc32c(b"hello world")));
         let mut h = HeaderMap::new();
@@ -759,9 +835,20 @@ mod tests {
     #[test]
     fn generations() {
         assert_eq!(coalesce_generation(None, None).unwrap(), None);
-        assert_eq!(coalesce_generation(Some("1"), None).unwrap().as_deref(), Some("1"));
-        assert_eq!(coalesce_generation(None, Some("2")).unwrap().as_deref(), Some("2"));
-        assert_eq!(coalesce_generation(Some("3"), Some("3")).unwrap().as_deref(), Some("3"));
+        assert_eq!(
+            coalesce_generation(Some("1"), None).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            coalesce_generation(None, Some("2")).unwrap().as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            coalesce_generation(Some("3"), Some("3"))
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
         assert!(coalesce_generation(Some("1"), Some("2")).is_err());
     }
 }

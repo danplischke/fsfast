@@ -155,6 +155,11 @@ mod tests {
     #[test]
     fn finish_reports_trailing_bytes() {
         let c = Cursor::new(Bytes::from_static(b"x"));
-        assert!(c.finish("pkt").unwrap_err().to_string().contains("trailing"));
+        assert!(
+            c.finish("pkt")
+                .unwrap_err()
+                .to_string()
+                .contains("trailing")
+        );
     }
 }

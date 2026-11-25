@@ -159,11 +159,7 @@ impl Resolver<'_> {
             let (kw, rest) = split_keyword(line);
             let kw = kw.to_ascii_lowercase();
             let args = tokenize(rest).map_err(|m| {
-                Error::invalid_input(format!(
-                    "ssh config {}:{}: {m}",
-                    path.display(),
-                    n + 1
-                ))
+                Error::invalid_input(format!("ssh config {}:{}: {m}", path.display(), n + 1))
             })?;
             match kw.as_str() {
                 "host" => active = outer_active && host_matches(&self.host, &args),
@@ -549,7 +545,8 @@ Host *
 
     #[test]
     fn negation_equals_quotes_and_case() {
-        let text = "host *.corp !bastion.corp\n  user=alice\nHOST bastion.corp\n  User \"bob smith\"\n";
+        let text =
+            "host *.corp !bastion.corp\n  user=alice\nHOST bastion.corp\n  User \"bob smith\"\n";
         assert_eq!(
             resolve_str("x.CORP", text, &ctx()).unwrap().user.as_deref(),
             Some("alice")

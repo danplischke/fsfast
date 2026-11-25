@@ -297,10 +297,10 @@ mod tests {
     #[test]
     fn hostile_lengths_are_errors() {
         for bad in [
-            &[0u8, 0, 0, 0][..],                          // zero length
-            &[0xff, 0xff, 0xff, 0xff][..],                 // above the limit
-            &[0, 0, 0, 2, fxp::STATUS, 0][..],             // no room for an id
-            &[0, 0, 0, 6, fxp::DATA, 0, 0, 0, 1, 0][..],   // DATA without length
+            &[0u8, 0, 0, 0][..],                                  // zero length
+            &[0xff, 0xff, 0xff, 0xff][..],                        // above the limit
+            &[0, 0, 0, 2, fxp::STATUS, 0][..],                    // no room for an id
+            &[0, 0, 0, 6, fxp::DATA, 0, 0, 0, 1, 0][..],          // DATA without length
             &[0, 0, 0, 9, fxp::DATA, 0, 0, 0, 1, 0, 0, 0, 9][..], // DATA length mismatch
         ] {
             let mut a = FrameAssembler::default();

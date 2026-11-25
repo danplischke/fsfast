@@ -13,8 +13,9 @@
 //! not implement them), produce objects without an MD5 hash, and leave
 //! billed parts behind on failure. A single HTTP/2 stream to GCS sustains
 //! hundreds of MB/s, and a 16 MiB chunk amortizes the per-chunk round trip;
-//! the session survives connection failures (a chunk is re-sent from the
-//! offset GCS confirms).
+//! the session survives connection failures and 5xx replies: the session
+//! status is queried and only the bytes GCS has not persisted are sent
+//! again (never data over persisted bytes).
 //!
 //! * Data from `write` is kept as the caller's `Bytes` and sent without
 //!   concatenating (`RequestBody::Chunks`, split at 256 KiB boundaries by
@@ -32,12 +33,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use fsfast_core::{Detail, Error, ErrorKind, Result, Value, WriteHandle, WriteMode, WriteOptions};
 use fsfast_engine::concurrency::AbortOnDrop;
+use fsfast_engine::retry::retry_with_stats;
 use fsfast_http_transport::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use fsfast_http_transport::{Method, Request, RequestBody, Response};
 use md5::Digest as _;
@@ -56,6 +59,9 @@ const FIXED_KEY_METADATA: &[(&str, &str)] = &[
     ("content_language", "contentLanguage"),
     ("custom_time", "customTime"),
 ];
+
+/// `fields` of upload responses: what `consistency` checks.
+const UPLOAD_FIELDS: &str = "name,size,md5Hash,crc32c,generation";
 
 /// gcsfs's `pipe_file` chunk for large in-memory uploads.
 const PIPE_CHUNK: usize = 50 << 20;
@@ -108,6 +114,11 @@ impl UploadMeta {
             q.push("ifGenerationMatch", "0");
         }
         q.opt("kmsKeyName", self.kms_key_name.as_deref());
+        if upload_type != "resumable" {
+            // Only what the consistency checks read, instead of the whole
+            // object resource.
+            q.push("fields", UPLOAD_FIELDS);
+        }
         q
     }
 
@@ -186,17 +197,18 @@ impl Hasher {
         match self.mode {
             Consistency::None => Ok(()),
             Consistency::Size => {
-                let got = obj
-                    .get("size")
-                    .and_then(|s| match s {
-                        Json::String(s) => s.parse::<u64>().ok(),
-                        Json::Number(n) => n.as_u64(),
-                        _ => None,
-                    });
+                let got = obj.get("size").and_then(|s| match s {
+                    Json::String(s) => s.parse::<u64>().ok(),
+                    Json::Number(n) => n.as_u64(),
+                    _ => None,
+                });
                 if got == Some(self.size) {
                     Ok(())
                 } else {
-                    fail(format!("Size mismatch: wrote {} bytes, GCS reports {got:?}", self.size))
+                    fail(format!(
+                        "Size mismatch: wrote {} bytes, GCS reports {got:?}",
+                        self.size
+                    ))
                 }
             }
             Consistency::Md5 => {
@@ -207,7 +219,10 @@ impl Hasher {
                 match obj.get("md5Hash").and_then(Json::as_str) {
                     Some(h) if h == want => Ok(()),
                     Some(h) => fail(format!("MD5 checksum failed: sent {want}, GCS reports {h}")),
-                    None => fail("MD5 checksum unavailable (GCS reports none, e.g. for composite objects)".into()),
+                    None => fail(
+                        "MD5 checksum unavailable (GCS reports none, e.g. for composite objects)"
+                            .into(),
+                    ),
                 }
             }
             Consistency::Crc32c => {
@@ -249,7 +264,9 @@ fn persisted(resp: &Response) -> Result<u64> {
             .and_then(|r| r.split_once('-'))
             .and_then(|(_, end)| end.trim().parse::<u64>().ok())
             .map(|e| e + 1)
-            .ok_or_else(|| Error::protocol(format!("invalid Range in a resumable upload reply: {r:?}"))),
+            .ok_or_else(|| {
+                Error::protocol(format!("invalid Range in a resumable upload reply: {r:?}"))
+            }),
     }
 }
 
@@ -258,7 +275,9 @@ fn take_front(pending: &mut VecDeque<Bytes>, pending_len: &mut usize, n: usize) 
     let mut out = Vec::new();
     let mut need = n;
     while need > 0 {
-        let Some(mut b) = pending.pop_front() else { break };
+        let Some(mut b) = pending.pop_front() else {
+            break;
+        };
         if b.len() > need {
             let rest = b.split_off(need);
             pending.push_front(rest);
@@ -288,7 +307,11 @@ fn skip_front(chunks: &[Bytes], skip: usize) -> Vec<Bytes> {
 impl GCSFileSystem {
     /// Parse write options into upload metadata. `default_type` is used
     /// when no content type is given.
-    pub(crate) fn upload_meta(&self, opts: &WriteOptions, default_type: impl FnOnce() -> String) -> Result<UploadMeta> {
+    pub(crate) fn upload_meta(
+        &self,
+        opts: &WriteOptions,
+        default_type: impl FnOnce() -> String,
+    ) -> Result<UploadMeta> {
         let mut meta = UploadMeta {
             content_type: String::new(),
             metadata: opts.metadata.clone(),
@@ -304,7 +327,8 @@ impl GCSFileSystem {
                 "fixed_key_metadata" => {
                     for (fk, fv) in string_map(v, "fixed_key_metadata")? {
                         // gcsfs accepts snake_case names only.
-                        if let Some((_, google)) = FIXED_KEY_METADATA.iter().find(|(s, _)| *s == fk) {
+                        if let Some((_, google)) = FIXED_KEY_METADATA.iter().find(|(s, _)| *s == fk)
+                        {
                             meta.fixed.insert((*google).to_owned(), fv);
                         }
                     }
@@ -354,7 +378,14 @@ impl GCSFileSystem {
 
     /// One-request upload (gcsfs `simple_upload`). Returns the object
     /// resource.
-    pub(crate) async fn simple_upload(&self, bucket: &str, key: &str, data: Vec<Bytes>, meta: &UploadMeta, path: &str) -> Result<Map<String, Json>> {
+    pub(crate) async fn simple_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: Vec<Bytes>,
+        meta: &UploadMeta,
+        path: &str,
+    ) -> Result<Map<String, Json>> {
         let c = &self.inner.client;
         let mut hasher = Hasher::new(meta.consistency);
         for d in &data {
@@ -374,15 +405,24 @@ impl GCSFileSystem {
             parts.push(Bytes::from(tail));
             let ctype = HeaderValue::try_from(format!("multipart/related; boundary={boundary}"))
                 .map_err(|_| Error::invalid_input("invalid multipart boundary"))?;
-            c.request(Method::POST, &c.upload_url(bucket), &meta.query("multipart", key))?
-                .header(CONTENT_TYPE, ctype)
-                .body(RequestBody::chunks(parts))
+            c.request(
+                Method::POST,
+                &c.upload_url(bucket),
+                &meta.query("multipart", key),
+            )?
+            .header(CONTENT_TYPE, ctype)
+            .body(RequestBody::chunks(parts))
         } else {
-            let ctype = HeaderValue::try_from(meta.content_type.as_str())
-                .map_err(|_| Error::invalid_input(format!("invalid content type {:?}", meta.content_type)))?;
-            c.request(Method::POST, &c.upload_url(bucket), &meta.query("media", key))?
-                .header(CONTENT_TYPE, ctype)
-                .body(RequestBody::chunks(data))
+            let ctype = HeaderValue::try_from(meta.content_type.as_str()).map_err(|_| {
+                Error::invalid_input(format!("invalid content type {:?}", meta.content_type))
+            })?;
+            c.request(
+                Method::POST,
+                &c.upload_url(bucket),
+                &meta.query("media", key),
+            )?
+            .header(CONTENT_TYPE, ctype)
+            .body(RequestBody::chunks(data))
         };
         // gcsfs retries uploads; resending the same object is harmless.
         let req = meta.kinds(req.retry_safe(true).path(path.to_owned()));
@@ -393,14 +433,29 @@ impl GCSFileSystem {
 
     /// Start a resumable upload session (gcsfs `initiate_upload`); returns
     /// the session URL.
-    pub(crate) async fn initiate_upload(&self, bucket: &str, key: &str, meta: &UploadMeta, path: &str) -> Result<String> {
+    pub(crate) async fn initiate_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        meta: &UploadMeta,
+        path: &str,
+    ) -> Result<String> {
         let c = &self.inner.client;
-        let body = serde_json::to_vec(&meta.resource(key)).map_err(|e| Error::protocol(e.to_string()))?;
-        let utype = HeaderValue::try_from(meta.content_type.as_str())
-            .map_err(|_| Error::invalid_input(format!("invalid content type {:?}", meta.content_type)))?;
+        let body =
+            serde_json::to_vec(&meta.resource(key)).map_err(|e| Error::protocol(e.to_string()))?;
+        let utype = HeaderValue::try_from(meta.content_type.as_str()).map_err(|_| {
+            Error::invalid_input(format!("invalid content type {:?}", meta.content_type))
+        })?;
         let req = c
-            .request(Method::POST, &c.upload_url(bucket), &meta.query("resumable", key))?
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json; charset=UTF-8"))
+            .request(
+                Method::POST,
+                &c.upload_url(bucket),
+                &meta.query("resumable", key),
+            )?
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=UTF-8"),
+            )
             .header(HeaderName::from_static("x-upload-content-type"), utype)
             .body(Bytes::from(body))
             .retry_safe(true)
@@ -410,7 +465,9 @@ impl GCSFileSystem {
             let loc = resp
                 .header_str("location")
                 .map(str::to_owned)
-                .ok_or_else(|| Error::protocol("resumable upload started without a Location header"))?;
+                .ok_or_else(|| {
+                    Error::protocol("resumable upload started without a Location header")
+                })?;
             // Drain the (small) body so the connection is reused.
             let _ = resp.bytes().await;
             Ok(loc)
@@ -419,7 +476,15 @@ impl GCSFileSystem {
     }
 
     /// Send `chunks` at `offset` to a session; `total` finalizes the upload.
-    async fn put_chunk(&self, session: &str, chunks: Vec<Bytes>, offset: u64, total: Option<u64>, meta: &UploadMeta, path: &str) -> Result<ChunkReply> {
+    async fn put_chunk(
+        &self,
+        session: &str,
+        chunks: Vec<Bytes>,
+        offset: u64,
+        total: Option<u64>,
+        meta: &UploadMeta,
+        path: &str,
+    ) -> Result<ChunkReply> {
         let c = &self.inner.client;
         let len: u64 = chunks.iter().map(|b| b.len() as u64).sum();
         let range = match (len, total) {
@@ -440,6 +505,9 @@ impl GCSFileSystem {
             // it from there).
             .header(CONTENT_TYPE, ctype)
             .body(RequestBody::chunks(chunks))
+            // `upload_span` owns the retries: after a failure it asks GCS
+            // what was persisted instead of re-sending blindly.
+            .retry_safe(false)
             .allow_status(308)
             .op(fsfast_engine::stats::OpKind::Write)
             .path(path.to_owned());
@@ -452,45 +520,151 @@ impl GCSFileSystem {
             } else {
                 let p = resp.path().to_owned();
                 let body = resp.bytes().await?;
-                Ok(ChunkReply::Done(parse_json_object(&body).map_err(|e| e.with_path(p))?))
+                Ok(ChunkReply::Done(
+                    parse_json_object(&body).map_err(|e| e.with_path(p))?,
+                ))
             }
         })
         .await
     }
 
     /// Upload `chunks` (bytes `offset..offset+len`) until GCS has them all,
-    /// re-sending any part it did not persist. With `total`, the last
-    /// request finalizes the object and its resource is returned.
-    async fn upload_span(&self, session: &str, chunks: Vec<Bytes>, offset: u64, total: Option<u64>, meta: &UploadMeta, path: &str) -> Result<Option<Map<String, Json>>> {
+    /// re-sending any part it did not persist. `total` is the object size
+    /// when known (sent in every `Content-Range`, as gcsfs does, so GCS can
+    /// check the upload against it); when these bytes end at `total`, the
+    /// upload is finalized and the object resource is returned.
+    async fn upload_span(
+        &self,
+        session: &str,
+        chunks: Vec<Bytes>,
+        offset: u64,
+        total: Option<u64>,
+        meta: &UploadMeta,
+        path: &str,
+    ) -> Result<Option<Map<String, Json>>> {
         let len: u64 = chunks.iter().map(|b| b.len() as u64).sum();
         let end = offset + len;
-        let mut chunks = chunks;
-        let mut pos = offset;
+        if total.is_some_and(|t| end > t) {
+            return Err(Error::invalid_input(format!(
+                "upload chunk ends at {end}, past the object size {total:?}"
+            ))
+            .with_path(path));
+        }
+        let finalizing = total == Some(end);
+        // Bytes GCS has confirmed (`offset` until a reply says more).
+        let pos = AtomicU64::new(offset);
+        let interrupted = AtomicBool::new(false);
+        // Data requests are never re-sent blindly by the transport: a request
+        // that failed may still have persisted part of its bytes, so after a
+        // transient failure the session status is queried first and only
+        // the bytes GCS does not have are sent again (GCS's documented
+        // resume procedure). The retries follow the client's policy.
+        let policy = self.inner.client.http.retry_policy().clone();
+        retry_with_stats(&policy, &self.inner.stats, || {
+            let chunks = &chunks;
+            let (pos, interrupted) = (&pos, &interrupted);
+            async move {
+                if interrupted.load(Ordering::Relaxed) {
+                    // `bytes */total` also finalizes an upload whose bytes
+                    // all arrived.
+                    match self
+                        .put_chunk(session, Vec::new(), end, total, meta, path)
+                        .await?
+                    {
+                        ChunkReply::Done(obj) if finalizing => return Ok(Some(obj)),
+                        ChunkReply::Done(_) => {
+                            return Err(Error::protocol("upload finished before its last chunk")
+                                .with_path(path));
+                        }
+                        ChunkReply::Incomplete(n) => {
+                            if n < pos.load(Ordering::Relaxed) || n > end {
+                                return Err(Error::protocol(format!(
+                                    "resumable upload reports {n} bytes persisted, outside {}..{end}",
+                                    pos.load(Ordering::Relaxed)
+                                ))
+                                .with_path(path));
+                            }
+                            tracing::debug!(
+                                persisted = n,
+                                sent_to = end,
+                                "resuming an interrupted upload"
+                            );
+                            pos.store(n, Ordering::Relaxed);
+                            if !finalizing && n == end {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+                interrupted.store(true, Ordering::Relaxed);
+                let r = self
+                    .send_span(session, chunks, offset, end, pos, total, meta, path)
+                    .await;
+                if r.is_ok() {
+                    interrupted.store(false, Ordering::Relaxed);
+                }
+                r
+            }
+        })
+        .await
+    }
+
+    /// Send bytes `pos..end` of `chunks` (which start at `offset`),
+    /// following short writes; `pos` is updated with what GCS confirms.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_span(
+        &self,
+        session: &str,
+        chunks: &[Bytes],
+        offset: u64,
+        end: u64,
+        pos: &AtomicU64,
+        total: Option<u64>,
+        meta: &UploadMeta,
+        path: &str,
+    ) -> Result<Option<Map<String, Json>>> {
+        let finalizing = total == Some(end);
         for _ in 0..16 {
-            match self.put_chunk(session, chunks.clone(), pos, total, meta, path).await? {
+            let from = pos.load(Ordering::Relaxed);
+            let rest = if from >= end {
+                Vec::new()
+            } else {
+                skip_front(chunks, (from - offset) as usize)
+            };
+            if rest.is_empty() && !finalizing {
+                return Ok(None);
+            }
+            match self
+                .put_chunk(session, rest, from, total, meta, path)
+                .await?
+            {
                 ChunkReply::Done(obj) => {
-                    if total.is_none() {
-                        return Err(Error::protocol("upload finished before its last chunk").with_path(path));
+                    if !finalizing {
+                        return Err(Error::protocol("upload finished before its last chunk")
+                            .with_path(path));
                     }
                     return Ok(Some(obj));
                 }
-                ChunkReply::Incomplete(n) if total.is_none() && n >= end => return Ok(None),
                 ChunkReply::Incomplete(n) => {
-                    if n < pos || n > end {
+                    if n < from || n > end {
                         return Err(Error::protocol(format!(
-                            "resumable upload persisted {n} bytes, outside the chunk {pos}..{end}"
+                            "resumable upload persisted {n} bytes, outside the chunk {from}..{end}"
                         ))
                         .with_path(path));
                     }
-                    if n == end && total.is_some() && len > 0 {
-                        // Everything persisted but not finalized: finalize.
-                        chunks = Vec::new();
-                        pos = end;
-                        continue;
+                    pos.store(n, Ordering::Relaxed);
+                    if n == end && !finalizing {
+                        return Ok(None);
                     }
-                    tracing::debug!(persisted = n, sent_to = end, "resumable upload short write; re-sending the rest");
-                    chunks = skip_front(&chunks, (n - pos) as usize);
-                    pos = n;
+                    if n < end {
+                        tracing::debug!(
+                            persisted = n,
+                            sent_to = end,
+                            "resumable upload short write; re-sending the rest"
+                        );
+                    }
+                    // n == end while finalizing: everything persisted but
+                    // not finalized; the next request (empty) finalizes.
                 }
             }
         }
@@ -510,7 +684,11 @@ impl GCSFileSystem {
         c.send_ok(req).await
     }
 
-    pub(crate) async fn open_write_impl(&self, path: &str, opts: &WriteOptions) -> Result<GcsWriteHandle> {
+    pub(crate) async fn open_write_impl(
+        &self,
+        path: &str,
+        opts: &WriteOptions,
+    ) -> Result<GcsWriteHandle> {
         let (bucket, key, name) = self.write_target(path)?;
         if opts.mode == WriteMode::Append {
             tracing::warn!(path = %name, "Append mode 'a' is not supported in GCS. Using overwrite mode instead.");
@@ -546,21 +724,31 @@ impl GCSFileSystem {
     pub(crate) fn write_target(&self, path: &str) -> Result<(String, String, String)> {
         let sp = split_path(path, self.inner.opts.version_aware);
         if sp.generation.is_some() {
-            return Err(Error::invalid_input("Cannot write to specific object generation"));
+            return Err(Error::invalid_input(
+                "Cannot write to specific object generation",
+            ));
         }
         if sp.bucket.is_empty() || sp.key.is_empty() {
-            return Err(Error::invalid_input(format!("Attempt to write to a bucket, not an object: {path:?}")));
+            return Err(Error::invalid_input(format!(
+                "Attempt to write to a bucket, not an object: {path:?}"
+            )));
         }
         let name = sp.full();
         check_object_name(&sp.key, &name)?;
         Ok((sp.bucket, sp.key, name))
     }
 
-    pub(crate) async fn pipe_file_impl(&self, path: &str, data: Bytes, opts: &WriteOptions) -> Result<()> {
+    pub(crate) async fn pipe_file_impl(
+        &self,
+        path: &str,
+        data: Bytes,
+        opts: &WriteOptions,
+    ) -> Result<()> {
         let (bucket, key, name) = self.write_target(path)?;
         let meta = self.upload_meta(opts, || "application/octet-stream".to_owned())?;
         if data.len() <= self.inner.opts.simple_upload_threshold {
-            self.simple_upload(&bucket, &key, vec![data], &meta, &name).await?;
+            self.simple_upload(&bucket, &key, vec![data], &meta, &name)
+                .await?;
             return Ok(());
         }
         let session = self.initiate_upload(&bucket, &key, &meta, &name).await?;
@@ -573,13 +761,20 @@ impl GCSFileSystem {
             let mut last = None;
             while off < data.len() {
                 let end = (off + chunk).min(data.len());
-                let fin = end == data.len();
                 last = self
-                    .upload_span(&session, vec![data.slice(off..end)], off as u64, fin.then_some(total), &meta, &name)
+                    .upload_span(
+                        &session,
+                        vec![data.slice(off..end)],
+                        off as u64,
+                        Some(total),
+                        &meta,
+                        &name,
+                    )
                     .await?;
                 off = end;
             }
-            let obj = last.ok_or_else(|| Error::protocol("upload did not finish").with_path(&name))?;
+            let obj =
+                last.ok_or_else(|| Error::protocol("upload did not finish").with_path(&name))?;
             hasher.validate(&obj, &name)
         }
         .await;
@@ -589,7 +784,12 @@ impl GCSFileSystem {
         res
     }
 
-    pub(crate) async fn put_file_impl(&self, local: &Path, remote: &str, opts: &WriteOptions) -> Result<()> {
+    pub(crate) async fn put_file_impl(
+        &self,
+        local: &Path,
+        remote: &str,
+        opts: &WriteOptions,
+    ) -> Result<()> {
         let md = tokio::fs::metadata(local)
             .await
             .map_err(|e| Error::from(e).with_path(local.display().to_string()))?;
@@ -613,7 +813,11 @@ impl GCSFileSystem {
             let ctype = HeaderValue::try_from(meta.content_type.as_str())
                 .map_err(|_| Error::invalid_input("invalid content type"))?;
             let req = c
-                .request(Method::POST, &c.upload_url(&bucket), &meta.query("media", &key))?
+                .request(
+                    Method::POST,
+                    &c.upload_url(&bucket),
+                    &meta.query("media", &key),
+                )?
                 .header(CONTENT_TYPE, ctype)
                 .body(RequestBody::File {
                     path: local.to_owned(),
@@ -628,6 +832,12 @@ impl GCSFileSystem {
         // read from disk while the previous one uploads.
         let mut w = self.open_write_impl(remote, opts).await?;
         w.meta = Arc::new(meta);
+        if opts.block_size.is_none() {
+            // gcsfs `_put_file` uploads 50 MiB chunks: fewer round trips per
+            // file (one file at a time, so the two chunks in memory are
+            // affordable; open files keep the smaller default).
+            w.chunk = round_chunk(PIPE_CHUNK.max(self.inner.opts.upload_chunk_size));
+        }
         let res = async {
             use tokio::io::AsyncReadExt;
             let mut f = tokio::fs::File::open(local).await?;
@@ -714,9 +924,15 @@ impl GcsWriteHandle {
     fn check_open(&self) -> Result<()> {
         match self.state {
             State::Open => Ok(()),
-            State::Closed => Err(Error::invalid_input("I/O operation on a closed file").with_path(&self.path)),
+            State::Closed => {
+                Err(Error::invalid_input("I/O operation on a closed file").with_path(&self.path))
+            }
             State::Aborted => Err(Error::invalid_input("write was aborted").with_path(&self.path)),
-            State::Failed => Err(Error::new(ErrorKind::Io, "an earlier part of this upload failed").with_path(&self.path)),
+            State::Failed => Err(Error::new(
+                ErrorKind::Io,
+                "an earlier part of this upload failed",
+            )
+            .with_path(&self.path)),
         }
     }
 
@@ -726,7 +942,8 @@ impl GcsWriteHandle {
         if let Some(t) = self.inflight.as_mut() {
             let r = t.await;
             self.inflight = None;
-            let r = r.map_err(|e| Error::new(ErrorKind::Other, format!("upload task failed: {e}")))?;
+            let r =
+                r.map_err(|e| Error::new(ErrorKind::Other, format!("upload task failed: {e}")))?;
             if r.is_err() {
                 self.state = State::Failed;
             }
@@ -763,7 +980,9 @@ impl GcsWriteHandle {
         let path = self.path.clone();
         self.inflight = Some(AbortOnDrop::spawn(async move {
             let _guard = guard;
-            fs.upload_span(&session, chunks, offset, None, &meta, &path).await.map(|_| ())
+            fs.upload_span(&session, chunks, offset, None, &meta, &path)
+                .await
+                .map(|_| ())
         }));
         Ok(())
     }
@@ -783,9 +1002,18 @@ impl GcsWriteHandle {
                 let total = self.offset + len;
                 let obj = self
                     .fs
-                    .upload_span(&session, rest, self.offset, Some(total), &self.meta, &self.path)
+                    .upload_span(
+                        &session,
+                        rest,
+                        self.offset,
+                        Some(total),
+                        &self.meta,
+                        &self.path,
+                    )
                     .await?
-                    .ok_or_else(|| Error::protocol("upload did not finish").with_path(&self.path))?;
+                    .ok_or_else(|| {
+                        Error::protocol("upload did not finish").with_path(&self.path)
+                    })?;
                 self.offset = total;
                 obj
             }
@@ -831,6 +1059,11 @@ impl WriteHandle for GcsWriteHandle {
             return Ok(());
         }
         self.check_open()?;
+        // `finish` takes the buffered tail before it awaits: if this future
+        // is cancelled half-way, those bytes are gone, so the upload must
+        // not be committable any more (a later `close` fails; `abort` or
+        // dropping the handle cancels the session).
+        self.state = State::Failed;
         match self.finish().await {
             Ok(()) => {
                 self.state = State::Closed;
@@ -891,12 +1124,20 @@ mod tests {
 
     #[test]
     fn take_and_skip() {
-        let mut q: VecDeque<Bytes> = vec![Bytes::from_static(b"abc"), Bytes::from_static(b"defgh"), Bytes::from_static(b"ij")].into();
+        let mut q: VecDeque<Bytes> = vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"defgh"),
+            Bytes::from_static(b"ij"),
+        ]
+        .into();
         let mut len = 10;
         let got = take_front(&mut q, &mut len, 4);
         assert_eq!(got.concat(), b"abcd");
         assert_eq!(len, 6);
-        assert_eq!(q.iter().map(|b| b.to_vec()).collect::<Vec<_>>().concat(), b"efghij");
+        assert_eq!(
+            q.iter().map(|b| b.to_vec()).collect::<Vec<_>>().concat(),
+            b"efghij"
+        );
         let got = take_front(&mut q, &mut len, 6);
         assert_eq!(got.concat(), b"efghij");
         assert_eq!(len, 0);
@@ -922,7 +1163,10 @@ mod tests {
         let mut h = Hasher::new(Consistency::Md5);
         h.update(b"hello world");
         let mut obj = Map::new();
-        obj.insert("md5Hash".into(), Json::String("XrY7u+Ae7tCTyyK7j1rNww==".into()));
+        obj.insert(
+            "md5Hash".into(),
+            Json::String("XrY7u+Ae7tCTyyK7j1rNww==".into()),
+        );
         assert!(h.clone().validate(&obj, "p").is_ok());
         assert!(h.validate(&Map::new(), "p").is_err());
 
@@ -933,7 +1177,11 @@ mod tests {
         assert!(h.clone().validate(&obj, "p").is_ok());
         obj.insert("size".into(), Json::String("12".into()));
         assert!(h.validate(&obj, "p").is_err());
-        assert!(Hasher::new(Consistency::None).validate(&Map::new(), "p").is_ok());
+        assert!(
+            Hasher::new(Consistency::None)
+                .validate(&Map::new(), "p")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -958,7 +1206,36 @@ mod tests {
         meta.kms_key_name = Some("projects/p/keys/k".into());
         assert_eq!(
             meta.query("media", "a b").as_str(),
-            "uploadType=media&name=a%20b&ifGenerationMatch=0&kmsKeyName=projects%2Fp%2Fkeys%2Fk"
+            "uploadType=media&name=a%20b&ifGenerationMatch=0&kmsKeyName=projects%2Fp%2Fkeys%2Fk&fields=name%2Csize%2Cmd5Hash%2Ccrc32c%2Cgeneration"
         );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Splitting the pending buffers at chunk boundaries (and skipping a
+        /// persisted prefix) never loses, duplicates or reorders bytes.
+        #[test]
+        fn chunking_preserves_bytes(
+            parts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..50), 0..12),
+            take in 0usize..400,
+            skip in 0usize..400,
+        ) {
+            let all: Vec<u8> = parts.concat();
+            let mut q: VecDeque<Bytes> = parts.into_iter().map(Bytes::from).collect();
+            let mut len = all.len();
+            let n = take.min(len);
+            let got = take_front(&mut q, &mut len, n);
+            prop_assert_eq!(got.concat(), &all[..n]);
+            prop_assert_eq!(len, all.len() - n);
+            let rest: Vec<u8> = q.iter().flat_map(|b| b.to_vec()).collect();
+            prop_assert_eq!(&rest[..], &all[n..]);
+            let s = skip.min(n);
+            prop_assert_eq!(skip_front(&got, s).concat(), &all[s..n]);
+        }
     }
 }

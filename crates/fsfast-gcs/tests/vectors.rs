@@ -65,7 +65,17 @@ fn signed_urls_match_google_cloud_storage() {
     let k = key();
     let now = UNIX_EPOCH + Duration::from_secs(v["iat"].as_u64().unwrap());
     let object = v["object"].as_str().unwrap();
-    let url = signed_url_v4(&k, "https://storage.googleapis.com", "GET", "bucket-1", object, None, 3600, now).unwrap();
+    let url = signed_url_v4(
+        &k,
+        "https://storage.googleapis.com",
+        "GET",
+        "bucket-1",
+        object,
+        None,
+        3600,
+        now,
+    )
+    .unwrap();
     assert_eq!(url, v["signed_url"].as_str().unwrap());
     let url = signed_url_v4(
         &k,
@@ -79,7 +89,19 @@ fn signed_urls_match_google_cloud_storage() {
     )
     .unwrap();
     assert_eq!(url, v["signed_url_gen"].as_str().unwrap());
-    assert!(signed_url_v4(&k, "https://storage.googleapis.com", "GET", "b", "o", None, 604_801, now).is_err());
+    assert!(
+        signed_url_v4(
+            &k,
+            "https://storage.googleapis.com",
+            "GET",
+            "b",
+            "o",
+            None,
+            604_801,
+            now
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -91,12 +113,22 @@ fn filesystem_signs_with_a_key_and_only_then() {
         token.insert(k.clone(), Value::from(val.as_str().unwrap()));
     }
     opts.insert("token".into(), Value::Map(token));
-    opts.insert("endpoint_url".into(), Value::from("https://storage.googleapis.com"));
-    let fs = GCSFileSystem::from_options_with_env(opts, GcsEnv::from_pairs([("NO_GCE_CHECK", "true")])).unwrap();
+    opts.insert(
+        "endpoint_url".into(),
+        Value::from("https://storage.googleapis.com"),
+    );
+    let fs =
+        GCSFileSystem::from_options_with_env(opts, GcsEnv::from_pairs([("NO_GCE_CHECK", "true")]))
+            .unwrap();
     assert!(fsfast_core::FileSystem::capabilities(&fs).signed_urls);
     let now = UNIX_EPOCH + Duration::from_secs(v["iat"].as_u64().unwrap());
     let url = fs
-        .sign_with(&format!("gs://bucket-1/{}", v["object"].as_str().unwrap()), "GET", Duration::from_secs(3600), now)
+        .sign_with(
+            &format!("gs://bucket-1/{}", v["object"].as_str().unwrap()),
+            "GET",
+            Duration::from_secs(3600),
+            now,
+        )
         .unwrap();
     assert_eq!(url, v["signed_url"].as_str().unwrap());
     assert_eq!(fs.auth_method(), "token");
@@ -105,6 +137,8 @@ fn filesystem_signs_with_a_key_and_only_then() {
     opts.insert("token".into(), Value::from("anon"));
     let anon = GCSFileSystem::from_options_with_env(opts, GcsEnv::default()).unwrap();
     assert!(!fsfast_core::FileSystem::capabilities(&anon).signed_urls);
-    let e = anon.sign_with("b/k", "GET", Duration::from_secs(1), now).unwrap_err();
+    let e = anon
+        .sign_with("b/k", "GET", Duration::from_secs(1), now)
+        .unwrap_err();
     assert_eq!(e.kind(), fsfast_core::ErrorKind::Unsupported);
 }

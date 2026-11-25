@@ -103,10 +103,7 @@ fn val(v: &Value) -> String {
         Value::Bool(b) => format!("b:{}", if *b { "True" } else { "False" }),
         Value::Int(i) => format!("i:{i}"),
         Value::Str(s) => format!("s:{s}"),
-        Value::Time(t) => format!(
-            "us:{}",
-            t.duration_since(UNIX_EPOCH).unwrap().as_micros()
-        ),
+        Value::Time(t) => format!("us:{}", t.duration_since(UNIX_EPOCH).unwrap().as_micros()),
         other => format!("?:{}", other.type_name()),
     }
 }
@@ -151,7 +148,11 @@ async fn tree(fs: &SftpFileSystem, root: &str) -> String {
         .await
         .unwrap();
     let mut out = Vec::new();
-    let mut names: Vec<String> = all.into_iter().map(|e| e.name).filter(|n| n != root).collect();
+    let mut names: Vec<String> = all
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| n != root)
+        .collect();
     names.sort();
     for n in names {
         let (t, sz) = match fs.info(&n).await {
@@ -184,7 +185,11 @@ async fn ours(fs: &SftpFileSystem, line: &str) -> String {
                     .map(|e| info_str(e, root))
                     .collect();
                 v.sort();
-                if v.is_empty() { "-".into() } else { v.join(" ") }
+                if v.is_empty() {
+                    "-".into()
+                } else {
+                    v.join(" ")
+                }
             }
             "lsn" => {
                 let mut v: Vec<String> = fs
@@ -194,7 +199,11 @@ async fn ours(fs: &SftpFileSystem, line: &str) -> String {
                     .map(|e| e.name.replacen(root, "<R>", 1))
                     .collect();
                 v.sort();
-                if v.is_empty() { "-".into() } else { v.join(" ") }
+                if v.is_empty() {
+                    "-".into()
+                } else {
+                    v.join(" ")
+                }
             }
             "find" => {
                 let maxdepth: usize = a[2].parse().unwrap();
@@ -210,9 +219,18 @@ async fn ours(fs: &SftpFileSystem, line: &str) -> String {
                     .into_iter()
                     .map(|e| e.name.replacen(root, "<R>", 1))
                     .collect();
-                if v.is_empty() { "-".into() } else { v.join(" ") }
+                if v.is_empty() {
+                    "-".into()
+                } else {
+                    v.join(" ")
+                }
             }
-            "exists" => if fs.exists(a[0]).await? { "True" } else { "False" }.into(),
+            "exists" => if fs.exists(a[0]).await? {
+                "True"
+            } else {
+                "False"
+            }
+            .into(),
             "isdir" => match fs.info(a[0]).await {
                 Ok(i) => if i.is_dir() { "True" } else { "False" }.into(),
                 Err(_) => "False".into(),
@@ -230,11 +248,17 @@ async fn ours(fs: &SftpFileSystem, line: &str) -> String {
             }
             "catr" => {
                 let (s, e) = (a[1].parse().unwrap(), a[2].parse().unwrap());
-                hex(&fs.cat_file(a[0], ByteRange::Bounded { start: s, end: e }).await?)
+                hex(&fs
+                    .cat_file(a[0], ByteRange::Bounded { start: s, end: e })
+                    .await?)
             }
             "pipe" => {
-                fs.pipe_file(a[0], Bytes::copy_from_slice(a[1].as_bytes()), &WriteOptions::default())
-                    .await?;
+                fs.pipe_file(
+                    a[0],
+                    Bytes::copy_from_slice(a[1].as_bytes()),
+                    &WriteOptions::default(),
+                )
+                .await?;
                 "ok".into()
             }
             "mkdir" => {
@@ -320,11 +344,36 @@ fn compare(lines: &[String], theirs: &[String], mine: &[String]) {
     assert_eq!(theirs.len(), lines.len(), "fsspec output: {theirs:#?}");
     let mut diffs = String::new();
     for ((l, t), m) in lines.iter().zip(theirs).zip(mine) {
-        if t != m {
+        if !equivalent(l, t, m) {
             let _ = writeln!(diffs, "op:     {l}\nfsspec: {t}\nfsfast: {m}\n");
         }
     }
     assert!(diffs.is_empty(), "differences:\n{diffs}");
+}
+
+/// `t` (fsspec) and `m` (fsfast) agree, modulo:
+///
+/// * access times (`time`): both sides read the same files at different
+///   moments, and every read or listing moves the atime, so only its
+///   presence and format are compared (`mtime` is compared exactly).
+///
+/// Error classes must match exactly (including `mkdir`/`makedirs` below a
+/// regular file and `rmdir` of a file: `FileNotFoundError` on both sides).
+fn equivalent(op: &str, t: &str, m: &str) -> bool {
+    fn mask_atime(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find(";time=us:") {
+            let (head, tail) = rest.split_at(i + ";time=us:".len());
+            out.push_str(head);
+            out.push('*');
+            rest = tail.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
+        }
+        out.push_str(rest);
+        out
+    }
+    let _ = op;
+    mask_atime(t) == mask_atime(m)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -338,7 +387,10 @@ async fn same_tree_same_answers() {
     for (name, data) in [
         ("a.txt", b"alpha".to_vec()),
         ("empty", vec![]),
-        ("big.bin", (0..300_000u32).map(|i| (i % 253) as u8).collect()),
+        (
+            "big.bin",
+            (0..300_000u32).map(|i| (i % 253) as u8).collect(),
+        ),
         ("dir/b.txt", b"bravo".to_vec()),
         ("dir/sub/c.txt", b"charlie".to_vec()),
         ("ünï cödé.txt", "名前".as_bytes().to_vec()),
@@ -365,8 +417,19 @@ async fn same_tree_same_answers() {
         lines.push(l);
     };
     for path in [
-        "a.txt", "empty", "big.bin", "dir", "dir/sub", "dir/b.txt", "emptydir", "link", "dirlink",
-        "dangling", "missing", "a.txt/x", "ünï cödé.txt",
+        "a.txt",
+        "empty",
+        "big.bin",
+        "dir",
+        "dir/sub",
+        "dir/b.txt",
+        "emptydir",
+        "link",
+        "dirlink",
+        "dangling",
+        "missing",
+        "a.txt/x",
+        "ünï cödé.txt",
     ] {
         let full = p(path);
         for op in ["info", "exists", "isdir", "isfile"] {
@@ -378,16 +441,37 @@ async fn same_tree_same_answers() {
         }
     }
     add("info", &[&root]);
-    for d in [root.as_str(), &p("dir"), &p("dir/sub"), &p("emptydir"), &p("dirlink"), &p("missing")] {
+    for d in [
+        root.as_str(),
+        &p("dir"),
+        &p("dir/sub"),
+        &p("emptydir"),
+        &p("dirlink"),
+        &p("missing"),
+    ] {
         add("ls", &[d]);
         add("lsn", &[d]);
     }
-    for (w, m) in [("0", "0"), ("1", "0"), ("0", "1"), ("1", "1"), ("1", "2"), ("0", "3")] {
+    for (w, m) in [
+        ("0", "0"),
+        ("1", "0"),
+        ("0", "1"),
+        ("1", "1"),
+        ("1", "2"),
+        ("0", "3"),
+    ] {
         add("find", &[&root, w, m]);
     }
     add("find", &[&p("a.txt"), "0", "0"]);
     add("find", &[&p("missing"), "1", "0"]);
-    for f in ["a.txt", "big.bin", "empty", "link", "dir/sub/c.txt", "ünï cödé.txt"] {
+    for f in [
+        "a.txt",
+        "big.bin",
+        "empty",
+        "link",
+        "dir/sub/c.txt",
+        "ünï cödé.txt",
+    ] {
         add("cat", &[&p(f)]);
     }
     add("cat", &[&p("missing")]);
@@ -442,6 +526,9 @@ async fn same_operations_same_results() {
         ("touch", &["@t"]),
         ("mkdir", &["@t", "0"]),
         ("mkdir", &["@t/sub", "1"]),
+        ("mkdir", &["@t/sub", "0"]),
+        ("makedirs", &["@t/sub/deeper", "1"]),
+        ("rmdir", &["@t"]),
         ("tree", &["@"]),
     ];
     let mut lines_a = Vec::new();

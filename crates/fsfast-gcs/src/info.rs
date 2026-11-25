@@ -93,7 +93,10 @@ pub fn parse_timestamp(s: &str) -> Option<SystemTime> {
     }
     let offset_secs: i64 = match &s[i..] {
         "Z" | "z" => 0,
-        tz if tz.len() == 6 && matches!(tz.as_bytes()[0], b'+' | b'-') && tz.as_bytes()[3] == b':' => {
+        tz if tz.len() == 6
+            && matches!(tz.as_bytes()[0], b'+' | b'-')
+            && tz.as_bytes()[3] == b':' =>
+        {
             let h: i64 = tz[1..3].parse().ok()?;
             let m: i64 = tz[4..6].parse().ok()?;
             let v = h * 3600 + m * 60;
@@ -151,16 +154,24 @@ pub fn object_info(bucket: &str, obj: Map<String, Json>) -> Result<FileInfo> {
     obj.remove("size");
     // gcsfs overwrites any `type` field with "file".
     obj.remove("type");
-    let updated = obj.get("updated").and_then(Json::as_str).and_then(parse_timestamp);
-    let created = obj.get("timeCreated").and_then(Json::as_str).and_then(parse_timestamp);
+    let updated = obj
+        .get("updated")
+        .and_then(Json::as_str)
+        .and_then(parse_timestamp);
+    let created = obj
+        .get("timeCreated")
+        .and_then(Json::as_str)
+        .and_then(parse_timestamp);
     let version = obj.get("generation").and_then(|g| match g {
         Json::String(s) => Some(s.clone()),
         Json::Number(n) => Some(n.to_string()),
         _ => None,
     });
     let has_gen = obj.contains_key("generation") || obj.contains_key("metageneration");
-    let mut extra: BTreeMap<String, Value> =
-        obj.into_iter().map(|(k, v)| (k, json_to_value(v))).collect();
+    let mut extra: BTreeMap<String, Value> = obj
+        .into_iter()
+        .map(|(k, v)| (k, json_to_value(v)))
+        .collect();
     if updated.is_some() {
         extra.insert("mtime".into(), Value::from(updated));
     } else if extra.contains_key("updated") {
@@ -219,9 +230,18 @@ pub fn bucket_info(name: String, res: Map<String, Json>) -> FileInfo {
     res.remove("name");
     res.remove("size");
     res.remove("type");
-    let updated = res.get("updated").and_then(Json::as_str).and_then(parse_timestamp);
-    let created = res.get("timeCreated").and_then(Json::as_str).and_then(parse_timestamp);
-    let version = res.get("metageneration").and_then(Json::as_str).map(str::to_owned);
+    let updated = res
+        .get("updated")
+        .and_then(Json::as_str)
+        .and_then(parse_timestamp);
+    let created = res
+        .get("timeCreated")
+        .and_then(Json::as_str)
+        .and_then(parse_timestamp);
+    let version = res
+        .get("metageneration")
+        .and_then(Json::as_str)
+        .map(str::to_owned);
     FileInfo {
         name,
         size: 0,
@@ -229,7 +249,10 @@ pub fn bucket_info(name: String, res: Map<String, Json>) -> FileInfo {
         modified: updated,
         created,
         version,
-        extra: res.into_iter().map(|(k, v)| (k, json_to_value(v))).collect(),
+        extra: res
+            .into_iter()
+            .map(|(k, v)| (k, json_to_value(v)))
+            .collect(),
     }
 }
 
@@ -247,17 +270,30 @@ mod tests {
         let t = parse_timestamp("1970-01-01T00:00:00Z").unwrap();
         assert_eq!(t, UNIX_EPOCH);
         let t = parse_timestamp("2026-11-24T19:16:54.8Z").unwrap();
-        assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().subsec_micros(), 800_000);
+        assert_eq!(
+            t.duration_since(UNIX_EPOCH).unwrap().subsec_micros(),
+            800_000
+        );
         // Nanoseconds are truncated to microseconds.
         let t = parse_timestamp("2026-11-24T19:16:54.123456789Z").unwrap();
-        assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().subsec_nanos(), 123_456_000);
+        assert_eq!(
+            t.duration_since(UNIX_EPOCH).unwrap().subsec_nanos(),
+            123_456_000
+        );
         let t = parse_timestamp("2000-03-01T01:00:00+01:00").unwrap();
         assert_eq!(t, parse_timestamp("2000-03-01T00:00:00Z").unwrap());
         assert_eq!(
             parse_timestamp("1969-12-31T23:59:59Z").unwrap(),
             UNIX_EPOCH - Duration::from_secs(1)
         );
-        for bad in ["", "2026-11-24", "2026-13-01T00:00:00Z", "2026-11-24T19:16:54", "x026-11-24T19:16:54Z", "2026-11-24T19:16:54.Z"] {
+        for bad in [
+            "",
+            "2026-11-24",
+            "2026-13-01T00:00:00Z",
+            "2026-11-24T19:16:54",
+            "x026-11-24T19:16:54Z",
+            "2026-11-24T19:16:54.Z",
+        ] {
             assert!(parse_timestamp(bad).is_none(), "{bad}");
         }
     }
@@ -296,12 +332,18 @@ mod tests {
         assert!(matches!(&i.extra["metadata"], Value::Map(m) if m["k"] == Value::from("v")));
         assert!(!i.extra.contains_key("name") && !i.extra.contains_key("size"));
         assert!(!is_directory_marker(&i));
-        let Json::Object(m) = json!({"name": "d/", "size": "0"}) else { unreachable!() };
+        let Json::Object(m) = json!({"name": "d/", "size": "0"}) else {
+            unreachable!()
+        };
         let marker = object_info("bkt", m).unwrap();
         assert!(is_directory_marker(&marker));
-        let Json::Object(m) = json!({"size": "1"}) else { unreachable!() };
+        let Json::Object(m) = json!({"size": "1"}) else {
+            unreachable!()
+        };
         assert!(object_info("b", m).is_err());
-        let Json::Object(m) = json!({"name": "x", "size": "nan"}) else { unreachable!() };
+        let Json::Object(m) = json!({"name": "x", "size": "nan"}) else {
+            unreachable!()
+        };
         assert!(object_info("b", m).is_err());
     }
 
@@ -310,7 +352,10 @@ mod tests {
         assert_eq!(json_to_value(json!(1)), Value::Int(1));
         assert_eq!(json_to_value(json!(u64::MAX)), Value::Int(i64::MAX));
         assert_eq!(json_to_value(json!(1.5)), Value::Float(1.5));
-        assert_eq!(json_to_value(json!([true, null])), Value::List(vec![Value::Bool(true), Value::Null]));
+        assert_eq!(
+            json_to_value(json!([true, null])),
+            Value::List(vec![Value::Bool(true), Value::Null])
+        );
     }
 
     #[test]
@@ -321,7 +366,10 @@ mod tests {
         let f = find_dir("b/x/y".into(), "x/y");
         assert_eq!(f.extra["Key"], Value::from("x/y"));
         assert_eq!(f.extra["Size"], Value::Int(0));
-        let Json::Object(m) = json!({"name": "b", "kind": "storage#bucket", "metageneration": "1"}) else { unreachable!() };
+        let Json::Object(m) = json!({"name": "b", "kind": "storage#bucket", "metageneration": "1"})
+        else {
+            unreachable!()
+        };
         let b = bucket_info("b/".into(), m);
         assert_eq!(b.name, "b/");
         assert!(b.is_dir());

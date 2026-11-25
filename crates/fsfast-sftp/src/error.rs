@@ -70,18 +70,30 @@ mod tests {
         assert_eq!(e.path(), Some("/x"));
         assert_eq!(sftp_code(&e), Some(2));
         assert_eq!(e.to_string(), "stat: No such file: '/x' (SFTP status 2)");
-        assert_eq!(kind_for(status::PERMISSION_DENIED), ErrorKind::PermissionDenied);
+        assert_eq!(
+            kind_for(status::PERMISSION_DENIED),
+            ErrorKind::PermissionDenied
+        );
         assert_eq!(kind_for(status::FAILURE), ErrorKind::Io);
         assert_eq!(kind_for(status::OP_UNSUPPORTED), ErrorKind::Unsupported);
-        assert_eq!(kind_for(status::CONNECTION_LOST), ErrorKind::ConnectionFailed);
-        assert_eq!(kind_for(status::DIR_NOT_EMPTY), ErrorKind::DirectoryNotEmpty);
+        assert_eq!(
+            kind_for(status::CONNECTION_LOST),
+            ErrorKind::ConnectionFailed
+        );
+        assert_eq!(
+            kind_for(status::DIR_NOT_EMPTY),
+            ErrorKind::DirectoryNotEmpty
+        );
         assert_eq!(kind_for(999), ErrorKind::Io);
         let empty = Status {
             code: status::FAILURE,
             message: String::new(),
             lang: String::new(),
         };
-        assert_eq!(status_error(&empty, "rmdir", None).message(), "rmdir: Failure");
+        assert_eq!(
+            status_error(&empty, "rmdir", None).message(),
+            "rmdir: Failure"
+        );
         assert_eq!(
             refine(e, ErrorKind::NotADirectory).kind(),
             ErrorKind::NotADirectory

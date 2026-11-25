@@ -74,7 +74,12 @@ pub struct Client {
 
 impl Client {
     /// A client for `location`.
-    pub fn new(http: HttpClient, location: String, creds: Arc<Credentials>, requester_pays: RequesterPays) -> Self {
+    pub fn new(
+        http: HttpClient,
+        location: String,
+        creds: Arc<Credentials>,
+        requester_pays: RequesterPays,
+    ) -> Self {
         Client {
             http,
             location,
@@ -90,7 +95,12 @@ impl Client {
 
     /// `{location}/storage/v1/b/{bucket}/o/{key}`.
     pub fn object_url(&self, bucket: &str, key: &str) -> String {
-        format!("{}/storage/v1/b/{}/o/{}", self.location, quote(bucket), quote(key))
+        format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.location,
+            quote(bucket),
+            quote(key)
+        )
     }
 
     /// `{location}/download/storage/v1/b/{bucket}/o/{key}` (media).
@@ -122,7 +132,8 @@ impl Client {
         } else {
             format!("{url}?{}", query.as_str())
         };
-        let parsed = Url::parse(&full).map_err(|e| Error::invalid_input(format!("invalid URL {full:?}: {e}")))?;
+        let parsed = Url::parse(&full)
+            .map_err(|e| Error::invalid_input(format!("invalid URL {full:?}: {e}")))?;
         Request::from_url(method, parsed)
     }
 
@@ -194,7 +205,10 @@ impl Client {
         match self.http.send_with(req, &f).await {
             Err(e) if e.http_status() == Some(401) => {
                 let resolved = self.creds.resolve(&self.http).await?;
-                let refreshable = resolved.tokens.as_ref().is_some_and(|t| t.invalidate(&used));
+                let refreshable = resolved
+                    .tokens
+                    .as_ref()
+                    .is_some_and(|t| t.invalidate(&used));
                 if !refreshable {
                     return Err(e);
                 }
@@ -210,7 +224,8 @@ impl Client {
     /// Send `req` and read (discard) the body, so the connection is
     /// reused.
     pub async fn send_ok(&self, req: Request) -> Result<()> {
-        self.execute(req, |r| async move { r.bytes().await.map(|_| ()) }).await
+        self.execute(req, |r| async move { r.bytes().await.map(|_| ()) })
+            .await
     }
 
     /// Send `req` and parse a JSON object from the body.
@@ -237,7 +252,10 @@ pub fn parse_json_object(body: &[u8]) -> Result<serde_json::Map<String, serde_js
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(serde_json::Value::Object(m)) => Ok(m),
         Ok(_) => Err(Error::protocol("expected a JSON object in the response")),
-        Err(e) => Err(Error::new(ErrorKind::Protocol, format!("invalid JSON response: {e}"))),
+        Err(e) => Err(Error::new(
+            ErrorKind::Protocol,
+            format!("invalid JSON response: {e}"),
+        )),
     }
 }
 

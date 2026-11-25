@@ -55,7 +55,10 @@ impl MetadataServer {
             .or_else(|| env.non_empty("GCE_METADATA_ROOT"))
             .unwrap_or(DEFAULT_HOST)
             .to_owned();
-        let ip = env.non_empty("GCE_METADATA_IP").unwrap_or(DEFAULT_IP).to_owned();
+        let ip = env
+            .non_empty("GCE_METADATA_IP")
+            .unwrap_or(DEFAULT_IP)
+            .to_owned();
         let timeout = env
             .non_empty("GCE_METADATA_TIMEOUT")
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -145,7 +148,8 @@ impl MetadataServer {
             };
             match self.client.send_once(&req).await {
                 Ok(resp) => {
-                    let ok = resp.status().as_u16() == 200 && resp.header_str("metadata-flavor") == Some(FLAVOR);
+                    let ok = resp.status().as_u16() == 200
+                        && resp.header_str("metadata-flavor") == Some(FLAVOR);
                     return ok;
                 }
                 Err(e) => {
@@ -206,6 +210,10 @@ impl MetadataServer {
 
     /// The project id of the instance.
     pub async fn project_id(&self) -> Result<String> {
-        Ok(self.get_text("project/project-id", None).await?.trim().to_owned())
+        Ok(self
+            .get_text("project/project-id", None)
+            .await?
+            .trim()
+            .to_owned())
     }
 }

@@ -16,7 +16,9 @@
 //!   types) is handled by the policy: `auto_add` (fsspec's default) accepts
 //!   it and remembers it for the rest of the process, so a later connection
 //!   presenting another key is rejected; `warning` logs a warning and
-//!   accepts it without remembering; `reject` refuses it.
+//!   accepts it without remembering; `reject` refuses it, even when an
+//!   `auto_add` filesystem of the same process accepted it before (only the
+//!   known-hosts files vouch for a key under `reject`).
 //!
 //! Nothing is ever written to a known-hosts file (paramiko's AutoAddPolicy
 //! does not save either). Host names are matched case-insensitively; hashed
@@ -390,10 +392,15 @@ impl HostKeyVerifier {
         }
         let mut learned = LEARNED.lock();
         if let Some(keys) = learned.get(&name) {
+            // A key learned by `auto_add` was never verified, so it does not
+            // make the key "known" for `reject` (which, like a fresh
+            // paramiko client with RejectPolicy, only trusts the known-hosts
+            // files); it still pins the host against a different key.
             if keys.iter().any(|k| same_key(k, key)) {
-                return Ok(());
-            }
-            if keys.iter().any(|k| same_key_type(k, key)) {
+                if self.policy != HostKeyPolicy::Reject {
+                    return Ok(());
+                }
+            } else if keys.iter().any(|k| same_key_type(k, key)) {
                 return reject(
                     "HostKeyMismatch",
                     format!(
@@ -486,7 +493,10 @@ mod tests {
         assert_eq!(kh.check("EXAMPLE.com", 22, &key(K1)), HostKeyMatch::Known);
         assert_eq!(kh.check("10.0.0.1", 22, &key(K1)), HostKeyMatch::Known);
         // Port 2222 entries do not match port 22 and vice versa.
-        assert_eq!(kh.check("example.com", 2222, &key(K1)), HostKeyMatch::Unknown);
+        assert_eq!(
+            kh.check("example.com", 2222, &key(K1)),
+            HostKeyMatch::Unknown
+        );
         assert_eq!(kh.check("127.0.0.1", 2222, &key(K1)), HostKeyMatch::Known);
         assert_eq!(kh.check("127.0.0.1", 22, &key(K1)), HostKeyMatch::Unknown);
         assert_eq!(kh.check("alt.example", 2222, &key(K2)), HostKeyMatch::Known);
@@ -544,11 +554,21 @@ mod tests {
         unknown(HostKeyPolicy::Warning).verify(&key(K2)).unwrap();
         unknown(HostKeyPolicy::Warning).verify(&key(K1)).unwrap();
         // ...auto_add remembers: a later different key of the same type is
-        // rejected even under auto_add, and even under reject the learned
-        // key is now known.
+        // rejected even under auto_add. A key learned (unverified) by
+        // auto_add must not satisfy `reject`, which trusts only the
+        // known-hosts files.
         unknown(HostKeyPolicy::AutoAdd).verify(&key(K2)).unwrap();
-        unknown(HostKeyPolicy::Reject).verify(&key(K2)).unwrap();
-        let e = unknown(HostKeyPolicy::AutoAdd).verify(&key(K1)).unwrap_err();
+        unknown(HostKeyPolicy::AutoAdd).verify(&key(K2)).unwrap();
+        unknown(HostKeyPolicy::Warning).verify(&key(K2)).unwrap();
+        let e = unknown(HostKeyPolicy::Reject).verify(&key(K2)).unwrap_err();
+        assert!(e.to_string().contains("HostKeyUnknown"), "{e}");
+        let e = unknown(HostKeyPolicy::Warning)
+            .verify(&key(K1))
+            .unwrap_err();
+        assert!(e.to_string().contains("HostKeyMismatch"), "{e}");
+        let e = unknown(HostKeyPolicy::AutoAdd)
+            .verify(&key(K1))
+            .unwrap_err();
         assert!(e.to_string().contains("earlier in this process"), "{e}");
         assert_eq!(
             unknown(HostKeyPolicy::Reject).preferred_algorithms(),
@@ -559,8 +579,14 @@ mod tests {
 
     #[test]
     fn policy_names() {
-        assert_eq!(HostKeyPolicy::parse("auto_add"), Some(HostKeyPolicy::AutoAdd));
-        assert_eq!(HostKeyPolicy::parse("RejectPolicy"), Some(HostKeyPolicy::Reject));
+        assert_eq!(
+            HostKeyPolicy::parse("auto_add"),
+            Some(HostKeyPolicy::AutoAdd)
+        );
+        assert_eq!(
+            HostKeyPolicy::parse("RejectPolicy"),
+            Some(HostKeyPolicy::Reject)
+        );
         assert_eq!(HostKeyPolicy::parse("nope"), None);
         assert_eq!(HostKeyPolicy::Warning.as_str(), "warning");
         assert_eq!(lookup_name("H", 22), "h");

@@ -512,6 +512,47 @@
  },
  {
   "kind": "sign",
+  "name": "metadata-tagging",
+  "method": "PUT",
+  "url": "http://127.0.0.1:9000/bucket/m%20%C3%BC",
+  "region": "ap-southeast-2",
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "headers": [
+   [
+    "x-amz-meta-Mixed-Case",
+    "a\tb   c\t"
+   ],
+   [
+    "x-amz-tagging",
+    "k%201=v%2B1&k2="
+   ],
+   [
+    "x-amz-meta-empty",
+    ""
+   ],
+   [
+    "Content-Type",
+    "text/plain; charset=utf-8"
+   ],
+   [
+    "Cache-Control",
+    "no-cache,  no-store"
+   ],
+   [
+    "x-amz-storage-class",
+    "STANDARD_IA"
+   ]
+  ],
+  "body_hex": "64617461",
+  "payload": "sha256",
+  "canonical_request": "PUT\n/bucket/m%20%C3%BC\n\ncache-control:no-cache, no-store\ncontent-type:text/plain; charset=utf-8\nhost:127.0.0.1:9000\nx-amz-content-sha256:3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7\nx-amz-date:20261124T123456Z\nx-amz-meta-empty:\nx-amz-meta-mixed-case:a b c\nx-amz-security-token:IQoJb3JpZ2luX2VjEXAMPLE//+/token==\nx-amz-storage-class:STANDARD_IA\nx-amz-tagging:k%201=v%2B1&k2=\n\ncache-control;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-empty;x-amz-meta-mixed-case;x-amz-security-token;x-amz-storage-class;x-amz-tagging\n3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+  "string_to_sign": "AWS4-HMAC-SHA256\n20261124T123456Z\n20261124/ap-southeast-2/s3/aws4_request\n7c1a1b545ecd92d53642a35efa94480b1104d2afd93b132d56d05b795a372424",
+  "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261124/ap-southeast-2/s3/aws4_request, SignedHeaders=cache-control;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-empty;x-amz-meta-mixed-case;x-amz-security-token;x-amz-storage-class;x-amz-tagging, Signature=fb29a7076b83464dc3b79b34f5761817a4631159a756571f6bfa54cc46236dc2",
+  "x_amz_date": "20261124T123456Z",
+  "x_amz_content_sha256": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"
+ },
+ {
+  "kind": "sign",
   "name": "ipv6-host",
   "method": "GET",
   "url": "http://[::1]:9000/bucket/k",
@@ -1575,5 +1616,769 @@
     "a91c8600f06606ba75e90ab552168c2c4a28e82cd06823b81a80ede272df0ee9"
    ]
   ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-0",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "simple.txt",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/simple.txt",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "60d9b3b72be997eb5b24cdcb8ee5a9080e38e3103bc899dca6ac4c8001700a56"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-1",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "a b.txt",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/a%20b.txt",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "5aea967dc9ea9b25d9b59c311e676116a629352014a0962934c9a6bc74ca9222"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-2",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "dir/sub dir/file name.csv",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/dir/sub%20dir/file%20name.csv",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "e09141717574551b0747c5580a09e0a5708be57205af58b339bc4b44945fdfaf"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-3",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "unicode/ünïcödé/файл.txt",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/unicode/%C3%BCn%C3%AFc%C3%B6d%C3%A9/%D1%84%D0%B0%D0%B9%D0%BB.txt",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "09b67ee1dadf9dcaa107dbe38490633d9e2e94cc0b5c699c48998bc1ec4816c2"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-4",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "emoji😀/x",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/emoji%F0%9F%98%80/x",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "2d5ef7b55228d4470d5f8af41fc823b89072c60a115ab3208d1ed1bd345fd1f7"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-5",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "plus+equals=amp&semi;comma,",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/plus%2Bequals%3Damp%26semi%3Bcomma%2C",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "401e847c749da6dfeb0091f54467af0636619567c887ef0b4f32bbf70e2e2959"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-6",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "tilde~under_score-dash.dot",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/tilde~under_score-dash.dot",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "9705a34e7ee93b9912cb91ea5f25e663e5bdf5bd78604517a19cad62c30e8608"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-7",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "100%done %41",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/100%25done%20%2541",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "6fc1f14783fd7d8be3ea5fb24b2ef8c6c837fac431f09a86add16e2ba5a12667"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-8",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "double//slash",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/double//slash",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "5139fd80ea370f83d5ea695115f9d47cbcb371a1d3e7b75b61af30d5db360d8d"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-9",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "trailing/",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/trailing/",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "e7cb000f4fb76891c565f418f8016876fe785d99cf5804da0a39555b52fac82c"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-10",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "/leading",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket//leading",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "2fdb90dfd0e514becaa87aecf707e965aa88dcc60226c44c18e3593c0554933a"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-11",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "q?hash#pct%",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/q%3Fhash%23pct%25",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "95e9165b09ec4aa0ca8863b3f426cdd1df216db8bf7c6c47f407163e0cd4946f"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-12",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "star*paren()quote'dq\"bang!dollar$at@colon:",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/star%2Aparen%28%29quote%27dq%22bang%21dollar%24at%40colon%3A",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "e721227ed6f63817429e6bae6f2814fd0f0bfa9a7a3466ccd7c007a4815b5e0e"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-13",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "back\\slash^caret`tick{brace}|pipe<lt>gt[br]",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/back%5Cslash%5Ecaret%60tick%7Bbrace%7D%7Cpipe%3Clt%3Egt%5Bbr%5D",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "122c9330a7afab09d18d533991d5cacb8b2089f96ce0eb055e58952bd82f65ec"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-14",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "  spaces  ",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/%20%20spaces%20%20",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "87c7f5f7c887884a4ec69573cd436a72d5ad1c6b5de846619efff356249c3af1"
+   ]
+  ]
+ },
+ {
+  "kind": "presign",
+  "name": "presign-key-15",
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "eu-west-1",
+  "addressing": "auto",
+  "bucket": "bucket",
+  "key": "tab\tnew",
+  "expires": 604800,
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "version_id": null,
+  "scheme": "http",
+  "netloc": "127.0.0.1:9000",
+  "path": "/bucket/tab%09new",
+  "query": [
+   [
+    "X-Amz-Algorithm",
+    "AWS4-HMAC-SHA256"
+   ],
+   [
+    "X-Amz-Credential",
+    "AKIDEXAMPLE%2F20261124%2Feu-west-1%2Fs3%2Faws4_request"
+   ],
+   [
+    "X-Amz-Date",
+    "20261124T123456Z"
+   ],
+   [
+    "X-Amz-Expires",
+    "604800"
+   ],
+   [
+    "X-Amz-SignedHeaders",
+    "host"
+   ],
+   [
+    "X-Amz-Security-Token",
+    "IQoJb3JpZ2luX2VjEXAMPLE%2F%2F%2B%2Ftoken%3D%3D"
+   ],
+   [
+    "X-Amz-Signature",
+    "d78641d18eb0c387ad52dec922b9658ddfa5f48bec3c89b533ffd8eb68fbcdb5"
+   ]
+  ]
+ },
+ {
+  "kind": "sign",
+  "service": "sts",
+  "name": "sts-assume-role",
+  "method": "POST",
+  "url": "https://sts.eu-west-1.amazonaws.com/",
+  "region": "eu-west-1",
+  "token": "IQoJb3JpZ2luX2VjEXAMPLE//+/token==",
+  "headers": [
+   [
+    "Content-Type",
+    "application/x-www-form-urlencoded; charset=utf-8"
+   ]
+  ],
+  "body_hex": "416374696f6e3d417373756d65526f6c652656657273696f6e3d323031312d30362d313526526f6c6541726e3d61726e25334161777325334169616d253341253341313233343536373839303132253341726f6c65253246722532427826526f6c6553657373696f6e4e616d653d732534306d6525323073657373696f6e",
+  "payload": "sha256",
+  "canonical_request": "POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.eu-west-1.amazonaws.com\nx-amz-date:20261124T123456Z\nx-amz-security-token:IQoJb3JpZ2luX2VjEXAMPLE//+/token==\n\ncontent-type;host;x-amz-date;x-amz-security-token\n863db53ac9175a2c7ffaab00c475614f80f1ea7b0ecedaa5a1e15640ab7d0f98",
+  "string_to_sign": "AWS4-HMAC-SHA256\n20261124T123456Z\n20261124/eu-west-1/sts/aws4_request\ncdcdb87536db30dc2b1afe7846da469a6c7641da775d1ecce845d62162f4bc57",
+  "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261124/eu-west-1/sts/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=7a5d3f1bea5e2334f46d91cedb432b1efeaf7fa42da5c1178aad8b7bbf8def1f",
+  "x_amz_date": "20261124T123456Z",
+  "x_amz_content_sha256": null
+ },
+ {
+  "kind": "sign",
+  "service": "sts",
+  "name": "sts-assume-role-global",
+  "method": "POST",
+  "url": "https://sts.amazonaws.com/",
+  "region": "us-east-1",
+  "token": null,
+  "headers": [
+   [
+    "Content-Type",
+    "application/x-www-form-urlencoded; charset=utf-8"
+   ]
+  ],
+  "body_hex": "416374696f6e3d417373756d65526f6c652656657273696f6e3d323031312d30362d313526526f6c6541726e3d61726e25334161777325334169616d253341253341313233343536373839303132253341726f6c65253246722532427826526f6c6553657373696f6e4e616d653d732534306d6525323073657373696f6e",
+  "payload": "sha256",
+  "canonical_request": "POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:20261124T123456Z\n\ncontent-type;host;x-amz-date\n863db53ac9175a2c7ffaab00c475614f80f1ea7b0ecedaa5a1e15640ab7d0f98",
+  "string_to_sign": "AWS4-HMAC-SHA256\n20261124T123456Z\n20261124/us-east-1/sts/aws4_request\n341ac74cf7f501034b2e1a0ec54eafc79d540e00dc762d4731e72bf591a49dca",
+  "authorization": "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261124/us-east-1/sts/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=9669f7765ab1625496e85e83140b158cd3d826ed18bbee971240ec854fdc5976",
+  "x_amz_date": "20261124T123456Z",
+  "x_amz_content_sha256": null
  }
 ]

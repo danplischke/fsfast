@@ -112,8 +112,11 @@ fn main() {
         mib / get_file.as_secs_f64() * 1.048576
     );
 
+    // `FSFAST_BENCH_ONLY=large`: stop after the large-object workloads.
+    let large_only = std::env::var("FSFAST_BENCH_ONLY").is_ok_and(|v| v == "large");
+
     // 2. 1000 small objects: cat and info.
-    let n = 1000;
+    let n = if large_only { 0 } else { 1000 };
     let small: Vec<String> = (0..n).map(|i| format!("{bucket}/small/{i:05}")).collect();
     let payload = Bytes::from(vec![42u8; 4096]);
     rt.block_on(async {
@@ -164,7 +167,7 @@ fn main() {
     }
 
     // 3. rm of 5000 keys.
-    let m = 5000;
+    let m = if large_only { 0 } else { 5000 };
     let doomed: Vec<String> = (0..m).map(|i| format!("{bucket}/rm/{i:05}")).collect();
     let mut rm_times = Vec::new();
     for _ in 0..repeats {

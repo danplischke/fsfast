@@ -169,7 +169,9 @@ impl<H: Handler> Session<'_, H> {
             .handle
             .authenticate_publickey(self.p.user.clone(), k)
             .await
-            .map_err(|e| map_ssh_error(e, &format!("public key authentication to {}", self.desc)))?;
+            .map_err(|e| {
+                map_ssh_error(e, &format!("public key authentication to {}", self.desc))
+            })?;
         Ok(self.outcome(r, label))
     }
 
@@ -187,7 +189,8 @@ impl<H: Handler> Session<'_, H> {
         let ids = match agent.request_identities().await {
             Ok(ids) => ids,
             Err(e) => {
-                self.attempts.note(format!("ssh-agent: listing keys failed: {e}"));
+                self.attempts
+                    .note(format!("ssh-agent: listing keys failed: {e}"));
                 return Ok(Step::Continue);
             }
         };
@@ -228,7 +231,9 @@ impl<H: Handler> Session<'_, H> {
                         return Ok(Step::Done);
                     }
                 }
-                Err(e) => self.attempts.note(format!("{label}: agent failed to sign: {e}")),
+                Err(e) => self
+                    .attempts
+                    .note(format!("{label}: agent failed to sign: {e}")),
             }
         }
         Ok(Step::Continue)
@@ -240,7 +245,9 @@ impl<H: Handler> Session<'_, H> {
                 .handle
                 .authenticate_password(self.p.user.clone(), pw.expose().to_owned())
                 .await
-                .map_err(|e| map_ssh_error(e, &format!("password authentication to {}", self.desc)))?;
+                .map_err(|e| {
+                    map_ssh_error(e, &format!("password authentication to {}", self.desc))
+                })?;
             return Ok(self.outcome(r, "password"));
         }
         if !self.allows(MethodKind::KeyboardInteractive) {

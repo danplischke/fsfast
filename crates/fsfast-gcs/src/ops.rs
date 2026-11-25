@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use fsfast_core::{Error, ErrorKind, Result, WriteMode, WriteOptions};
-use fsfast_http_transport::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use fsfast_http_transport::Method;
+use fsfast_http_transport::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use futures::{StreamExt, stream};
 use serde_json::{Value as Json, json};
 
@@ -32,7 +32,14 @@ fn random_token() -> String {
     let mut b = [0u8; 16];
     let _ = aws_lc_rs::rand::fill(&mut b);
     let h = hex::encode(b);
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }
 
 impl GCSFileSystem {
@@ -141,13 +148,17 @@ impl GCSFileSystem {
         let s = split_path(src, va);
         let d = split_path(dst, va);
         if d.generation.is_some() {
-            return Err(Error::invalid_input("Cannot write to specific object generation"));
+            return Err(Error::invalid_input(
+                "Cannot write to specific object generation",
+            ));
         }
         if s.key.is_empty() {
             return Err(Error::is_a_directory(s.bucket));
         }
         if d.key.is_empty() {
-            return Err(Error::invalid_input(format!("cannot copy {src:?} onto a bucket ({dst:?})")));
+            return Err(Error::invalid_input(format!(
+                "cannot copy {src:?} onto a bucket ({dst:?})"
+            )));
         }
         check_object_name(&s.key, &s.full())?;
         check_object_name(&d.key, &d.full())?;
@@ -162,7 +173,9 @@ impl GCSFileSystem {
         loop {
             let q = Query::new()
                 .with_opt("rewriteToken", token.as_deref())
-                .with_opt("sourceGeneration", s.generation.as_deref());
+                .with_opt("sourceGeneration", s.generation.as_deref())
+                // The response would carry the whole destination resource.
+                .with("fields", "done,rewriteToken");
             let req = c
                 .request(Method::POST, &url, &q)?
                 .header(CONTENT_TYPE, app_json())
@@ -175,7 +188,12 @@ impl GCSFileSystem {
             }
             match out.get("rewriteToken").and_then(Json::as_str) {
                 Some(t) if !t.is_empty() => token = Some(t.to_owned()),
-                _ => return Err(Error::protocol("rewrite is not done but returned no rewriteToken").with_path(s.full())),
+                _ => {
+                    return Err(Error::protocol(
+                        "rewrite is not done but returned no rewriteToken",
+                    )
+                    .with_path(s.full()));
+                }
             }
         }
     }
@@ -190,7 +208,9 @@ impl GCSFileSystem {
         let s = split_path(src, va);
         let d = split_path(dst, va);
         if d.generation.is_some() {
-            return Err(Error::invalid_input("Cannot move to specific object generation"));
+            return Err(Error::invalid_input(
+                "Cannot move to specific object generation",
+            ));
         }
         if s.full() == d.full() && s.generation.is_none() {
             return Ok(());
@@ -209,11 +229,15 @@ impl GCSFileSystem {
                 crate::path::quote(&d.key)
             );
             let q = Query::new().with_opt("sourceGeneration", s.generation.as_deref());
-            let token = HeaderValue::try_from(random_token()).map_err(|_| Error::invalid_input("token"))?;
+            let token =
+                HeaderValue::try_from(random_token()).map_err(|_| Error::invalid_input("token"))?;
             let req = c
                 .request(Method::POST, &url, &q)?
                 .header(CONTENT_TYPE, app_json())
-                .header(HeaderName::from_static("x-goog-gcs-idempotency-token"), token)
+                .header(
+                    HeaderName::from_static("x-goog-gcs-idempotency-token"),
+                    token,
+                )
                 // The idempotency token makes retries safe.
                 .retry_safe(true)
                 .op(fsfast_engine::stats::OpKind::Copy)
@@ -240,7 +264,9 @@ impl GCSFileSystem {
     /// settable modification time).
     pub(crate) async fn touch_impl(&self, path: &str, truncate: bool) -> Result<()> {
         if truncate {
-            return self.pipe_file_impl(path, Bytes::new(), &WriteOptions::default()).await;
+            return self
+                .pipe_file_impl(path, Bytes::new(), &WriteOptions::default())
+                .await;
         }
         let opts = WriteOptions::default().with_mode(WriteMode::CreateNew);
         match self.pipe_file_impl(path, Bytes::new(), &opts).await {
@@ -278,7 +304,7 @@ impl GCSFileSystem {
         let c = &self.inner.client;
         let url = format!("{}/compose", c.object_url(&bucket, &key));
         let req = c
-            .request(Method::POST, &url, &Query::new())?
+            .request(Method::POST, &url, &Query::new().with("fields", "name"))?
             .header(CONTENT_TYPE, app_json())
             .body(json_body(&body))
             .retry_safe(true)

@@ -49,6 +49,8 @@ pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
+    /// Wait this long before answering.
+    pub delay: Option<std::time::Duration>,
 }
 
 impl Reply {
@@ -57,6 +59,7 @@ impl Reply {
             status,
             headers: Vec::new(),
             body: Bytes::new(),
+            delay: None,
         }
     }
 
@@ -68,6 +71,11 @@ impl Reply {
 
     pub fn header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.to_owned(), v.to_owned()));
+        self
+    }
+
+    pub fn delay(mut self, d: std::time::Duration) -> Self {
+        self.delay = Some(d);
         self
     }
 
@@ -111,7 +119,9 @@ impl Mock {
             let log = l2.clone();
             async move {
                 let (parts, body) = req.into_parts();
-                let body = axum::body::to_bytes(body, 1 << 30).await.unwrap_or_default();
+                let body = axum::body::to_bytes(body, 1 << 30)
+                    .await
+                    .unwrap_or_default();
                 let seen = Seen {
                     method: parts.method.to_string(),
                     path: parts.uri.path().to_owned(),
@@ -121,8 +131,11 @@ impl Mock {
                 };
                 let reply = handler(&seen);
                 log.lock().push(seen);
-                let mut resp = Response::builder()
-                    .status(StatusCode::from_u16(reply.status).unwrap());
+                if let Some(d) = reply.delay {
+                    tokio::time::sleep(d).await;
+                }
+                let mut resp =
+                    Response::builder().status(StatusCode::from_u16(reply.status).unwrap());
                 for (k, v) in &reply.headers {
                     resp = resp.header(k.as_str(), v.as_str());
                 }

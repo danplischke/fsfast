@@ -45,7 +45,14 @@ pub(crate) struct ListArgs<'a> {
     pub versions: bool,
     /// Stop after this many entries (items + prefixes).
     pub limit: Option<usize>,
+    /// A JSON API `fields` selection, for listings that only need to know
+    /// what exists (the full resources are ~1 KiB per object).
+    pub fields: Option<&'a str>,
 }
+
+/// `fields` of existence probes: names and sizes (enough to tell a
+/// directory marker from an object) and the prefixes.
+const PROBE_FIELDS: &str = "items(name,size),prefixes,nextPageToken";
 
 fn parse_page(bucket: &str, mut m: Map<String, Json>) -> Result<Page> {
     let mut page = Page::default();
@@ -88,7 +95,8 @@ impl GCSFileSystem {
         q.opt("delimiter", args.delimiter.filter(|d| !d.is_empty()))
             .opt("prefix", args.prefix.filter(|p| !p.is_empty()))
             .push("maxResults", &max_results.to_string())
-            .opt("pageToken", token);
+            .opt("pageToken", token)
+            .opt("fields", args.fields);
         if args.versions {
             q.push("versions", "true");
         }
@@ -102,7 +110,11 @@ impl GCSFileSystem {
     }
 
     /// Every page of a listing (or up to `args.limit` entries).
-    pub(crate) async fn list_all(&self, bucket: &str, args: &ListArgs<'_>) -> Result<(Vec<FileInfo>, Vec<String>)> {
+    pub(crate) async fn list_all(
+        &self,
+        bucket: &str,
+        args: &ListArgs<'_>,
+    ) -> Result<(Vec<FileInfo>, Vec<String>)> {
         let mut items = Vec::new();
         let mut prefixes = Vec::new();
         let mut token: Option<String> = None;
@@ -126,8 +138,18 @@ impl GCSFileSystem {
 
     /// `GET b/{bucket}/o/{key}` (gcsfs `_get_object`), falling back to a
     /// listing when the GET is forbidden.
-    pub(crate) async fn get_object(&self, bucket: &str, key: &str, generation: Option<&str>) -> Result<FileInfo> {
+    pub(crate) async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation: Option<&str>,
+    ) -> Result<FileInfo> {
         let name = format!("{bucket}/{key}");
+        if key.is_empty() {
+            // gcsfs `_get_object`: a bucket root is not an object (and
+            // `GET b/{bucket}/o/` would be a listing).
+            return Err(Error::not_found(bucket.to_owned()));
+        }
         check_object_name(key, &name)?;
         let c = &self.inner.client;
         let q = Query::new().with_opt("generation", generation);
@@ -201,20 +223,29 @@ impl GCSFileSystem {
     /// gcsfs `_get_directory_info`: one entry of the delimited listing of
     /// `key/`.
     async fn dir_probe(&self, bucket: &str, key: &str, name: &str) -> Result<DirProbe> {
-        let prefix = format!("{}/", key.trim_end_matches('/'));
+        // gcsfs `_do_list_objects`: the bucket root lists everything.
+        let prefix = if key.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", key.trim_end_matches('/'))
+        };
         let args = ListArgs {
             prefix: Some(&prefix),
             delimiter: Some("/"),
+            fields: Some(PROBE_FIELDS),
             ..ListArgs::default()
         };
         let page = self.list_page(bucket, &args, 1, None).await?;
-        if let Some(exact) = page
+        if page
             .items
             .iter()
-            .find(|i| i.name.trim_end_matches('/') == name)
-            .filter(|i| !is_directory_marker(i))
+            .any(|i| i.name.trim_end_matches('/') == name && !is_directory_marker(i))
         {
-            return Ok(DirProbe::Exact(exact.clone()));
+            // A non-empty object named `key/` (rare): gcsfs reports it, with
+            // its full resource, which the probe did not ask for.
+            return Ok(DirProbe::Exact(
+                self.get_object(bucket, &prefix, None).await?,
+            ));
         }
         if page.items.is_empty() && page.prefixes.is_empty() {
             Ok(DirProbe::Empty)
@@ -239,6 +270,7 @@ impl GCSFileSystem {
                 let args = ListArgs {
                     limit: Some(1),
                     delimiter: Some("/"),
+                    fields: Some(PROBE_FIELDS),
                     ..ListArgs::default()
                 };
                 let (items, prefixes) = self.list_all(bucket, &args).await?;
@@ -270,7 +302,11 @@ impl GCSFileSystem {
             if let Some(Json::Array(items)) = m.remove("items") {
                 for it in items {
                     if let Json::Object(o) = it {
-                        let name = o.get("name").and_then(Json::as_str).unwrap_or_default().to_owned();
+                        let name = o
+                            .get("name")
+                            .and_then(Json::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
                         out.push(bucket_info(format!("{name}/"), o));
                     }
                 }
@@ -318,7 +354,10 @@ impl GCSFileSystem {
         let mut out = Vec::with_capacity(items.len() + prefixes.len());
         let mut dir_names = BTreeSet::new();
         let dirs = prefixes.iter().map(|pre| {
-            pseudo_dir(&sp.bucket, format!("{}/{}", sp.bucket, pre.trim_matches('/')))
+            pseudo_dir(
+                &sp.bucket,
+                format!("{}/{}", sp.bucket, pre.trim_matches('/')),
+            )
         });
         for entry in dirs.chain(items) {
             let entry = if is_directory_marker(&entry) {
@@ -426,10 +465,14 @@ mod tests {
         assert_eq!(p.items[0].name, "bk/a/b");
         assert_eq!(p.prefixes, vec!["a/c/"]);
         assert_eq!(p.next.as_deref(), Some("tok"));
-        let Json::Object(m) = json!({"kind": "storage#objects"}) else { unreachable!() };
+        let Json::Object(m) = json!({"kind": "storage#objects"}) else {
+            unreachable!()
+        };
         let p = parse_page("bk", m).unwrap();
         assert!(p.items.is_empty() && p.prefixes.is_empty() && p.next.is_none());
-        let Json::Object(m) = json!({"items": [1]}) else { unreachable!() };
+        let Json::Object(m) = json!({"items": [1]}) else {
+            unreachable!()
+        };
         assert!(parse_page("bk", m).is_err());
     }
 }

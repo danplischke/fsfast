@@ -42,7 +42,7 @@ pub struct Lease {
 }
 
 impl Lease {
-    fn new(session: Session) -> Self {
+    pub(crate) fn new(session: Session) -> Self {
         session.acquire();
         Lease { session }
     }
@@ -226,6 +226,7 @@ impl PoolInner {
                 read_chunk: self.cfg.read_chunk_size,
                 write_chunk: self.cfg.write_chunk_size,
                 request_timeout: self.cfg.request_timeout,
+                handshake_timeout: Some(t.channel_timeout),
             },
             label,
             Some(keep),

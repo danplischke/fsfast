@@ -204,20 +204,27 @@ impl Shared {
         Ok(id)
     }
 
+    /// Close the server handle carried by a reply nobody will consume.
+    fn close_orphan(&self, reply: RawReply) {
+        if reply.ty == fxp::HANDLE
+            && let Ok(Reply::Handle(h)) = Reply::decode(reply.ty, reply.body)
+        {
+            tracing::debug!("closing a handle whose OPEN was abandoned");
+            let _ = self.submit(&Request::Close { handle: h }, Waiter::Ignore);
+        }
+    }
+
     fn dispatch(&self, id: u32, reply: RawReply) {
         let w = self.pending.lock().remove(&id);
         match w {
             Some(Waiter::Active(tx)) => {
-                let _ = tx.send(Ok(reply));
-            }
-            Some(Waiter::CloseHandle) => {
-                if reply.ty == fxp::HANDLE
-                    && let Ok(Reply::Handle(h)) = Reply::decode(reply.ty, reply.body)
-                {
-                    tracing::debug!("closing a handle whose OPEN was abandoned");
-                    let _ = self.submit(&Request::Close { handle: h }, Waiter::Ignore);
+                // The requester may have gone away between our removing the
+                // slot and this send: an orphaned HANDLE must still be closed.
+                if let Err(Ok(reply)) = tx.send(Ok(reply)) {
+                    self.close_orphan(reply);
                 }
             }
+            Some(Waiter::CloseHandle) => self.close_orphan(reply),
             Some(Waiter::Ignore) => {}
             None => tracing::trace!("reply for abandoned request {id}"),
         }
@@ -257,12 +264,62 @@ impl Drop for PendingCall {
             return;
         }
         let mut p = self.shared.pending.lock();
-        if self.close_on_drop {
-            if let Some(w) = p.get_mut(&self.id) {
-                *w = Waiter::CloseHandle;
-            }
-        } else {
+        if !self.close_on_drop {
             p.remove(&self.id);
+            return;
+        }
+        if let Some(w) = p.get_mut(&self.id) {
+            *w = Waiter::CloseHandle;
+            return;
+        }
+        drop(p);
+        // The reader already took the slot: the reply is either in our
+        // receiver (delivered, never polled) or about to be sent, in which
+        // case closing the receiver makes the send fail and the reader closes
+        // the handle itself (see `Shared::dispatch`).
+        self.rx.close();
+        if let Ok(Ok(reply)) = self.rx.try_recv() {
+            self.shared.close_orphan(reply);
+        }
+    }
+}
+
+/// Owns an open server handle inside an operation: if the operation's
+/// future is dropped (cancelled) before it closes the handle, the guard
+/// sends `SSH_FXP_CLOSE` (without waiting), so cancellation cannot leak
+/// server handles.
+pub(crate) struct HandleGuard<'a> {
+    session: &'a Session,
+    handle: Option<Bytes>,
+}
+
+impl<'a> HandleGuard<'a> {
+    pub(crate) fn new(session: &'a Session, handle: Bytes) -> Self {
+        HandleGuard {
+            session,
+            handle: Some(handle),
+        }
+    }
+
+    /// The guarded handle.
+    pub(crate) fn handle(&self) -> &Bytes {
+        self.handle
+            .as_ref()
+            .expect("guard holds a handle until disarmed")
+    }
+
+    /// Take the handle back; the caller is responsible for closing it.
+    pub(crate) fn disarm(mut self) -> Bytes {
+        self.handle
+            .take()
+            .expect("guard holds a handle until disarmed")
+    }
+}
+
+impl Drop for HandleGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            self.session.close_nowait(h);
         }
     }
 }
@@ -319,6 +376,10 @@ pub struct SessionOptions {
     pub write_chunk: Option<usize>,
     /// Per-request timeout.
     pub request_timeout: Option<Duration>,
+    /// Bound on the SFTP handshake (`INIT`/`VERSION` and the
+    /// `limits@openssh.com` query), so a server that accepts the subsystem
+    /// but never answers cannot hang the connection attempt.
+    pub handshake_timeout: Option<Duration>,
 }
 
 struct Inner {
@@ -463,6 +524,22 @@ impl Session {
     /// Run the SFTP handshake on a fresh channel and start the I/O tasks.
     /// `keepalive` is stored to keep the underlying SSH connection open.
     pub async fn start<T: PacketTx, R: PacketRx>(
+        tx: T,
+        rx: R,
+        opts: SessionOptions,
+        label: String,
+        keepalive: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Session> {
+        let fut = Self::start_inner(tx, rx, opts, label, keepalive);
+        match opts.handshake_timeout {
+            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+                Error::timeout(format!("the SFTP handshake did not complete within {d:?}"))
+            })?,
+            None => fut.await,
+        }
+    }
+
+    async fn start_inner<T: PacketTx, R: PacketRx>(
         mut tx: T,
         mut rx: R,
         opts: SessionOptions,
@@ -536,7 +613,11 @@ impl Session {
             }),
         };
         let limits = if ext.limits {
-            match session.call(Request::Extended(ExtRequest::Limits)).await?.decode()? {
+            match session
+                .call(Request::Extended(ExtRequest::Limits))
+                .await?
+                .decode()?
+            {
                 Reply::ExtendedReply(b) => Some(Limits::decode(b)?),
                 Reply::Status(s) => {
                     tracing::debug!("limits@openssh.com failed: {}", s.message);
@@ -669,14 +750,26 @@ impl Session {
 
     /// `SSH_FXP_STAT`.
     pub async fn stat(&self, path: &str) -> Result<FileAttributes> {
-        self.attrs_call(Request::Stat { path: bytes_of(path) }, "stat", path)
-            .await
+        self.attrs_call(
+            Request::Stat {
+                path: bytes_of(path),
+            },
+            "stat",
+            path,
+        )
+        .await
     }
 
     /// `SSH_FXP_LSTAT`.
     pub async fn lstat(&self, path: &str) -> Result<FileAttributes> {
-        self.attrs_call(Request::Lstat { path: bytes_of(path) }, "lstat", path)
-            .await
+        self.attrs_call(
+            Request::Lstat {
+                path: bytes_of(path),
+            },
+            "lstat",
+            path,
+        )
+        .await
     }
 
     /// `SSH_FXP_FSTAT`.
@@ -733,7 +826,11 @@ impl Session {
 
     /// `SSH_FXP_REMOVE`.
     pub async fn remove(&self, path: &str) -> Result<()> {
-        let r = self.call(Request::Remove { path: bytes_of(path) }).await?;
+        let r = self
+            .call(Request::Remove {
+                path: bytes_of(path),
+            })
+            .await?;
         expect_status(r, "remove", Some(path))
     }
 
@@ -750,7 +847,11 @@ impl Session {
 
     /// `SSH_FXP_RMDIR`.
     pub async fn rmdir(&self, path: &str) -> Result<()> {
-        let r = self.call(Request::Rmdir { path: bytes_of(path) }).await?;
+        let r = self
+            .call(Request::Rmdir {
+                path: bytes_of(path),
+            })
+            .await?;
         expect_status(r, "rmdir", Some(path))
     }
 
@@ -808,13 +909,21 @@ impl Session {
 
     /// `SSH_FXP_REALPATH`.
     pub async fn realpath(&self, path: &str) -> Result<String> {
-        let r = self.call(Request::Realpath { path: bytes_of(path) }).await?;
+        let r = self
+            .call(Request::Realpath {
+                path: bytes_of(path),
+            })
+            .await?;
         single_name(r, "realpath", path)
     }
 
     /// `SSH_FXP_READLINK`.
     pub async fn readlink(&self, path: &str) -> Result<String> {
-        let r = self.call(Request::Readlink { path: bytes_of(path) }).await?;
+        let r = self
+            .call(Request::Readlink {
+                path: bytes_of(path),
+            })
+            .await?;
         single_name(r, "readlink", path)
     }
 
@@ -992,7 +1101,9 @@ pub fn readdir_reply(r: RawReply, path: &str) -> Result<Option<Vec<NameEntry>>> 
 
 fn single_name(r: RawReply, op: &str, path: &str) -> Result<String> {
     match r.decode()? {
-        Reply::Name(v) if !v.is_empty() => Ok(v.into_iter().next().map(|e| e.filename).unwrap_or_default()),
+        Reply::Name(v) if !v.is_empty() => {
+            Ok(v.into_iter().next().map(|e| e.filename).unwrap_or_default())
+        }
         Reply::Name(_) => Err(Error::protocol(format!("{op}: empty NAME reply"))),
         Reply::Status(s) => Err(status_error(&s, op, Some(path))),
         other => Err(unexpected(op, &other)),
@@ -1125,7 +1236,8 @@ mod tests {
                 max_write_len: 261_120,
                 max_open_handles: 64,
             };
-            stx.send(Reply::ExtendedReply(l.encode()).encode(id)).unwrap();
+            stx.send(Reply::ExtendedReply(l.encode()).encode(id))
+                .unwrap();
             // Three STATs answered in reverse order, in one chunk.
             let mut ids = Vec::new();
             for _ in 0..3 {
@@ -1190,14 +1302,22 @@ mod tests {
             .unwrap();
         assert_eq!(s.read_chunk(), FALLBACK_IO_SIZE);
         let calls: Vec<_> = (0..50)
-            .map(|i| s.start_call(&Request::Stat { path: bytes_of(&format!("/p{i}")) }).unwrap())
+            .map(|i| {
+                s.start_call(&Request::Stat {
+                    path: bytes_of(&format!("/p{i}")),
+                })
+                .unwrap()
+            })
             .collect();
         for c in calls {
             let e = attrs_reply(c.await.unwrap(), "stat", "/p").unwrap_err();
             assert_eq!(e.kind(), ErrorKind::NotFound);
         }
         let chunks = chunks_rx.recv().await.unwrap();
-        assert!(chunks < 50, "50 small requests took {chunks} channel messages");
+        assert!(
+            chunks < 50,
+            "50 small requests took {chunks} channel messages"
+        );
         server.await.unwrap();
     }
 
@@ -1252,6 +1372,55 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// An OPEN whose HANDLE reply was already delivered to the pending call,
+    /// but which is dropped before anyone polled it (a cancelled future),
+    /// must still close the server handle.
+    #[tokio::test]
+    async fn dropped_unpolled_open_with_delivered_handle_is_closed() {
+        let (tx, rx, srx, stx) = pair();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<Request>();
+        let server = tokio::spawn(async move {
+            let mut rr = handshake(srx, &stx, &[]).await;
+            let (id, r) = Request::decode(rr.next().await.unwrap()).unwrap();
+            assert!(matches!(r, Request::Open { .. }));
+            stx.send(Reply::Handle(Bytes::from_static(b"H2")).encode(id))
+                .unwrap();
+            if let Some(p) = rr.next().await {
+                let (_, r) = Request::decode(p).unwrap();
+                seen_tx.send(r).unwrap();
+            }
+        });
+        let s = Session::start(tx, rx, SessionOptions::default(), "t".into(), None)
+            .await
+            .unwrap();
+        let call = s
+            .start_call(&Request::Open {
+                path: bytes_of("/f"),
+                pflags: proto::open_flags::READ,
+                attrs: FileAttributes::default(),
+            })
+            .unwrap();
+        // Wait until the reader delivered the reply into the call's slot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while s.in_flight() > 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(call);
+        let close = tokio::time::timeout(Duration::from_secs(5), seen_rx.recv())
+            .await
+            .expect("the handle of the dropped OPEN was never closed")
+            .unwrap();
+        assert_eq!(
+            close,
+            Request::Close {
+                handle: Bytes::from_static(b"H2")
+            }
+        );
+        drop(s);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn request_timeout_and_old_version() {
         let (tx, rx, srx, stx) = pair();
@@ -1264,10 +1433,16 @@ mod tests {
             request_timeout: Some(Duration::from_millis(30)),
             ..Default::default()
         };
-        let s = Session::start(tx, rx, opts, "t".into(), None).await.unwrap();
+        let s = Session::start(tx, rx, opts, "t".into(), None)
+            .await
+            .unwrap();
         let e = s.stat("/slow").await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Timeout);
-        assert_eq!(s.in_flight(), 0, "a timed-out request must not leak its slot");
+        assert_eq!(
+            s.in_flight(),
+            0,
+            "a timed-out request must not leak its slot"
+        );
         server.abort();
 
         let (tx, rx, mut srx, stx) = pair();
@@ -1284,6 +1459,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn silent_server_handshake_times_out() {
+        // VERSION never comes.
+        let (tx, rx, srx, stx) = pair();
+        let opts = SessionOptions {
+            handshake_timeout: Some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let e = Session::start(tx, rx, opts, "t".into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        // VERSION offers limits@, but the LIMITS query is never answered.
+        let (tx, rx, srx2, stx2) = pair();
+        let server = tokio::spawn(async move {
+            let mut rr = handshake(srx2, &stx2, &[ext::LIMITS]).await;
+            let _ = rr.next().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let e = Session::start(tx, rx, opts, "t".into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        server.abort();
+        drop((srx, stx));
     }
 
     #[test]

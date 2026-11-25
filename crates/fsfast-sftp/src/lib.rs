@@ -78,14 +78,17 @@
 //!   contract requires; fsspec echoes the path as given.
 //! * `ls` of a file returns `[info(file)]` (the fsfast contract and fsspec's
 //!   generic behaviour) instead of raising `FileNotFoundError`.
-//! * Errors are more precise where OpenSSH's codes are vague: `rmdir` of a
-//!   non-empty directory raises `OSError(ENOTEMPTY)` (fsspec: `OSError`
-//!   "Failure"), of a file `NotADirectoryError` (fsspec:
-//!   `FileNotFoundError`); `rm_file` of a directory and reading a
-//!   directory raise `IsADirectoryError` (fsspec: `OSError` "Failure");
-//!   `open(..., "xb")` of an existing file raises `FileExistsError`;
-//!   `makedirs(file, exist_ok=True)` raises `FileExistsError` (fsspec
-//!   silently returns).
+//! * Errors are more precise where OpenSSH's codes are vague, always as a
+//!   subclass of the exception fsspec raises: `rmdir` of a non-empty
+//!   directory raises `OSError(ENOTEMPTY)` (fsspec: `OSError` "Failure");
+//!   `rm_file` of a directory and reading a directory raise
+//!   `IsADirectoryError` (fsspec: `OSError` "Failure");
+//!   `open(..., "xb")` of an existing file raises `FileExistsError`
+//!   (fsspec: `OSError`). Where OpenSSH reports ENOTDIR (`rmdir` of a file,
+//!   `mkdir`/`makedirs` below a regular file) the kind stays fsspec's
+//!   `FileNotFoundError` and the message names the component that is not a
+//!   directory. `makedirs(file, exist_ok=True)` raises `FileExistsError`
+//!   (the fsfast core contract; fsspec silently returns).
 //! * `cp_file` works (server-side with `copy-data`, else streamed); fsspec
 //!   raises `NotImplementedError`. `touch(path, truncate=False)` of an
 //!   existing file updates its times (fsspec: `NotImplementedError`).

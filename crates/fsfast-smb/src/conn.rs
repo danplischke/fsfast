@@ -767,9 +767,12 @@ impl Shared {
         let mid = u64::from_le_bytes(p[24..32].try_into().unwrap());
         let credits = u16_at(14);
         let mut pending = self.pending.lock();
-        let ok = pending
-            .get(&mid)
-            .is_some_and(|e| e.encrypted && e.dest.as_ref().is_some_and(|d| d.len() >= data_len));
+        // Only for a caller that is still waiting: it authenticates the
+        // frame. An abandoned READ's frame takes the regular path, where the
+        // reader decrypts (and so authenticates) it.
+        let ok = pending.get(&mid).is_some_and(|e| {
+            e.encrypted && e.tx.is_some() && e.dest.as_ref().is_some_and(|d| d.len() >= data_len)
+        });
         if !ok {
             return Some(frame);
         }
@@ -1049,15 +1052,35 @@ impl Response {
         Ok(())
     }
 
+    /// The response must belong to the session the request was sent on.
+    ///
+    /// The SessionId of the *response* is unauthenticated: deciding from it
+    /// whether a signature is needed (as in "SessionId 0: no session, no
+    /// signature") would let a man in the middle strip signatures by zeroing
+    /// it. The decision follows the request's session instead, and a
+    /// response for another session is a protocol violation.
+    fn check_session_id(&self, h: &Header) -> Result<()> {
+        let Some(s) = &self.session else {
+            return Ok(());
+        };
+        if s.session_id == 0 || h.session_id == s.session_id {
+            return Ok(());
+        }
+        let why = format!(
+            "{:?} response for session {:#x} to a request of session {:#x}",
+            h.command, h.session_id, s.session_id
+        );
+        self.shared.fail(&why);
+        Err(Error::protocol(format!("SMB {why}")).with_retryable(false))
+    }
+
     /// Verify a READ response received in two parts (header + data).
     fn verify_parts(&self, head: &RawMessage, data: &[u8]) -> Result<()> {
         let Some(s) = &self.session else {
             return Ok(());
         };
         let h = head.header();
-        if h.session_id == 0 {
-            return Ok(());
-        }
+        self.check_session_id(h)?;
         if h.is_signed() {
             if let Some(signer) = &s.signer {
                 let ok = signer
@@ -1097,9 +1120,7 @@ impl Response {
             return Ok(());
         };
         let h = m.header();
-        if h.session_id == 0 {
-            return Ok(());
-        }
+        self.check_session_id(h)?;
         if h.is_signed() {
             if let Some(signer) = &s.signer
                 && let Err(e) = signer.verify(m.bytes())

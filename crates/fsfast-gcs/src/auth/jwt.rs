@@ -63,7 +63,8 @@ impl ServiceAccountKey {
                 "Service account info was not in the expected format, missing fields {k}."
             ))
         };
-        let client_email = str_field(info, "client_email").ok_or_else(|| missing("client_email"))?;
+        let client_email =
+            str_field(info, "client_email").ok_or_else(|| missing("client_email"))?;
         let token_uri = str_field(info, "token_uri").ok_or_else(|| missing("token_uri"))?;
         let pem = str_field(info, "private_key").ok_or_else(|| missing("private_key"))?;
         let key = parse_private_key(pem)?;
@@ -121,7 +122,8 @@ impl ServiceAccountKey {
 /// Parse a PEM private key: PKCS#8 (`BEGIN PRIVATE KEY`, what Google issues)
 /// or PKCS#1 (`BEGIN RSA PRIVATE KEY`).
 pub fn parse_private_key(pem: &str) -> Result<RsaKeyPair> {
-    let bad = |why: &str| Error::invalid_input(format!("invalid service account private key: {why}"));
+    let bad =
+        |why: &str| Error::invalid_input(format!("invalid service account private key: {why}"));
     let (label, body) = pem_body(pem).ok_or_else(|| bad("no PEM block found"))?;
     let der: Zeroizing<Vec<u8>> = Zeroizing::new(
         base64::engine::general_purpose::STANDARD
@@ -186,7 +188,11 @@ pub fn form_urlencode(pairs: &[(&str, &str)]) -> String {
         .remove(b'_')
         .remove(b'~')
         .remove(b' ');
-    let enc = |s: &str| percent_encoding::utf8_percent_encode(s, FORM).to_string().replace(' ', "+");
+    let enc = |s: &str| {
+        percent_encoding::utf8_percent_encode(s, FORM)
+            .to_string()
+            .replace(' ', "+")
+    };
     pairs
         .iter()
         .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
@@ -217,10 +223,17 @@ mod tests {
     fn pem_parsing() {
         assert!(pem_body("nothing").is_none());
         let (label, body) =
-            pem_body("x\n-----BEGIN PRIVATE KEY-----\nAAAA\nBBBB\n-----END PRIVATE KEY-----\n").unwrap();
+            pem_body("x\n-----BEGIN PRIVATE KEY-----\nAAAA\nBBBB\n-----END PRIVATE KEY-----\n")
+                .unwrap();
         assert_eq!(label, "PRIVATE KEY");
         assert_eq!(body.as_str(), "AAAABBBB");
-        assert!(parse_private_key("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----").is_err());
-        assert!(parse_private_key("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----").is_err());
+        assert!(
+            parse_private_key("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----")
+                .is_err()
+        );
+        assert!(
+            parse_private_key("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----")
+                .is_err()
+        );
     }
 }

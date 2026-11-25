@@ -26,7 +26,9 @@
 //! against GCS's CRC32C, default true), plus the HTTP client options of
 //! `HttpConfig::apply_fsfast_options` (`connect_timeout`, `read_timeout`,
 //! `total_timeout`, `max_retries`, `limit_per_host`, `http2`, `ca_bundle`,
-//! `user_agent`, `rotate_dns`).
+//! `user_agent`, `rotate_dns`) and `retry_base_delay` (seconds; backoff cap
+//! before the first retry, doubling up to 32 s; default 2, which matches
+//! gcsfs's ~33 s of retrying).
 
 use std::time::Duration;
 
@@ -141,12 +143,14 @@ pub fn round_chunk(n: usize) -> usize {
     (n / CHUNK_GRANULARITY * CHUNK_GRANULARITY).clamp(CHUNK_GRANULARITY, MAX_CHUNK)
 }
 
-/// The HTTP defaults for GCS: gcsfs makes 6 attempts with exponential
-/// backoff capped at 32 s.
+/// The HTTP defaults for GCS: gcsfs makes 6 attempts, sleeping
+/// `min(2**(n-1) + random(), 32)` s before retry `n` (about 33 s in all,
+/// enough to ride out a short GCS outage). Full-jitter backoff with a 2 s
+/// base gives the same expected total (caps 2, 4, 8, 16, 32 s).
 pub fn gcs_http_defaults() -> HttpConfig {
     HttpConfig {
         max_retries: 5,
-        retry_base_delay: Duration::from_millis(500),
+        retry_base_delay: Duration::from_secs(2),
         retry_max_delay: Duration::from_secs(32),
         ..HttpConfig::default()
     }
@@ -176,7 +180,9 @@ impl GcsOptions {
         };
         // `project=None` passed explicitly also arrives as absent; gcsfs
         // warns that buckets cannot be listed or created then.
-        let access = r.string("access")?.unwrap_or_else(|| "full_control".to_owned());
+        let access = r
+            .string("access")?
+            .unwrap_or_else(|| "full_control".to_owned());
         crate::auth::scope_for_access(&access)?;
         let token = TokenSpec::from_value(r.value("token"))?;
         let block_size = r.usize("block_size")?;
@@ -227,6 +233,9 @@ impl GcsOptions {
                 .map_err(|e| Error::invalid_input(format!("session_kwargs: {}", e.message())))?;
         }
         http.apply_fsfast_options(&mut r)?;
+        if let Some(d) = r.duration_secs("retry_base_delay")? {
+            http.retry_base_delay = d;
+        }
         if let Some(t) = requests_timeout {
             http.total_timeout = Some(t);
         }
@@ -299,7 +308,10 @@ mod tests {
     use fsfast_core::Value;
 
     fn parse(pairs: &[(&str, Value)], env: &[(&str, &str)]) -> Result<GcsOptions> {
-        let opts = pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect();
+        let opts = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
         GcsOptions::parse_with_env(opts, GcsEnv::from_pairs(env.iter().copied()))
     }
 
@@ -314,6 +326,18 @@ mod tests {
         assert_eq!(o.location().unwrap(), "https://storage.googleapis.com");
         assert_eq!(o.upload_chunk_size, 16 << 20);
         assert_eq!(o.http.max_retries, 5);
+        // gcsfs's backoff envelope: about 33 s over 5 retries.
+        assert_eq!(o.http.retry_base_delay, Duration::from_secs(2));
+        assert_eq!(o.http.retry_max_delay, Duration::from_secs(32));
+        let o = parse(
+            &[
+                ("token", Value::from("anon")),
+                ("retry_base_delay", Value::Float(0.01)),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(o.http.retry_base_delay, Duration::from_millis(10));
     }
 
     #[test]
@@ -347,7 +371,10 @@ mod tests {
         .unwrap();
         assert_eq!(o.project.as_deref(), Some("p"));
         assert_eq!(o.consistency, Consistency::Md5);
-        assert_eq!(o.requester_pays, RequesterPays::Explicit("billing-proj".into()));
+        assert_eq!(
+            o.requester_pays,
+            RequesterPays::Explicit("billing-proj".into())
+        );
         assert_eq!(o.location().unwrap(), "http://127.0.0.1:4443");
         assert_eq!(o.http.total_timeout, Some(Duration::from_secs(30)));
         assert_eq!(o.http.proxy, fsfast_http_transport::ProxyConfig::Disabled);

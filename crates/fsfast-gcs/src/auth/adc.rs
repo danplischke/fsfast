@@ -93,9 +93,10 @@ impl FileCredentials {
 
 /// Read and parse a JSON object from a file.
 pub fn read_json_file(path: &Path) -> Result<Map<String, Json>> {
-    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
-        Error::from(e).with_path(path.display().to_string())
-    })?);
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|e| Error::from(e).with_path(path.display().to_string()))?,
+    );
     match serde_json::from_str::<Json>(&text) {
         Ok(Json::Object(m)) => Ok(m),
         Ok(_) => Err(Error::invalid_input(format!(
@@ -113,12 +114,17 @@ pub fn read_json_file(path: &Path) -> Result<Map<String, Json>> {
 /// dispatch on `"type"`. Only `authorized_user` and `service_account` are
 /// supported; the other ADC types (workload identity federation,
 /// impersonation, GDCH) are `Unsupported`.
-pub fn credentials_from_typed_info(info: &Map<String, Json>, origin: &str) -> Result<FileCredentials> {
+pub fn credentials_from_typed_info(
+    info: &Map<String, Json>,
+    origin: &str,
+) -> Result<FileCredentials> {
     match info.get("type").and_then(Json::as_str) {
         Some("service_account") => Ok(FileCredentials::ServiceAccount(Arc::new(
             ServiceAccountKey::from_info(info)?,
         ))),
-        Some("authorized_user") => Ok(FileCredentials::AuthorizedUser(AuthorizedUser::from_info(info)?)),
+        Some("authorized_user") => Ok(FileCredentials::AuthorizedUser(AuthorizedUser::from_info(
+            info,
+        )?)),
         Some(
             t @ ("external_account"
             | "external_account_authorized_user"
@@ -166,7 +172,9 @@ pub fn credentials_from_token_info(info: &Map<String, Json>) -> Result<FileCrede
 
 /// An fsfast [`Value`] map (a Python dict) as JSON.
 pub fn value_map_to_json(m: &std::collections::BTreeMap<String, Value>) -> Map<String, Json> {
-    m.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect()
+    m.iter()
+        .map(|(k, v)| (k.clone(), value_to_json(v)))
+        .collect()
 }
 
 fn value_to_json(v: &Value) -> Json {
@@ -251,7 +259,8 @@ pub fn gcloud_project(env: &GcsEnv) -> Option<String> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_owned()),
     };
-    let text = std::fs::read_to_string(dir.join("configurations").join(format!("config_{name}"))).ok()?;
+    let text =
+        std::fs::read_to_string(dir.join("configurations").join(format!("config_{name}"))).ok()?;
     ini_value(&text, "core", "project")
 }
 
@@ -311,12 +320,16 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let Json::Object(ext) = json!({"type": "external_account"}) else { unreachable!() };
+        let Json::Object(ext) = json!({"type": "external_account"}) else {
+            unreachable!()
+        };
         assert_eq!(
             credentials_from_typed_info(&ext, "f").unwrap_err().kind(),
             fsfast_core::ErrorKind::Unsupported
         );
-        let Json::Object(none) = json!({"client_id": "x"}) else { unreachable!() };
+        let Json::Object(none) = json!({"client_id": "x"}) else {
+            unreachable!()
+        };
         assert!(credentials_from_typed_info(&none, "f").is_err());
         assert!(credentials_from_token_info(&none).is_err());
     }
@@ -340,18 +353,26 @@ mod tests {
         ]);
         assert_eq!(gcloud_project(&env).as_deref(), Some("env-proj"));
         // No ADC file: nothing found.
-        assert!(find_adc_file(&GcsEnv::from_pairs([("CLOUDSDK_CONFIG", cfg.to_str().unwrap())]))
+        assert!(
+            find_adc_file(&GcsEnv::from_pairs([(
+                "CLOUDSDK_CONFIG",
+                cfg.to_str().unwrap()
+            )]))
             .unwrap()
-            .is_none());
+            .is_none()
+        );
         // gcloud's ADC file with user credentials takes the gcloud project.
         std::fs::write(
             cfg.join("application_default_credentials.json"),
             r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#,
         )
         .unwrap();
-        let found = find_adc_file(&GcsEnv::from_pairs([("CLOUDSDK_CONFIG", cfg.to_str().unwrap())]))
-            .unwrap()
-            .unwrap();
+        let found = find_adc_file(&GcsEnv::from_pairs([(
+            "CLOUDSDK_CONFIG",
+            cfg.to_str().unwrap(),
+        )]))
+        .unwrap()
+        .unwrap();
         assert_eq!(found.project.as_deref(), Some("work-proj"));
         // A missing explicit file is an error.
         let env = GcsEnv::from_pairs([("GOOGLE_APPLICATION_CREDENTIALS", "/nonexistent/x.json")]);

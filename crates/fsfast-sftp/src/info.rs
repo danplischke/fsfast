@@ -73,8 +73,14 @@ mod tests {
         assert_eq!(i.size, 5);
         assert_eq!(i.extra["uid"], Value::Int(1));
         assert_eq!(i.extra["gid"], Value::Int(2));
-        assert_eq!(i.extra["time"], Value::Time(UNIX_EPOCH + Duration::from_secs(10)));
-        assert_eq!(i.extra["mtime"], Value::Time(UNIX_EPOCH + Duration::from_secs(20)));
+        assert_eq!(
+            i.extra["time"],
+            Value::Time(UNIX_EPOCH + Duration::from_secs(10))
+        );
+        assert_eq!(
+            i.extra["mtime"],
+            Value::Time(UNIX_EPOCH + Duration::from_secs(20))
+        );
         assert_eq!(i.modified, Some(UNIX_EPOCH + Duration::from_secs(20)));
         assert_eq!(i.created, i.modified);
         let bare = file_info("f".into(), &FileAttributes::default());

@@ -15,7 +15,10 @@ pub const MAX_EXPIRATION_SECS: u64 = 604_800;
 
 /// `YYYYMMDDTHHMMSSZ` for `t`.
 pub fn v4_timestamp(t: SystemTime) -> String {
-    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
@@ -103,7 +106,9 @@ pub fn signed_url_v4(
     let hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
     let string_to_sign = format!("GOOG4-RSA-SHA256\n{timestamp}\n{scope}\n{hash}");
     let sig = hex::encode(key.sign(string_to_sign.as_bytes())?);
-    Ok(format!("{endpoint}{resource}?{query}&X-Goog-Signature={sig}"))
+    Ok(format!(
+        "{endpoint}{resource}?{query}&X-Goog-Signature={sig}"
+    ))
 }
 
 #[cfg(test)]

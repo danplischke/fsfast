@@ -323,3 +323,224 @@ async fn s3fs_extras() {
         vec!["extras/p/2024-01", "extras/p/2024-02"]
     );
 }
+
+const VERSIONED_SCRIPT: &str = r#"
+import datetime, json, sys
+import s3fs
+fs = s3fs.S3FileSystem(key="testing", secret="testing", endpoint_url=sys.argv[3],
+    version_aware=True, use_listings_cache=False, skip_instance_cache=True)
+
+def norm(v):
+    if isinstance(v, datetime.datetime):
+        return "TIME"
+    if isinstance(v, dict):
+        return {k: norm(x) for k, x in v.items() if k != "Owner"}
+    if isinstance(v, (list, tuple)):
+        return [norm(x) for x in v]
+    return v
+
+out = []
+for op in json.load(open(sys.argv[1])):
+    fs.invalidate_cache()
+    p = op["path"]
+    try:
+        if op["op"] == "info":
+            r = norm(fs.info(p))
+        elif op["op"] == "ls":
+            r = norm(fs.ls(p, detail=True))
+        elif op["op"] == "ls_versions":
+            r = norm(fs.ls(p, detail=True, versions=True))
+        elif op["op"] == "find":
+            r = norm(fs.find(p, detail=True, withdirs=True))
+        elif op["op"] == "exists":
+            r = fs.exists(p)
+        elif op["op"] == "cat":
+            r = fs.cat_file(p).decode()
+        elif op["op"] == "object_versions":
+            r = len(fs.object_version_info(p))
+        out.append({"ok": r})
+    except Exception as e:
+        out.append({"error": type(e).__name__})
+json.dump(out, open(sys.argv[2], "w"))
+"#;
+
+fn value_json(v: &Value) -> serde_json::Value {
+    use serde_json::json;
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => json!(b),
+        Value::Int(i) => json!(i),
+        Value::Float(f) => json!(f),
+        Value::Str(s) => json!(s),
+        Value::Bytes(b) => json!(String::from_utf8_lossy(b)),
+        Value::Time(_) => json!("TIME"),
+        Value::List(l) => serde_json::Value::Array(l.iter().map(value_json).collect()),
+        Value::Map(m) => serde_json::Value::Object(
+            m.iter()
+                .filter(|(k, _)| k.as_str() != "Owner")
+                .map(|(k, v)| (k.clone(), value_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn info_json(i: &fsfast_core::FileInfo) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("name".into(), i.name.clone().into());
+    m.insert("size".into(), i.size.into());
+    m.insert("type".into(), i.file_type.as_fsspec_str().into());
+    for (k, v) in &i.extra {
+        if k != "Owner" {
+            m.insert(k.clone(), value_json(v));
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
+/// `version_aware=True` against s3fs on the same moto server: version
+/// paths, listings of versioned buckets (latest versions only, delete
+/// markers hidden), `ls(versions=True)`, and the error types.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_aware_matches_s3fs() {
+    use serde_json::json;
+    let Ok(python) = std::env::var("FSFAST_TEST_FSSPEC_PYTHON") else {
+        eprintln!("skipping version_aware_matches_s3fs: set FSFAST_TEST_FSSPEC_PYTHON");
+        return;
+    };
+    let Some(m) = start_moto().await else { return };
+    let f = fs(&m, &[("version_aware", true.into())]);
+    f.mkdir("vdiff", true).await.unwrap();
+    f.make_bucket_versioned("vdiff", true).await.unwrap();
+    let w = WriteOptions::default();
+    let mut versions = Vec::new();
+    for body in ["one", "two", "three"] {
+        f.pipe_file("vdiff/dir/k", Bytes::from(body), &w)
+            .await
+            .unwrap();
+        match &f.info("vdiff/dir/k").await.unwrap().extra["VersionId"] {
+            Value::Str(s) => versions.push(s.clone()),
+            other => panic!("no VersionId: {other:?}"),
+        }
+    }
+    f.pipe_file("vdiff/gone", Bytes::from_static(b"x"), &w)
+        .await
+        .unwrap();
+    let gone_v = match &f.info("vdiff/gone").await.unwrap().extra["VersionId"] {
+        Value::Str(s) => s.clone(),
+        other => panic!("{other:?}"),
+    };
+    // A delete marker hides "gone"; its old version stays readable.
+    fsfast_s3::S3FileSystem::rm_file(&fs(&m, &[("strict_delete", false.into())]), "vdiff/gone")
+        .await
+        .unwrap();
+    f.pipe_file("vdiff/other.txt", Bytes::from_static(b"o"), &w)
+        .await
+        .unwrap();
+
+    let mut paths = vec![
+        "vdiff".to_owned(),
+        "vdiff/dir".to_owned(),
+        "vdiff/dir/k".to_owned(),
+        "vdiff/gone".to_owned(),
+        format!("vdiff/gone?versionId={gone_v}"),
+        "vdiff/other.txt".to_owned(),
+        "vdiff/dir/k?versionId=nonexistent".to_owned(),
+    ];
+    paths.extend(
+        versions
+            .iter()
+            .map(|v| format!("vdiff/dir/k?versionId={v}")),
+    );
+    let mut ops = Vec::new();
+    for p in &paths {
+        for op in ["info", "exists", "ls", "find", "cat"] {
+            ops.push(json!({"op": op, "path": p}));
+        }
+    }
+    for p in ["vdiff", "vdiff/dir", "vdiff/dir/k", "vdiff/missing"] {
+        ops.push(json!({"op": "ls_versions", "path": p}));
+    }
+    ops.push(
+        json!({"op": "ls_versions", "path": format!("vdiff/dir/k?versionId={}", versions[0])}),
+    );
+    ops.push(json!({"op": "object_versions", "path": "vdiff/dir/k"}));
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("ops.json");
+    let output = dir.path().join("out.json");
+    let script = dir.path().join("vdiff.py");
+    std::fs::write(&input, serde_json::to_vec(&ops).unwrap()).unwrap();
+    std::fs::write(&script, VERSIONED_SCRIPT).unwrap();
+    let status = Command::new(&python)
+        .arg(&script)
+        .arg(&input)
+        .arg(&output)
+        .arg(&m.endpoint)
+        .status()
+        .unwrap();
+    assert!(status.success(), "s3fs script failed");
+    let want: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+
+    let class = |k: ErrorKind| match k {
+        ErrorKind::NotFound => "FileNotFoundError",
+        ErrorKind::PermissionDenied => "PermissionError",
+        ErrorKind::InvalidInput => "ValueError",
+        ErrorKind::IsADirectory => "IsADirectoryError",
+        _ => "OSError",
+    };
+    let list =
+        |v: Vec<fsfast_core::FileInfo>| serde_json::Value::Array(v.iter().map(info_json).collect());
+    let mut mismatches = Vec::new();
+    for (op, want) in ops.iter().zip(&want) {
+        let p = op["path"].as_str().unwrap();
+        let got = match op["op"].as_str().unwrap() {
+            "info" => f.info(p).await.map(|i| info_json(&i)),
+            "exists" => f.exists(p).await.map(|b| json!(b)),
+            "ls" => f.ls(p).await.map(list),
+            "ls_versions" => f.ls_versions(p).await.map(list),
+            "find" => f
+                .find(
+                    p,
+                    &FindOptions {
+                        maxdepth: None,
+                        withdirs: true,
+                    },
+                )
+                .await
+                .map(list),
+            "cat" => f
+                .cat_file(p, ByteRange::Full)
+                .await
+                .map(|d| json!(String::from_utf8_lossy(&d))),
+            "object_versions" => f.object_versions(p).await.map(|v| json!(v.len())),
+            other => panic!("{other}"),
+        };
+        let got = match got {
+            Ok(v) => json!({ "ok": v }),
+            Err(e) => json!({ "error": class(e.kind()) }),
+        };
+        // s3fs's find returns a dict (name -> info); compare as a list.
+        let want = match (op["op"].as_str(), want.get("ok")) {
+            (Some("find"), Some(serde_json::Value::Object(m))) => {
+                json!({ "ok": m.values().cloned().collect::<Vec<_>>() })
+            }
+            _ => want.clone(),
+        };
+        // Deliberate: s3fs lets botocore reject the empty key
+        // (ParamValidationError); fsfast says the bucket is a directory.
+        if op["op"] == "cat" && p == "vdiff" && got["error"] == "IsADirectoryError" {
+            continue;
+        }
+        if got != want {
+            mismatches.push(format!("{op}\n  s3fs:   {want}\n  fsfast: {got}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} calls differ from s3fs:\n{}",
+        mismatches.len(),
+        ops.len(),
+        mismatches.join("\n")
+    );
+}

@@ -399,6 +399,8 @@ fn fake_s3(heads_400: bool) -> Handler {
     Arc::new(move |s: &Seen| {
         let auth = header(s, "authorization");
         if auth.contains("Credential=OLDKEY/") {
+            // Let concurrent requests overlap with the refresh.
+            std::thread::sleep(Duration::from_millis(5));
             return (
                 400,
                 vec![],
@@ -645,4 +647,54 @@ async fn profile_supplies_region_endpoint_and_addressing() {
     let i = fs.info("bucket/k").await.unwrap();
     assert_eq!(i.size, 3);
     assert_eq!(fake.seen.lock()[0].uri, "/bucket/k");
+}
+
+/// Many requests signed with the same expired credentials: they must share
+/// one refresh, and none may fail because another request dropped the
+/// cached credentials while it was deciding whether to retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_expired_token_rejections_share_one_refresh() {
+    let fake_s3_server = serve(fake_s3(false)).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c2 = calls.clone();
+    let creds = serve(Arc::new(move |_s: &Seen| {
+        let n = c2.fetch_add(1, Ordering::SeqCst);
+        let ak = if n == 0 {
+            "OLDKEY".to_owned()
+        } else {
+            format!("GOODKEY{n}")
+        };
+        (200, vec![], creds_json(&ak, Duration::from_secs(3600)))
+    }))
+    .await;
+    let full = format!("{}/creds", creds.base);
+    let e = env(&[
+        ("AWS_CONTAINER_CREDENTIALS_FULL_URI", &full),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+        ("AWS_CONFIG_FILE", "/nonexistent"),
+        ("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent"),
+    ]);
+    let fs = fs_for(
+        &fake_s3_server.base,
+        &[(
+            "client_kwargs",
+            Value::Map([("region_name".to_owned(), Value::from("eu-west-1"))].into()),
+        )],
+        e,
+    );
+    let tasks: Vec<_> = (0..64)
+        .map(|_| {
+            let fs = fs.clone();
+            tokio::spawn(async move { fs.cat_file("eu-bucket/key.txt", ByteRange::Full).await })
+        })
+        .collect();
+    for t in tasks {
+        let data = t.await.unwrap().expect("request after a shared refresh");
+        assert_eq!(&data[..], b"hello");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one initial load and exactly one refresh"
+    );
 }

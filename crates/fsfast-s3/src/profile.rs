@@ -22,9 +22,25 @@ use std::sync::Arc;
 use fsfast_core::{Error, Result};
 
 /// The process environment, or a fixed map of variables (tests).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Env {
     vars: Option<Arc<HashMap<String, String>>>,
+}
+
+/// Variable names only: values include secrets (`AWS_SECRET_ACCESS_KEY`,
+/// `AWS_SESSION_TOKEN`), and `Env` ends up inside the credential providers
+/// that handles and filesystems print with `{:?}`.
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.vars {
+            None => f.write_str("Env(process)"),
+            Some(m) => {
+                let mut names: Vec<&str> = m.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                f.debug_tuple("Env").field(&names).finish()
+            }
+        }
+    }
 }
 
 impl Env {
@@ -156,7 +172,7 @@ pub fn parse_ini(text: &str) -> Vec<(String, Section)> {
 }
 
 /// The merged contents of the shared config and credentials files.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ProfileFiles {
     /// Profiles by name.
     pub profiles: HashMap<String, Section>,
@@ -168,6 +184,22 @@ pub struct ProfileFiles {
     pub config_file: HashMap<String, Section>,
     /// Profiles of the credentials file alone.
     pub credentials_file: HashMap<String, Section>,
+}
+
+/// Section names only: the sections hold secret keys and session tokens.
+impl std::fmt::Debug for ProfileFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn names(m: &HashMap<String, Section>) -> Vec<&str> {
+            let mut v: Vec<&str> = m.keys().map(String::as_str).collect();
+            v.sort_unstable();
+            v
+        }
+        f.debug_struct("ProfileFiles")
+            .field("profiles", &names(&self.profiles))
+            .field("sso_sessions", &names(&self.sso_sessions))
+            .field("services", &names(&self.services))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProfileFiles {

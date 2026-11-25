@@ -629,8 +629,29 @@ impl S3FileSystem {
         let p = strip_protocol(path);
         let sp = split_path(&p, true);
         let st = self.state().await?;
-        self.lsdir(&st, &sp.bucket, &sp.key, Some("/"), true, &p)
+        let files = self
+            .lsdir(&st, &sp.bucket, &sp.key, Some("/"), true, &p)
+            .await?;
+        if !files.is_empty() || !p.contains('/') {
+            return Ok(files);
+        }
+        // s3fs `_ls`: nothing below `path`, so look for `path` itself in
+        // its parent's (version) listing, whose names carry `?versionId=`:
+        // only a version path can match, a plain key is not found.
+        let parent = crate::path::parent(&p);
+        let ps = split_path(&parent, true);
+        let files = self
+            .lsdir(&st, &ps.bucket, &ps.key, Some("/"), true, &parent)
             .await
+            .unwrap_or_default();
+        let files: Vec<FileInfo> = files
+            .into_iter()
+            .filter(|o| o.name.trim_end_matches('/') == p && !o.is_dir())
+            .collect();
+        if files.is_empty() {
+            return Err(Error::not_found(p));
+        }
+        Ok(files)
     }
 }
 

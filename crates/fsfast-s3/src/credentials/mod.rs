@@ -55,6 +55,12 @@ pub const ADVISORY_REFRESH: Duration = Duration::from_secs(15 * 60);
 /// Refresh, blocking every user, when credentials expire within this window
 /// (botocore `_DEFAULT_MANDATORY_REFRESH_TIMEOUT`).
 pub const MANDATORY_REFRESH: Duration = Duration::from_secs(10 * 60);
+/// After a refresh failed, or produced credentials that are themselves
+/// inside the refresh window (a provider handing out short-lived
+/// credentials, or a local clock running ahead), credentials that are still
+/// valid are used for this long before the next refresh attempt. Without
+/// it every request would call the provider (STS, IMDS, ...) again.
+pub const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// An access key, its secret and an optional session token. Secrets are
 /// wiped from memory on drop and never printed by `Debug`.
@@ -330,6 +336,9 @@ pub struct CredentialsCache {
     provider: Arc<dyn ProvideCredentials>,
     current: RwLock<Option<Arc<Credentials>>>,
     refresh: tokio::sync::Mutex<()>,
+    /// No refresh attempt before this instant while the current
+    /// credentials are still valid (see [`REFRESH_RETRY_INTERVAL`]).
+    retry_after: Mutex<Option<std::time::Instant>>,
 }
 
 impl CredentialsCache {
@@ -339,6 +348,7 @@ impl CredentialsCache {
             provider,
             current: RwLock::new(None),
             refresh: tokio::sync::Mutex::new(()),
+            retry_after: Mutex::new(None),
         }
     }
 
@@ -350,6 +360,9 @@ impl CredentialsCache {
             if !c.expires_within(now, ADVISORY_REFRESH) {
                 return Ok(c.clone());
             }
+            if self.cooling_down() && !c.expires_within(now, Duration::ZERO) {
+                return Ok(c.clone());
+            }
             if !c.expires_within(now, MANDATORY_REFRESH) {
                 // Advisory window: refresh if nobody else is, never wait.
                 if let Ok(_guard) = self.refresh.try_lock() {
@@ -359,10 +372,14 @@ impl CredentialsCache {
                         return Ok(fresh);
                     }
                     match self.provider.provide().await {
-                        Ok(Some(n)) => return Ok(self.store(n)),
+                        Ok(Some(n)) => {
+                            self.note_refresh(&n, ADVISORY_REFRESH);
+                            return Ok(self.store(n));
+                        }
                         Ok(None) => tracing::warn!("credential refresh found no credentials"),
                         Err(e) => tracing::warn!(error = %e, "advisory credential refresh failed"),
                     }
+                    self.start_cooldown();
                 }
                 return Ok(c.clone());
             }
@@ -371,17 +388,23 @@ impl CredentialsCache {
         let now = SystemTime::now();
         let current = self.current.read().clone();
         if let Some(c) = &current
-            && !c.expires_within(now, MANDATORY_REFRESH)
+            && (!c.expires_within(now, MANDATORY_REFRESH)
+                || (self.cooling_down() && !c.expires_within(now, Duration::ZERO)))
         {
             return Ok(c.clone());
         }
-        match self.provider.provide().await {
+        let res = self.provider.provide().await;
+        if !matches!(res, Ok(Some(_))) {
+            self.start_cooldown();
+        }
+        match res {
             Ok(Some(n)) => {
                 if n.expires_within(now, MANDATORY_REFRESH) {
                     tracing::warn!(
                         "refreshed credentials expire within the mandatory refresh window"
                     );
                 }
+                self.note_refresh(&n, MANDATORY_REFRESH);
                 Ok(self.store(n))
             }
             Ok(None) => match current {
@@ -399,6 +422,26 @@ impl CredentialsCache {
         }
     }
 
+    fn cooling_down(&self) -> bool {
+        self.retry_after
+            .lock()
+            .is_some_and(|t| std::time::Instant::now() < t)
+    }
+
+    fn start_cooldown(&self) {
+        *self.retry_after.lock() = Some(std::time::Instant::now() + REFRESH_RETRY_INTERVAL);
+    }
+
+    /// After a successful refresh: cool down if the new credentials are
+    /// still inside `window` (refreshing again at once would not help).
+    fn note_refresh(&self, fresh: &Credentials, window: Duration) {
+        if fresh.expires_within(SystemTime::now(), window) {
+            self.start_cooldown();
+        } else {
+            *self.retry_after.lock() = None;
+        }
+    }
+
     fn store(&self, c: Credentials) -> Arc<Credentials> {
         let c = Arc::new(c);
         *self.current.write() = Some(c.clone());
@@ -409,6 +452,19 @@ impl CredentialsCache {
     /// as expired); the next `get` loads fresh ones.
     pub fn invalidate(&self) {
         *self.current.write() = None;
+    }
+
+    /// Forget the cached credentials only if they are still `rejected` (the
+    /// ones a request was signed with and the service refused as expired).
+    ///
+    /// Concurrent requests signed with the same credentials are all
+    /// rejected; the first one's refresh must not be thrown away by the
+    /// others, so a stale rejection after the refresh is a no-op.
+    pub fn invalidate_if_current(&self, rejected: &Arc<Credentials>) {
+        let mut cur = self.current.write();
+        if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, rejected)) {
+            *cur = None;
+        }
     }
 
     /// Whether the cached credentials are temporary (have an expiry), i.e.
@@ -613,6 +669,38 @@ mod tests {
             cache.get().await.unwrap_err().kind(),
             ErrorKind::ConnectionFailed
         );
+    }
+
+    #[tokio::test]
+    async fn short_lived_credentials_do_not_cause_a_refresh_storm() {
+        // Every refresh yields credentials inside the mandatory window (a
+        // provider with short-lived credentials, or a clock running ahead):
+        // they are still valid, so they are used and the provider is not
+        // called again on every request.
+        let p = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            lifetime: Duration::from_secs(5 * 60),
+            fail_after: None,
+        });
+        let cache = CredentialsCache::new(p.clone());
+        for _ in 0..50 {
+            cache.get().await.unwrap();
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        // Same in the advisory window, when the refresh keeps failing.
+        let p = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            lifetime: Duration::from_secs(12 * 60),
+            fail_after: Some(1),
+        });
+        let cache = CredentialsCache::new(p.clone());
+        for _ in 0..50 {
+            assert_eq!(cache.get().await.unwrap().access_key_id(), "AK0");
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        // Expired credentials are never served from the cool-down.
+        cache.invalidate();
+        assert!(cache.get().await.is_err());
     }
 
     #[tokio::test]
