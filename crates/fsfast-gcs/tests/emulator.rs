@@ -364,11 +364,11 @@ async fn uploads_on_every_path() {
             .kind(),
         ErrorKind::AlreadyExists
     );
-    let mut w = fs.open_write(&pb, &cn).await.unwrap();
-    w.write(big.clone()).await.unwrap();
+    // A create-only open of an existing object fails at open, like a local
+    // file opened with O_EXCL.
     assert_eq!(
-        w.close().await.unwrap_err().kind(),
-        ErrorKind::AlreadyExists
+        fs.open_write(&pb, &cn).await.err().map(|e| e.kind()),
+        Some(ErrorKind::AlreadyExists)
     );
     assert_eq!(fs.cat_file(&pb, ByteRange::Full).await.unwrap(), big);
     // Content type, metadata and fixed-key metadata.

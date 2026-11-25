@@ -853,6 +853,8 @@ async fn aborted_uploads_cancel_the_session() {
         ),
         "PUT" => Reply::new(308).header("range", &format!("bytes=0-{}", s.body.len() - 1)),
         "DELETE" => Reply::gcs_error(499, "", ""),
+        // The create-only open first checks that the object is absent.
+        "GET" => Reply::gcs_error(404, "notFound", "No such object"),
         _ => Reply::new(500),
     })
     .await;
@@ -879,14 +881,17 @@ async fn aborted_uploads_cancel_the_session() {
     assert_eq!(
         log,
         [
+            "GET /storage/v1/b/bkt/o/x.bin",
             "POST /upload/storage/v1/b/bkt/o",
             "PUT /session",
             "DELETE /session"
         ]
     );
-    assert_eq!(seen[0].param("ifGenerationMatch").as_deref(), Some("0"));
+    // The upload itself stays conditional, so a writer racing in after the
+    // open-time check still loses.
+    assert_eq!(seen[1].param("ifGenerationMatch").as_deref(), Some("0"));
     // gcsfs drops the precondition when cancelling.
-    assert_eq!(seen[2].param("ifGenerationMatch"), None);
+    assert_eq!(seen[3].param("ifGenerationMatch"), None);
     assert!(w.write(Bytes::from_static(b"x")).await.is_err());
 
     // Dropping an unfinished upload cancels it in the background.
