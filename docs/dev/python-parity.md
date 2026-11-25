@@ -181,3 +181,12 @@ Each item below is either a reference bug or a limitation that fsfast does not c
 - **fsfast-azure** (`crates/fsfast-azure/src/write.rs`, `BlobHeaders::from_options`): a per-call `metadata` option (adlfs `open(..., metadata=...)`) was rejected as unknown; it is now merged into the blob's metadata. Unit test `write::tests::metadata_from_extra`.
 
 The upstream compliance runs that found these are in [compliance.md](compliance.md).
+
+## Recursive copy of a tree onto or into itself
+
+`copy(src, dst, recursive=True)` with `dst == src` or `dst` inside `src` is
+undefined. fsspec expands the source while writing into it, so its result
+depends on iteration order (for the memory filesystem it can turn a copied
+subdirectory into an empty file). fsfast does not reproduce that; the
+stateful parity tests skip this case, as they already did for `mv` into
+itself.

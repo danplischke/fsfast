@@ -567,6 +567,12 @@ class MemoryParity(RuleBasedStateMachine):
 
     @rule(src=PATHS, dst=PATHS, recursive=st.booleans())
     def copy(self, src, dst, recursive):
+        if recursive and (dst == src or dst.startswith(src + "/")):
+            # Copying a tree onto or into itself: fsspec expands the source
+            # while writing into it, so its result depends on iteration
+            # order (it can turn a copied directory into an empty file).
+            # Undefined, like mv into itself below; see python-parity.md.
+            return
         self.same("copy", src, dst, recursive=recursive)
 
     @rule(src=PATHS, dst=PATHS)
