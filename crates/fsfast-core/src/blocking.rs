@@ -34,6 +34,9 @@ use crate::{Error, ErrorKind, Result};
 thread_local! {
     /// Whether [`blocking`] may run its closure on this thread.
     static INLINE: Cell<bool> = const { Cell::new(false) };
+    /// How many [`blocking`] calls polled on this thread sent their closure
+    /// to the blocking pool (see [`pool_dispatches`]).
+    static DISPATCHED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Restores the previous flag value on drop (also during unwinding).
@@ -61,6 +64,18 @@ pub fn inline_allowed() -> bool {
     INLINE.with(Cell::get)
 }
 
+/// How many [`blocking`] calls polled on this thread so far sent their
+/// (short, by contract) closure to the blocking pool; a wrapping counter.
+///
+/// An executor compares the value before and after a poll that returned
+/// `Pending` to learn whether the future now only waits for a short
+/// blocking step (a local `stat`, a small read), whose completion is worth
+/// a brief busy-wait, rather than for network I/O or a timer.
+/// [`spawn_blocking`] (long or parallel work) is not counted.
+pub fn pool_dispatches() -> u64 {
+    DISPATCHED.with(Cell::get)
+}
+
 /// Run blocking work for the current operation: inline when the polling
 /// thread allowed it ([`allow_inline`]), else on tokio's blocking pool.
 ///
@@ -76,7 +91,50 @@ where
     if inline_allowed() {
         return allow_inline(false, f);
     }
+    DISPATCHED.with(|c| c.set(c.get().wrapping_add(1)));
     spawn_blocking(f).await
+}
+
+/// What a step run by [`blocking_deferrable`] did.
+#[derive(Debug)]
+pub enum Attempt<T> {
+    /// The step ran (successfully or not).
+    Done(Result<T>),
+    /// Running inline, the step found it could block for an unbounded time
+    /// (e.g. opening a named pipe, which waits for the other end): nothing
+    /// was done, run it on the blocking pool instead.
+    Defer,
+}
+
+/// [`blocking`] for a step that can only tell once it starts whether it is
+/// short: `f(true)` runs inline (when allowed) and may return
+/// [`Attempt::Defer`], after which `f(false)` runs on the blocking pool,
+/// where it must not defer. With inline blocking not allowed, only
+/// `f(false)` runs, on the pool.
+///
+/// Inline steps hold a thread that cannot check for signals meanwhile, so
+/// a step that may wait indefinitely (on another process, a device) must
+/// defer rather than block.
+pub async fn blocking_deferrable<T, F>(mut f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnMut(bool) -> Attempt<T> + Send + 'static,
+{
+    if inline_allowed() {
+        match allow_inline(false, || f(true)) {
+            Attempt::Done(r) => return r,
+            Attempt::Defer => {}
+        }
+    }
+    DISPATCHED.with(|c| c.set(c.get().wrapping_add(1)));
+    spawn_blocking(move || match f(false) {
+        Attempt::Done(r) => r,
+        Attempt::Defer => Err(Error::new(
+            ErrorKind::Other,
+            "blocking step deferred while running on the blocking pool",
+        )),
+    })
+    .await
 }
 
 /// Run blocking work on tokio's blocking pool, always (see the module
@@ -105,6 +163,20 @@ mod tests {
 
     fn thread_of() -> impl FnOnce() -> Result<ThreadId> + Send + 'static {
         || Ok(std::thread::current().id())
+    }
+
+    /// Finish a future whose first poll (on this thread) gave `first`: a
+    /// pool thread may already have completed it then, so it must not be
+    /// polled again in that case.
+    fn finish<T>(
+        rt: &tokio::runtime::Runtime,
+        first: std::task::Poll<T>,
+        fut: std::pin::Pin<&mut impl Future<Output = T>>,
+    ) -> T {
+        match first {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => rt.block_on(fut),
+        }
     }
 
     #[test]
@@ -155,8 +227,74 @@ mod tests {
         // `spawn_blocking` ignores the flag.
         let mut fut = std::pin::pin!(spawn_blocking(thread_of()));
         let polled = allow_inline(true, || fut.as_mut().poll(&mut cx));
-        assert!(polled.is_pending());
-        assert_ne!(rt.block_on(fut).unwrap(), me);
+        assert_ne!(finish(&rt, polled, fut).unwrap(), me);
+    }
+
+    #[test]
+    fn pool_dispatches_count_only_short_steps_sent_to_the_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let _ctx = rt.enter();
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let before = pool_dispatches();
+        // Inline: not dispatched.
+        let mut fut = std::pin::pin!(blocking(thread_of()));
+        assert!(allow_inline(true, || fut.as_mut().poll(&mut cx)).is_ready());
+        assert_eq!(pool_dispatches(), before);
+        // `spawn_blocking` (long work): not counted. (Whether the first poll
+        // is already ready depends on the pool's timing: not checked.)
+        let mut fut = std::pin::pin!(spawn_blocking(thread_of()));
+        let first = fut.as_mut().poll(&mut cx);
+        assert_eq!(pool_dispatches(), before);
+        finish(&rt, first, fut).unwrap();
+        // A short step sent to the pool: counted once, on the polling thread.
+        let mut fut = std::pin::pin!(blocking(thread_of()));
+        let first = fut.as_mut().poll(&mut cx);
+        assert_eq!(pool_dispatches(), before.wrapping_add(1));
+        finish(&rt, first, fut).unwrap();
+        assert_eq!(pool_dispatches(), before.wrapping_add(1));
+    }
+
+    #[test]
+    fn deferrable_steps_retry_on_the_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let _ctx = rt.enter();
+        let me = std::thread::current().id();
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let step = |defer: bool| {
+            move |inline: bool| {
+                if inline && defer {
+                    Attempt::Defer
+                } else {
+                    Attempt::Done(Ok((inline, std::thread::current().id())))
+                }
+            }
+        };
+        // Not deferred: done inline, in the first poll.
+        let mut fut = std::pin::pin!(blocking_deferrable(step(false)));
+        match allow_inline(true, || fut.as_mut().poll(&mut cx)) {
+            std::task::Poll::Ready(Ok((true, id))) => assert_eq!(id, me),
+            other => panic!("not inline: {other:?}"),
+        }
+        // Deferred: redone on the pool (counted as a dispatch).
+        let before = pool_dispatches();
+        let mut fut = std::pin::pin!(blocking_deferrable(step(true)));
+        let first = allow_inline(true, || fut.as_mut().poll(&mut cx));
+        assert_eq!(pool_dispatches(), before.wrapping_add(1));
+        let (inline, id) = finish(&rt, first, fut).unwrap();
+        assert!(!inline);
+        assert_ne!(id, me);
+        // Inline not allowed: straight to the pool.
+        let (inline, id) = rt.block_on(blocking_deferrable(step(false))).unwrap();
+        assert!(!inline);
+        assert_ne!(id, me);
     }
 
     #[test]

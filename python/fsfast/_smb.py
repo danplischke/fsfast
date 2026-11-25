@@ -45,6 +45,12 @@ class _GlobView:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._fs, name)
 
+    def _strip_protocol(self, path: Any) -> Any:
+        # fsspec's glob expects a stripped pattern without the trailing
+        # "/" (it re-appends one for "dir/*/"); smb paths keep it.
+        stripped = self._fs._strip_protocol(path)
+        return stripped.rstrip("/") or stripped
+
     def find(self, path: Any, **kwargs: Any) -> Any:
         return _bare_dir_keys(self._fs.find(path, **kwargs))
 

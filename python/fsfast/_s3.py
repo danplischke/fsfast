@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-from glob import has_magic
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -531,18 +530,7 @@ class S3FileSystem(ObjectStoreFileSystem):
         return kwargs
 
     def _put_one_with_params(self, lpath: str, rpath: str, mode: str, params: dict[str, Any]) -> None:
-        if os.path.isdir(lpath):
-            return  # prefixes need no object
-        wmode = "xb" if mode == "create" else "wb"
-        writer = self._rfs.open_write(self._strip(rpath), wmode, block_size=None, extra=params)
-        try:
-            with open(lpath, "rb") as f:
-                while chunk := f.read(self.default_block_size):
-                    writer.write(chunk)
-        except BaseException:
-            writer.abort()
-            raise
-        writer.close()
+        self._put_streamed(lpath, rpath, mode, params)
 
     def put_file(self, lpath: Any, rpath: Any, callback: Any = DEFAULT_CALLBACK, mode: str = "overwrite", **kwargs: Any) -> None:
         params = self._put_params(dict(kwargs))
@@ -562,26 +550,9 @@ class S3FileSystem(ObjectStoreFileSystem):
         params = self._put_params(dict(kwargs))
         if not params:
             return super().put(lpath, rpath, recursive=recursive, callback=callback, maxdepth=maxdepth, **kwargs)
-        from fsspec.implementations.local import LocalFileSystem as _Local
-
         # Expand exactly as fsspec's put does, then upload each file with
         # the parameters.
-        if isinstance(lpath, list) and isinstance(rpath, list):
-            pairs = list(zip([os.fspath(p) for p in lpath], rpath))
-        else:
-            from fsspec.utils import other_paths
-
-            lfs = _Local()
-            lpaths = lfs.expand_path(lpath, recursive=recursive, maxdepth=maxdepth)
-            if isinstance(lpath, str) and (not recursive or maxdepth is not None):
-                lpaths = [p for p in lpaths if not lfs.isdir(p)]
-            dest_is_dir = isinstance(rpath, str) and (rpath.endswith("/") or self.isdir(rpath))
-            exists = isinstance(lpath, str) and (
-                (has_magic(lpath) and len(lpaths) == 1)
-                or (not has_magic(lpath) and dest_is_dir and not lpath.endswith("/"))
-            )
-            rpaths = other_paths(lpaths, self._strip_protocol(rpath), exists=exists, flatten=not isinstance(lpath, str))
-            pairs = list(zip(lpaths, rpaths))
+        pairs = self._put_pairs(lpath, rpath, recursive, maxdepth)
         try:
             for lp, rp in pairs:
                 self._put_one_with_params(lp, rp, mode, params)

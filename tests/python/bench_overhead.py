@@ -21,7 +21,21 @@ over ``--repeat`` runs of the per-call time in microseconds:
   the bridge from the Python class layer.
 
 Async rows await one call at a time inside a running event loop, so they
-measure the latency of one call, including the event-loop wake-up.
+measure the latency of one call, including the event-loop wake-up. The
+``gather100`` rows run 100 calls concurrently (``asyncio.gather``) and
+report the time per call: ``fsfast`` wraps coroutines in tasks (how fsspec
+code batches), ``rust`` passes the 100 awaitables created up front.
+
+``--compare`` runs the fsfast rows once per bridge configuration, each in
+a fresh interpreter with the runtime's diagnostic switches set, and prints
+them side by side:
+
+* ``wave1``: ``FSFAST_SYNC_INLINE=0 FSFAST_ASYNC_COMPLETION=pyo3`` (sync
+  calls hand blocking steps to the blocking pool; pending async calls go
+  through ``pyo3-async-runtimes``): the bridge as measured in wave 1;
+* ``nospin``: ``FSFAST_ASYNC_SPIN_US=0`` (inline sync steps, eventfd
+  completion queue, no busy-wait);
+* ``default``: the shipped configuration.
 """
 
 from __future__ import annotations
@@ -31,6 +45,7 @@ import asyncio
 import json
 import os
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -38,12 +53,20 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import fsfast
 import fsspec.implementations.local as fs_local
 import fsspec.implementations.memory as fs_memory
 
-import fsfast
-
 PAYLOAD = b"x" * 100
+GATHER = 100
+
+#: --compare configurations: name -> environment overrides.
+CONFIGS: dict[str, dict[str, str]] = {
+    "wave1": {"FSFAST_SYNC_INLINE": "0", "FSFAST_ASYNC_COMPLETION": "pyo3"},
+    "nospin": {"FSFAST_ASYNC_SPIN_US": "0"},
+    "default": {},
+}
+_SWITCHES = ("FSFAST_SYNC_INLINE", "FSFAST_ASYNC_COMPLETION", "FSFAST_ASYNC_SPIN_US")
 
 
 def _time_sync(fn: Callable[[], Any], n: int) -> float:
@@ -78,8 +101,14 @@ def measure(run: Callable[[int], float], repeat: int, target: float) -> float:
     return statistics.median(run(n) for _ in range(repeat)) * 1e6
 
 
-def bench(repeat: int, target: float, only: str | None) -> list[dict[str, Any]]:
-    tmp = tempfile.mkdtemp(prefix="fsfast-bench-")
+def bench(
+    repeat: int,
+    target: float,
+    only: str | None,
+    fsfast_only: bool = False,
+    directory: str | None = None,
+) -> list[dict[str, Any]]:
+    tmp = tempfile.mkdtemp(prefix="fsfast-bench-", dir=directory)
     small = os.path.join(tmp, "small.bin")
     out = os.path.join(tmp, "out.bin")
     with open(small, "wb") as f:
@@ -145,21 +174,45 @@ def bench(repeat: int, target: float, only: str | None) -> list[dict[str, Any]]:
         ("fsfast", "memory", "pipe_file", lambda: ff_mem._pipe_file(mem_out, PAYLOAD)),
         ("rust", "memory", "info", lambda: r_mem.info_async(mem_small)),
         ("rust", "memory", "cat_file", lambda: r_mem.cat_file_async(mem_small)),
-        ("rust", "memory", "pipe_file", lambda: r_mem.pipe_file_async(mem_out, PAYLOAD)),
+        (
+            "rust",
+            "memory",
+            "pipe_file",
+            lambda: r_mem.pipe_file_async(mem_out, PAYLOAD),
+        ),
+    ]
+
+    def gather_tasks(fs: Any, path: str) -> Callable[[], Awaitable[Any]]:
+        return lambda: asyncio.gather(*(fs._info(path) for _ in range(GATHER)))
+
+    def gather_eager(rfs: Any, path: str) -> Callable[[], Awaitable[Any]]:
+        return lambda: asyncio.gather(*[rfs.info_async(path) for _ in range(GATHER)])
+
+    # Each fn() makes GATHER calls; rows report the time per call.
+    gather_cases: list[tuple[str, str, str, Callable[[], Awaitable[Any]]]] = [
+        ("fsfast", "local", "gather100", gather_tasks(ff_local, small)),
+        ("rust", "local", "gather100", gather_eager(r_local, small)),
+        ("fsfast", "memory", "gather100", gather_tasks(ff_mem, mem_small)),
+        ("rust", "memory", "gather100", gather_eager(r_mem, mem_small)),
     ]
 
     rows: list[dict[str, Any]] = []
 
     def keep(impl: str, backend: str, op: str) -> bool:
+        if fsfast_only and impl not in ("fsfast", "rust"):
+            return False
         return only is None or only in f"{impl}/{backend}/{op}"
 
     for impl, backend, op, fn in sync_cases:
         if keep(impl, backend, op):
             us = measure(lambda n, fn=fn: _time_sync(fn, n), repeat, target)
-            rows.append({"mode": "sync", "impl": impl, "backend": backend, "op": op, "us": us})
+            rows.append(
+                {"mode": "sync", "impl": impl, "backend": backend, "op": op, "us": us}
+            )
 
     async def run_async() -> None:
-        for impl, backend, op, fn in async_cases:
+        cases = [(*c, 1) for c in async_cases] + [(*c, GATHER) for c in gather_cases]
+        for impl, backend, op, fn, per in cases:
             if not keep(impl, backend, op):
                 continue
             # One event loop for all async rows; each run awaits serially.
@@ -180,7 +233,7 @@ def bench(repeat: int, target: float, only: str | None) -> list[dict[str, Any]]:
                     "impl": impl,
                     "backend": backend,
                     "op": op,
-                    "us": statistics.median(samples) * 1e6,
+                    "us": statistics.median(samples) * 1e6 / per,
                 }
             )
 
@@ -203,19 +256,89 @@ def bench(repeat: int, target: float, only: str | None) -> list[dict[str, Any]]:
 def print_table(rows: list[dict[str, Any]]) -> None:
     print(f"{'mode':<6} {'backend':<7} {'op':<10} {'impl':<13} {'us/op':>9}")
     for r in sorted(rows, key=lambda r: (r["mode"] != "sync", r["backend"], r["op"])):
-        print(f"{r['mode']:<6} {r['backend']:<7} {r['op']:<10} {r['impl']:<13} {r['us']:>9.2f}")
+        print(
+            f"{r['mode']:<6} {r['backend']:<7} {r['op']:<10} {r['impl']:<13} {r['us']:>9.2f}"
+        )
+
+
+def compare(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Run the benchmark once per entry of ``CONFIGS`` (fresh interpreters:
+    the switches are read once per process) and merge the rows."""
+    rows: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="fsfast-bench-cmp-") as tmp:
+        for name, env_over in CONFIGS.items():
+            env = {k: v for k, v in os.environ.items() if k not in _SWITCHES}
+            env.update(env_over)
+            out = os.path.join(tmp, f"{name}.json")
+            cmd = [sys.executable, os.path.abspath(__file__), "--json", out, "--quiet"]
+            cmd += ["--repeat", str(args.repeat), "--target", str(args.target)]
+            # Reference rows (os, fsspec) do not depend on the switches.
+            if name != "default":
+                cmd += ["--fsfast-only"]
+            if args.only:
+                cmd += ["--only", args.only]
+            if args.dir:
+                cmd += ["--dir", args.dir]
+            subprocess.run(cmd, env=env, check=True)
+            with open(out) as f:
+                for r in json.load(f):
+                    r["config"] = name if r["impl"] in ("fsfast", "rust") else "-"
+                    rows.append(r)
+    return rows
+
+
+def print_compare(rows: list[dict[str, Any]]) -> None:
+    names = list(CONFIGS)
+    table: dict[tuple[str, str, str, str], dict[str, float]] = {}
+    for r in rows:
+        key = (r["mode"], r["backend"], r["op"], r["impl"])
+        table.setdefault(key, {})[r["config"]] = r["us"]
+    head = f"{'mode':<6} {'backend':<7} {'op':<10} {'impl':<13}"
+    print(head + "".join(f" {n:>9}" for n in names) + "   (us/op)")
+    for key in sorted(table, key=lambda k: (k[0] != "sync", k[1], k[2], k[3])):
+        vals = table[key]
+        cells = []
+        for n in names:
+            v = vals.get(n, vals.get("-"))
+            cells.append(f" {v:>9.2f}" if v is not None else f" {'':>9}")
+        mode, backend, op, impl = key
+        print(f"{mode:<6} {backend:<7} {op:<10} {impl:<13}" + "".join(cells))
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--repeat", type=int, default=5, help="runs per row (median is reported)")
+    ap.add_argument(
+        "--repeat", type=int, default=5, help="runs per row (median is reported)"
+    )
     ap.add_argument("--target", type=float, default=0.2, help="seconds per run")
-    ap.add_argument("--only", help="substring filter on impl/backend/op, e.g. 'rust/local'")
+    ap.add_argument(
+        "--only", help="substring filter on impl/backend/op, e.g. 'rust/local'"
+    )
     ap.add_argument("--json", help="also write the rows to this file")
+    ap.add_argument(
+        "--dir",
+        help="directory for the local files (default: the temp dir; a tmpfs such as "
+        "/dev/shm takes disk latency out of pipe_file)",
+    )
+    ap.add_argument(
+        "--compare",
+        action="store_true",
+        help="fsfast rows per bridge configuration (CONFIGS)",
+    )
+    ap.add_argument("--fsfast-only", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
-    rows = bench(args.repeat, args.target, args.only)
-    print(f"python {sys.version.split()[0]}, fsfast {fsfast.__version__}, {os.cpu_count()} CPUs")
-    print_table(rows)
+    if not args.quiet:
+        print(
+            f"python {sys.version.split()[0]}, fsfast {fsfast.__version__}, {os.cpu_count()} CPUs"
+        )
+    if args.compare:
+        rows = compare(args)
+        print_compare(rows)
+    else:
+        rows = bench(args.repeat, args.target, args.only, args.fsfast_only, args.dir)
+        if not args.quiet:
+            print_table(rows)
     if args.json:
         with open(args.json, "w") as f:
             json.dump(rows, f, indent=1)

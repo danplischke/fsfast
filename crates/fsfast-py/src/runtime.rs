@@ -28,9 +28,20 @@
 //!   (local `stat`/`open`/small reads and writes) inline on the calling
 //!   thread through `fsfast_core::blocking`, so a local `info()` costs no
 //!   thread hop at all.
-//! * **Async calls** ([`future_into_py`]) return asyncio futures through
-//!   `pyo3-async-runtimes`; its generic runtime traits are implemented on top
-//!   of the same fork-aware runtime ([`FsfastRuntime`]).
+//! * **Async calls** ([`spawn_async`]) poll the operation on the event-loop
+//!   thread first (an already-resolved future when it completes, possibly
+//!   after a bounded busy-wait for a short blocking step) and otherwise
+//!   resolve the asyncio future from the loop's own selector through an
+//!   eventfd completion queue (see the section comment before
+//!   [`spawn_async`]). Loops that cannot watch descriptors fall back to
+//!   `pyo3-async-runtimes` ([`future_into_py`]), whose generic runtime
+//!   traits are implemented on top of the same fork-aware runtime
+//!   ([`FsfastRuntime`]).
+//! * **Switches** (read once per process, for diagnosis and for measuring
+//!   what each mechanism saves; see `tests/python/bench_overhead.py
+//!   --compare`): `FSFAST_SYNC_INLINE=0` (no inline blocking steps in sync
+//!   calls), `FSFAST_ASYNC_SPIN_US=<µs>` (busy-wait budget of async calls,
+//!   0 disables), `FSFAST_ASYNC_COMPLETION=pyo3` (no completion queue).
 
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -131,6 +142,37 @@ pub(crate) fn watch_forks() {
 
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
+}
+
+/// A boolean environment switch: `0`, `false`, `off` and `no` (any case)
+/// turn it off; anything else, or unset, leaves it on.
+fn env_switch(name: &str) -> bool {
+    std::env::var(name).map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Whether sync single-operation calls let backends run short blocking
+/// steps inline ([`block_on_inline`]); `FSFAST_SYNC_INLINE=0` disables it
+/// (a diagnostic switch, also used to measure the saving). Read once.
+fn sync_inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_switch("FSFAST_SYNC_INLINE"))
+}
+
+/// Whether async calls complete through the event loop's own selector
+/// ([`spawn_async`]); `FSFAST_ASYNC_COMPLETION=pyo3` uses
+/// `pyo3-async-runtimes` for every pending call instead (a diagnostic
+/// switch, also used to measure the saving). Read once.
+fn completion_queue_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FSFAST_ASYNC_COMPLETION")
+            .map_or(true, |v| !v.trim().eq_ignore_ascii_case("pyo3"))
+    })
 }
 
 fn build_runtime() -> Runtime {
@@ -254,7 +296,8 @@ where
     F::Output: Send,
 {
     let slot = runtime();
-    py.detach(move || drive_with(&slot, fut, true))
+    let inline = sync_inline_enabled();
+    py.detach(move || drive_with(&slot, fut, inline))
 }
 
 /// Drive `fut` on the current (detached) thread; backends' blocking steps
@@ -480,6 +523,16 @@ where
 // * The operation is polled once on the calling (event-loop) thread with a
 //   real waker. Ready at once (memory, caches): an already-resolved future
 //   is returned.
+// * Pending only on a short blocking step (`fsfast_core::blocking`: a local
+//   `stat`, a small read or write) while the loop has nothing else ready to
+//   run: the calling thread busy-waits for that step (detached from the
+//   interpreter) for at most [`async_spin`], polls again and usually returns
+//   an already-resolved future. The loop would otherwise go to sleep in its
+//   selector and pay a full thread wake-up (plus a loop iteration) for the
+//   result. Not while other callbacks are ready or while a result resolved
+//   this way is still held unconsumed (a batch being launched): those calls
+//   must overlap instead. See [`Task::first_polls`] and
+//   [`Completer::spin_budget`].
 // * Otherwise the waker belongs to a [`Task`]: waking it pushes the task on
 //   its loop's [`Completer`] queue and signals an eventfd (a pipe on other
 //   Unixes) that the loop watches with `add_reader`. No thread hop, no
@@ -511,17 +564,29 @@ pub(crate) type OpFuture = Pin<Box<dyn Future<Output = crate::out::Converted> + 
 pub(crate) fn spawn_async<'py>(py: Python<'py>, fut: OpFuture) -> PyResult<Bound<'py, PyAny>> {
     let event_loop = pyo3_async_runtimes::get_running_loop(py)?;
     let slot = runtime();
+    if !completion_queue_enabled() {
+        return spawn_async_fallback(py, event_loop, &slot, fut);
+    }
     let Some(completer) = completer_for(py, &event_loop)? else {
         return spawn_async_fallback(py, event_loop, &slot, fut);
     };
+    let spin = completer.spin_budget(py);
     let task = Arc::new(Task {
         fut: parking_lot::Mutex::new(Stage::Loop(fut)),
         py_future: std::sync::OnceLock::new(),
         completer,
         scheduled: AtomicBool::new(false),
+        spin: std::sync::atomic::AtomicU8::new(SPIN_ARMED),
     });
-    match py.detach(|| task.poll_on_this_thread(&slot)) {
-        Polled::Ready(out) => resolved_future(py, &event_loop, out.into_pyobject(py)),
+    let (polled, spun) = py.detach(|| task.first_polls(&slot, spin));
+    match polled {
+        Polled::Ready(out) => {
+            let fut = resolved_future(py, &event_loop, out.into_pyobject(py))?;
+            if spun {
+                task.completer.note_spun(&fut);
+            }
+            Ok(fut)
+        }
         Polled::Pending => {
             // Wakes that already happened are queued and only processed by
             // the loop, i.e. after this returns and the future is set.
@@ -594,6 +659,31 @@ enum Polled {
     Gone,
 }
 
+/// [`Task::spin`]: the calling thread is not (or no longer) waiting for a
+/// wake-up; wakes go through the completion queue.
+const SPIN_OFF: u8 = 0;
+/// The calling thread polls or busy-waits for the task: a wake only sets
+/// [`SPIN_WOKEN`].
+const SPIN_ARMED: u8 = 1;
+/// Woken while [`SPIN_ARMED`]: the calling thread polls again.
+const SPIN_WOKEN: u8 = 2;
+
+/// Default for [`async_spin`], in microseconds: comfortably above one
+/// blocking-pool round trip plus a small local syscall on a loaded VM
+/// (about 15-30 µs here), far below anything a network operation takes.
+const DEFAULT_ASYNC_SPIN_US: u64 = 50;
+
+/// How long an async call may busy-wait on the event-loop thread for a
+/// short blocking step before handing over to the completion queue
+/// (`FSFAST_ASYNC_SPIN_US`, default [`DEFAULT_ASYNC_SPIN_US`]; 0 disables
+/// spinning). Read once per process.
+fn async_spin() -> Duration {
+    static SPIN_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_micros(*SPIN_US.get_or_init(|| {
+        env_usize("FSFAST_ASYNC_SPIN_US").map_or(DEFAULT_ASYNC_SPIN_US, |v| v as u64)
+    }))
+}
+
 /// One awaited operation.
 struct Task {
     fut: parking_lot::Mutex<Stage>,
@@ -602,23 +692,95 @@ struct Task {
     completer: Arc<Completer>,
     /// Queued for a poll on the loop thread (coalesces repeated wakes).
     scheduled: AtomicBool,
+    /// Hand-off with the calling thread during the first polls
+    /// ([`SPIN_OFF`], [`SPIN_ARMED`], [`SPIN_WOKEN`]).
+    spin: std::sync::atomic::AtomicU8,
 }
 
 impl Wake for Task {
     fn wake(self: Arc<Self>) {
-        if !self.scheduled.swap(true, Ordering::AcqRel) {
-            self.completer.push(Completion::Poll(self.clone()));
-        }
+        self.wake_by_ref();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        if !self.scheduled.swap(true, Ordering::AcqRel) {
-            self.completer.push(Completion::Poll(self.clone()));
+        // The calling thread is still polling or waiting for this task:
+        // flag it, no queue, no eventfd. (Already woken: nothing to add.)
+        match self.spin.compare_exchange(
+            SPIN_ARMED,
+            SPIN_WOKEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(SPIN_WOKEN) => return,
+            Err(_) => {}
         }
+        self.schedule();
     }
 }
 
 impl Task {
+    /// Queue a poll on the loop thread (once until that poll starts).
+    fn schedule(self: &Arc<Self>) {
+        if !self.scheduled.swap(true, Ordering::AcqRel) {
+            self.completer.push(Completion::Poll(self.clone()));
+        }
+    }
+
+    /// The first poll(s), on the calling (event-loop) thread, detached from
+    /// the interpreter. `spin` is the busy-wait budget, `None` when the
+    /// loop has other work ready.
+    ///
+    /// After a `Pending` poll the thread busy-waits for the task's wake-up
+    /// only if that poll sent a short blocking step to the pool
+    /// (`fsfast_core::blocking::pool_dispatches` moved): such a step takes
+    /// microseconds, while a sleeping event loop pays a full thread wake-up
+    /// (eventfd, selector, one more loop iteration) for the result. The
+    /// wait is bounded by `spin` in total, so the loop is never held longer
+    /// than that, whatever the backend does; network I/O and timers never
+    /// trigger it. On return the task is [`SPIN_OFF`] and any later (or
+    /// unconsumed) wake goes through the completion queue.
+    ///
+    /// Also returns whether the result came after a busy-wait.
+    fn first_polls(self: &Arc<Self>, slot: &RuntimeSlot, spin: Option<Duration>) -> (Polled, bool) {
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let before = fsfast_core::blocking::pool_dispatches();
+            let polled = self.poll_on_this_thread(slot);
+            if !matches!(polled, Polled::Pending) {
+                self.spin.store(SPIN_OFF, Ordering::Release);
+                return (polled, deadline.is_some());
+            }
+            let short_step = fsfast_core::blocking::pool_dispatches() != before;
+            let mut may_spin = false;
+            if let (Some(budget), true) = (spin, short_step) {
+                let now = Instant::now();
+                let end = *deadline.get_or_insert(now + budget);
+                may_spin = now < end;
+                while may_spin && self.spin.load(Ordering::Acquire) != SPIN_WOKEN {
+                    std::hint::spin_loop();
+                    may_spin = Instant::now() < end;
+                }
+            }
+            match self.spin.compare_exchange(
+                SPIN_ARMED,
+                SPIN_OFF,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // Not woken: the queue delivers the wake-up later.
+                Ok(_) => return (Polled::Pending, false),
+                // Woken in time: re-arm and poll again right here.
+                Err(_) if may_spin => self.spin.store(SPIN_ARMED, Ordering::Release),
+                // Woken, but no (more) spinning: let the loop poll it.
+                Err(_) => {
+                    self.spin.store(SPIN_OFF, Ordering::Release);
+                    self.schedule();
+                    return (Polled::Pending, false);
+                }
+            }
+        }
+    }
+
     /// Poll the future on this (detached, non-worker) thread with the task
     /// as waker. Inline blocking is not allowed here: this is the event
     /// loop's thread, which must not wait for syscalls.
@@ -736,6 +898,16 @@ enum Completion {
 /// loop watches (`add_reader`) to learn that the queue is not empty.
 struct Completer {
     queue: parking_lot::Mutex<Vec<Completion>>,
+    /// The loop's queue of ready callbacks (`BaseEventLoop._ready`, a
+    /// deque), if it has one: async calls only busy-wait while it is empty
+    /// (see [`Task::first_polls`]). `None` (e.g. uvloop): never spin.
+    ready: Option<Py<PyAny>>,
+    /// The last asyncio future resolved after a busy-wait, weakly. While
+    /// it is alive the caller holds results it has not consumed, i.e. it is
+    /// launching a batch of calls before awaiting them (`gather` over
+    /// awaitables created up front): those must overlap, so nothing spins
+    /// until it is gone. Only touched with the interpreter attached.
+    last_spun: parking_lot::Mutex<Option<Py<pyo3::types::PyWeakrefReference>>>,
     /// Whether the descriptor has been signalled since the loop last
     /// drained the queue: one `write` per batch of completions.
     signaled: AtomicBool,
@@ -746,6 +918,39 @@ struct Completer {
 }
 
 impl Completer {
+    /// The busy-wait budget for an async call made now: `None` when spinning
+    /// is disabled, the loop's ready queue is unknown, or other callbacks
+    /// are ready to run (e.g. the other tasks of an `asyncio.gather`, which
+    /// would otherwise run one after another instead of overlapping).
+    fn spin_budget(&self, py: Python<'_>) -> Option<Duration> {
+        let budget = async_spin();
+        if budget.is_zero() {
+            return None;
+        }
+        let ready = self.ready.as_ref()?.bind(py);
+        if !matches!(ready.len(), Ok(0)) {
+            return None;
+        }
+        let mut last = self.last_spun.lock();
+        if let Some(w) = &*last {
+            use pyo3::types::PyWeakrefMethods;
+            if w.bind(py).upgrade().is_some() {
+                return None;
+            }
+            *last = None;
+        }
+        Some(budget)
+    }
+
+    /// Remember `fut`, just resolved after a busy-wait (see `last_spun`).
+    fn note_spun(&self, fut: &Bound<'_, PyAny>) {
+        // asyncio futures (C and Python) support weak references; if one
+        // does not, the batch detection is simply off for it.
+        *self.last_spun.lock() = pyo3::types::PyWeakrefReference::new(fut)
+            .ok()
+            .map(Bound::unbind);
+    }
+
     fn push(&self, c: Completion) {
         self.queue.lock().push(c);
         // AcqRel RMW on both sides (see `CompletionReader::__call__`): if
@@ -978,8 +1183,18 @@ fn register_completer(
     let py = event_loop.py();
     let notify = Notifier::new()?;
     let fd = notify.raw_read_fd();
+    // `_ready` is an implementation detail of asyncio's `BaseEventLoop`
+    // (one deque for the loop's lifetime). Anything else: no spinning.
+    let deque = py.import("collections")?.getattr("deque")?;
+    let ready = event_loop
+        .getattr(pyo3::intern!(py, "_ready"))
+        .ok()
+        .filter(|r| r.get_type().is(&deque))
+        .map(Bound::unbind);
     let completer = Arc::new(Completer {
         queue: parking_lot::Mutex::new(Vec::new()),
+        ready,
+        last_spun: parking_lot::Mutex::new(None),
         signaled: AtomicBool::new(false),
         notify,
         generation,
@@ -1293,6 +1508,23 @@ mod tests {
                     }
                     Ok(PyOut::Str(format!("steps{id}")))
                 }
+                // One short `fsfast_core::blocking` step (a local `stat`):
+                // the calling thread may busy-wait for it.
+                "blocking" => {
+                    let v = fsfast_core::blocking(move || Ok(id * 3)).await.unwrap();
+                    Ok(PyOut::Str(format!("blocking{v}")))
+                }
+                // A "short" step that is in fact slow: the busy-wait gives
+                // up after its budget and the queue delivers the result.
+                "blocking_slow" => {
+                    fsfast_core::blocking(|| {
+                        std::thread::sleep(Duration::from_millis(30));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                    Ok(PyOut::Str(format!("slow{id}")))
+                }
                 "error" => {
                     tokio::task::spawn_blocking(|| ()).await.unwrap();
                     Err(fsfast_core::Error::not_found(format!("/missing/{id}")))
@@ -1322,6 +1554,14 @@ mod tests {
             .is_some_and(|s| s.contains(&id))
     }
 
+    /// Whether an async call made now on the running loop may busy-wait.
+    #[pyfunction]
+    fn spin_now(py: Python<'_>) -> PyResult<bool> {
+        let lp = pyo3_async_runtimes::get_running_loop(py)?;
+        let c = completer_for(py, &lp)?.expect("loop with add_reader");
+        Ok(c.spin_budget(py).is_some())
+    }
+
     #[pyfunction]
     fn loops_known() -> usize {
         LOOPS.with(|l| l.borrow().len())
@@ -1335,6 +1575,8 @@ mod tests {
             g.set_item("dropped", wrap_pyfunction!(dropped, py).unwrap())
                 .unwrap();
             g.set_item("loops_known", wrap_pyfunction!(loops_known, py).unwrap())
+                .unwrap();
+            g.set_item("spin_now", wrap_pyfunction!(spin_now, py).unwrap())
                 .unwrap();
             if let Err(e) = py.run(code, Some(&g), None) {
                 e.display(py);
@@ -1362,6 +1604,79 @@ async def main():
     got = await asyncio.gather(*(op(kinds[i % 3], i) for i in range(3000)))
     want = [('ready%d', 'hop%d', 'steps%d')[i % 3] % (i * 2 if i % 3 == 1 else i)
             for i in range(3000)]
+    assert got == want
+asyncio.run(main())
+",
+        );
+    }
+
+    #[test]
+    fn async_busy_waits_for_short_blocking_steps_only_when_the_loop_is_idle() {
+        assert_eq!(async_spin(), Duration::from_micros(DEFAULT_ASYNC_SPIN_US));
+        run_py(
+            c"
+import asyncio, time
+async def main():
+    loop = asyncio.get_running_loop()
+    # Idle loop: the step is usually waited for on this thread and the
+    # future comes back resolved (timing-dependent, so not every time).
+    done_at_once = 0
+    for i in range(3000):
+        f = op('blocking', i)
+        done_at_once += f.done()
+        assert await f == 'blocking%d' % (3 * i)
+        del f  # a held result would stop the next call from spinning
+        if done_at_once >= 10:
+            break
+    assert done_at_once >= 10, 'rarely resolved by the busy-wait'
+    # Other callbacks ready (e.g. gather's tasks): no busy-wait, the
+    # results come through the completion queue. (Whether a given call
+    # completes at once is timing-dependent: under load a busy pool thread
+    # can finish the step before the first poll ends. So the decision is
+    # checked, plus the results.)
+    assert spin_now()
+    loop.call_soon(lambda: None)
+    assert not spin_now()
+    f = op('blocking', 1000)
+    assert await f == 'blocking3000'
+    del f
+    await asyncio.sleep(0)  # the call may not have yielded: run the lambda
+    assert spin_now()
+    # Awaitables created up front (a batch): once a busy-waited result is
+    # held unconsumed, the rest of the batch does not spin and overlaps.
+    # (A result may also be ready at the first poll, without a busy-wait;
+    # that one is not remembered, hence the spin_now() in the condition.)
+    for attempt in range(3000):
+        futs = [op('blocking', 2000)]
+        if futs[0].done() and not spin_now():
+            break
+        await futs[0]
+    assert futs[0].done() and not spin_now(), 'never resolved by the busy-wait'
+    futs += [op('blocking', 2000 + i) for i in range(1, 20)]
+    assert not spin_now()
+    assert await asyncio.gather(*futs) == ['blocking%d' % (3 * (2000 + i)) for i in range(20)]
+    del futs
+    # The batch's results are gone (asyncio keeps the finished gather, and
+    # so its children, reachable until the task next waits on a future):
+    # calls spin again.
+    await asyncio.sleep(0.001)
+    assert spin_now()
+    # The busy-wait is bounded: a slow (30 ms) step returns a pending
+    # future, long before it completes.
+    t = time.perf_counter()
+    f = op('blocking_slow', 7)
+    assert not f.done()
+    assert await f == 'slow7'
+    assert time.perf_counter() - t >= 0.03
+    # Timers and I/O (no blocking step) never trigger it.
+    f = op('steps', 8)
+    assert not f.done()
+    assert await f == 'steps8'
+    # Mixed concurrent batch.
+    kinds = ['blocking', 'hop', 'ready', 'blocking_slow']
+    got = await asyncio.gather(*(op(kinds[i % 4], i) for i in range(40)))
+    want = [('blocking%d' % (3 * i), 'hop%d' % (2 * i), 'ready%d' % i, 'slow%d' % i)[i % 4]
+            for i in range(40)]
     assert got == want
 asyncio.run(main())
 ",

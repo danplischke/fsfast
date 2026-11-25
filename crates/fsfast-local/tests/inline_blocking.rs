@@ -209,3 +209,80 @@ fn long_or_parallel_work_still_uses_the_pool() {
         Poll::Pending => panic!("a single rm_files batch did not run inline"),
     }
 }
+
+/// Opening a named pipe waits for the other end, possibly forever: inline,
+/// the caller could no longer see Ctrl-C. Such opens must go to the pool
+/// (the first poll stays pending) and still work once the other end shows
+/// up.
+#[cfg(unix)]
+#[test]
+fn opening_a_named_pipe_is_never_inline() {
+    use std::io::{Read, Write};
+    let rt = runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let root = root_of(&dir);
+    let fs = Arc::new(LocalFileSystem::new());
+    let fifo = dir.path().join("fifo");
+    let st = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(st.success());
+    let path = format!("{root}/fifo");
+
+    // cat_file: the pool opens it once a writer appears. (It reads the
+    // size `fstat` reports, 0 for a pipe; only the open matters here.)
+    let mut cat = Box::pin(fs.cat_file(&path, ByteRange::Full));
+    assert!(first_poll(&rt, cat.as_mut()).is_pending());
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let mut w = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            let _ = w.write_all(b"through the pipe"); // EPIPE once the reader closes
+        })
+    };
+    block_on_inline(&rt, cat).unwrap();
+    writer.join().unwrap();
+
+    // pipe_file / touch / open_write / open_read: pending too (each would
+    // block in open until a peer appears).
+    let wo = WriteOptions::default();
+    let mut pipe = Box::pin(fs.pipe_file(&path, Bytes::from_static(b"x"), &wo));
+    assert!(first_poll(&rt, pipe.as_mut()).is_pending());
+    let reader = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::fs::File::open(fifo)
+                .unwrap()
+                .read_to_end(&mut buf)
+                .unwrap();
+            buf
+        })
+    };
+    block_on_inline(&rt, pipe).unwrap();
+    assert_eq!(reader.join().unwrap(), b"x");
+    // (touch without truncate does not open the pipe and would finish on
+    // the pool at once: keep the pool busy so that Ready could only mean
+    // inline.)
+    let busy = occupy_pool(&rt);
+    let mut touch = Box::pin(fs.touch(&path, false));
+    assert!(first_poll(&rt, touch.as_mut()).is_pending());
+    drop(busy);
+    block_on_inline(&rt, touch).unwrap();
+    let ro = fsfast_core::ReadOptions::default();
+    let mut open = Box::pin(fs.open_read(&path, &ro));
+    assert!(first_poll(&rt, open.as_mut()).is_pending());
+    // A writer that keeps its end open until the reader is open.
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let w = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(w);
+        })
+    };
+    let handle = block_on_inline(&rt, open).unwrap();
+    writer.join().unwrap();
+    drop(handle);
+}

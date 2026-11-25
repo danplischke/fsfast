@@ -198,9 +198,12 @@ def test_azure_find_honours_maxdepth():
         assert len(fs.find(f"{c}/s")) == 3
         with pytest.raises(ValueError):
             fs.find(f"{c}/s", maxdepth=0)
-        fs.mkdir(f"{c}/t")
+        # mkdir below a container is a no-op (adlfs), so the target
+        # directory exists through a blob in it; fsspec's memory filesystem
+        # gives the same result for this sequence.
+        fs.pipe_file(f"{c}/t/x", b"")
         fs.cp(f"{c}/s", f"{c}/t", recursive=True, maxdepth=1)
-        assert fs.find(f"{c}/t") == [f"{c}/t/f1"]
+        assert fs.find(f"{c}/t") == [f"{c}/t/f1", f"{c}/t/x"]
     finally:
         fs.rm(c, recursive=True)
 

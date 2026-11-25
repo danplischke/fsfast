@@ -68,7 +68,7 @@ upstream() {
       PYTHONPATH="$HERE/upstream${PYTHONPATH:+:$PYTHONPATH}" \
       "$PY" -m pytest -c "$HERE/upstream/ini/$shim.ini" --rootdir "$dir" \
       -p fsfast_shim -p no:cacheprovider -q -W ignore --timeout "$TIMEOUT" \
-      -rfE --junitxml="$xml" "$@") 2>&1 | tail -n 25
+      -rfEX --junitxml="$xml" "$@") 2>&1 | tail -n 25
   RAN+=("$xml")
   if [[ $impl == fsfast ]] && ! "$PY" "$HERE/summarize.py" --clean "$xml" >/dev/null; then STATUS=1; fi
 }
@@ -77,7 +77,7 @@ abstract() {
   local impl=$1 name=$2 xml="$REPORTS/$2.xml"
   echo "== $name ($impl)"
   (cd "$ROOT" && FSFAST_COMPLIANCE_IMPL="$impl" "$PY" -m pytest tests/compliance/abstract \
-      -p no:cacheprovider -q -W ignore --timeout "$TIMEOUT" -rfE --junitxml="$xml") 2>&1 | tail -n 25
+      -p no:cacheprovider -q -W ignore --timeout "$TIMEOUT" -rfEX --junitxml="$xml") 2>&1 | tail -n 25
   RAN+=("$xml")
   if [[ $impl == fsfast ]] && ! "$PY" "$HERE/summarize.py" --clean "$xml" >/dev/null; then STATUS=1; fi
 }
@@ -114,7 +114,8 @@ for suite in "${SUITES[@]}"; do
       fsspec)
         I=fsspec/implementations/tests
         upstream fsspec "$impl" "fsspec$sfx" "$UP/fsspec-git-$V_FSSPEC" \
-          $I/test_local.py $I/local $I/test_memory.py $I/memory $I/test_http.py $I/test_http_sync.py ;;
+          $I/test_local.py $I/local $I/test_memory.py $I/memory $I/test_http.py $I/test_http_sync.py \
+          fsspec/tests/abstract/mv.py ;;
       fsspec-net)
         if [[ -z "${FSFAST_TEST_SMB_HOST:-}" || -z "${FSFAST_TEST_SFTP_HOST:-}" ]]; then
           echo "== fsspec-net skipped: SMB/SFTP services not configured"; continue
@@ -127,10 +128,15 @@ for suite in "${SUITES[@]}"; do
         STORAGE_EMULATOR_HOST="$FSFAST_TEST_GCS_ENDPOINT" GCSFS_TEST_BUCKET="${tag}-b" \
         GCSFS_TEST_VERSIONED_BUCKET="${tag}-v" GCSFS_TEST_REQ_PAYS_BUCKET="${tag}-rp" \
         GCSFS_TEST_PROJECT=test GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT=false \
-          upstream gcsfs "$impl" "gcsfs$sfx" "$UP/gcsfs-git-$V_GCSFS" gcsfs/tests/test_core.py gcsfs/tests/derived ;;
+          upstream gcsfs "$impl" "gcsfs$sfx" "$UP/gcsfs-git-$V_GCSFS" gcsfs/tests/test_core.py gcsfs/tests/derived \
+          gcsfs/tests/test_mapping.py gcsfs/tests/test_dircache.py gcsfs/tests/test_caching.py \
+          gcsfs/tests/test_core_versioned.py gcsfs/tests/test_manyopens.py gcsfs/tests/test_checkers.py ;;
       adlfs)
         if [[ -z "${FSFAST_TEST_AZURE_CONNECTION_STRING:-}" ]]; then echo "== adlfs skipped: no Azurite"; continue; fi
-        upstream adlfs "$impl" "adlfs$sfx" "$UP/adlfs-$V_ADLFS" adlfs/tests ;;
+        # test_large_upload_overflow writes a 3 GiB blob (several GiB of
+        # Azurite storage on the shared disk): not run, for either impl.
+        upstream adlfs "$impl" "adlfs$sfx" "$UP/adlfs-$V_ADLFS" adlfs/tests \
+          --deselect adlfs/tests/test_spec.py::test_large_upload_overflow ;;
       *) echo "unknown suite $suite" >&2; exit 2 ;;
     esac
   done

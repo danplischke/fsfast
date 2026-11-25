@@ -1,12 +1,14 @@
-"""Summarize pytest JUnit XML reports from ``tests/compliance/run.sh``.
+r"""Summarize pytest JUnit XML reports from ``tests/compliance/run.sh``.
 
 Usage::
 
-    python tests/compliance/summarize.py REPORT.xml [...] [--group N | --by-report] [--failures] [--clean]
+    python tests/compliance/summarize.py REPORT.xml [...] [--group N | --by-report | --pattern RE] [--failures] [--clean]
 
 Prints passed/failed/error/skipped/xfailed counts per test class (``--group``
 picks how many ``::``-separated parts of the test id form the group key)
-and, with ``--failures``, the first line of each failure message.
+(``--pattern`` groups by the first regex group matched in the class name,
+e.g. ``'Test(\w+?)(?:Copy|Get|Put|Open|Pipe)$'`` gives one row per
+backend of the abstract suite) and, with ``--failures``, the first line of each failure message.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import argparse
 import collections
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -38,6 +41,7 @@ def main() -> None:
     ap.add_argument("--group", type=int, default=1, help="classname parts used as the group key")
     ap.add_argument("--failures", action="store_true")
     ap.add_argument("--by-report", action="store_true", help="one row per report file")
+    ap.add_argument("--pattern", help="group by the first group of this regex on the class name")
     ap.add_argument("--clean", action="store_true", help="exit 1 if anything failed or errored")
     args = ap.parse_args()
 
@@ -49,6 +53,9 @@ def main() -> None:
             cls = case.get("classname", "")
             if args.by_report:
                 group = os.path.splitext(os.path.basename(report))[0]
+            elif args.pattern:
+                m = re.search(args.pattern, cls)
+                group = m.group(1) if m else cls
             else:
                 group = ".".join(cls.split(".")[-args.group :]) if args.group else cls
             kind, msg = outcome(case)

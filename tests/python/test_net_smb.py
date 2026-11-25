@@ -70,6 +70,12 @@ def backend(share: str) -> np_.Backend:
             # recursive=True; fsfast copies server-side (FSCTL_SRV_COPYCHUNK).
             "cp_file": "fsspec smb raises NotImplementedError",
             "copy recursive": "fsspec smb raises TypeError",
+            # fsspec's smb glob never matches a directory (its find keys
+            # carry a trailing "/"); fsfast matches directories as fsspec's
+            # glob does elsewhere and its abstract suite requires.
+            "glob star": "fsspec smb omits directories",
+            "glob doublestar": "fsspec smb names directories with a trailing /",
+            "glob detail": "fsspec smb omits directories",
             # smbclient files reject 'xb' on an existing file with
             # SMBOSError(EEXIST)... and fsspec's generic mv of a directory
             # is a single server rename in both; see python-parity.md.

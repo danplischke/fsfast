@@ -193,6 +193,12 @@ impl BlobHeaders {
             }
             cs.finish()?;
         }
+        // adlfs `open(..., metadata=...)` / `pipe_file(..., metadata=...)`
+        // arrive as a per-call extra; they add to `WriteOptions::metadata`.
+        let mut metadata = opts.metadata.clone();
+        if let Some(m) = r.string_map("metadata")? {
+            metadata.extend(m);
+        }
         // Accepted for adlfs compatibility; concurrency comes from the
         // filesystem settings.
         r.accept_ignored(&["max_concurrency", "overwrite"]);
@@ -200,12 +206,12 @@ impl BlobHeaders {
         if let Some(ct) = &opts.content_type {
             h.set("x-ms-blob-content-type", ct, "content type")?;
         }
-        if opts.metadata.is_empty() {
+        if metadata.is_empty() {
             let mut m = BTreeMap::new();
             m.insert("is_directory".to_owned(), "false".to_owned());
             h.set_metadata(&m)?;
         } else {
-            h.set_metadata(&opts.metadata)?;
+            h.set_metadata(&metadata)?;
         }
         Ok(h)
     }
@@ -1049,6 +1055,28 @@ mod tests {
         assert_eq!(h.headers["x-ms-blob-content-type"], "text/plain");
         assert_eq!(h.headers["x-ms-blob-cache-control"], "no-cache");
         o.extra.insert("bogus".into(), Value::Int(1));
+        assert!(BlobHeaders::from_options(&o).is_err());
+    }
+
+    #[test]
+    fn metadata_from_extra() {
+        // adlfs `open(..., metadata={...})` arrives as a per-call extra.
+        let mut o = WriteOptions::default();
+        let mut m = BTreeMap::new();
+        m.insert("user".to_owned(), Value::Str("x".into()));
+        o.extra.insert("metadata".into(), Value::Map(m));
+        let h = BlobHeaders::from_options(&o).unwrap();
+        assert_eq!(h.headers["x-ms-meta-user"], "x");
+        assert!(!h.headers.contains_key("x-ms-meta-is_directory"));
+        // Merged with WriteOptions::metadata.
+        o.metadata.insert("k".into(), "v".into());
+        let h = BlobHeaders::from_options(&o).unwrap();
+        assert_eq!(h.headers["x-ms-meta-user"], "x");
+        assert_eq!(h.headers["x-ms-meta-k"], "v");
+        // Values must be strings.
+        let mut bad = BTreeMap::new();
+        bad.insert("n".to_owned(), Value::Int(1));
+        o.extra.insert("metadata".into(), Value::Map(bad));
         assert!(BlobHeaders::from_options(&o).is_err());
     }
 }

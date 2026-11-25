@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import os
 import re
+import warnings
 from typing import Any
 from urllib.parse import parse_qs
 
+from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.utils import infer_storage_options
 
 from ._objstore import ObjectStoreFileSystem
@@ -14,7 +17,9 @@ from ._objstore import ObjectStoreFileSystem
 __all__ = ["AzureBlobFileSystem"]
 
 _ROOT_PATH = "/"
-_DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024
+#: adlfs ``_DEFAULT_BLOCK_SIZE`` (the ``blocksize`` attribute of the
+#: filesystem and of its files).
+_DEFAULT_BLOCK_SIZE = 50 * 2**20
 _STORAGE_SCOPE = "https://storage.azure.com/.default"
 
 
@@ -73,6 +78,44 @@ def _content_settings(**fields: Any) -> Any:
     return _CONTENT_SETTINGS(**fields)
 
 
+_CS_FIELDS = (
+    "content_type",
+    "content_encoding",
+    "content_language",
+    "content_md5",
+    "content_disposition",
+    "cache_control",
+)
+
+
+def _content_settings_option(cs: Any) -> dict[str, Any] | None:
+    """adlfs ``content_settings`` (a dict, the documented form, or an
+    ``azure.storage.blob.ContentSettings``) as the fsfast-azure write
+    option: a dict of the fields that are set."""
+    if cs is None:
+        return None
+    if isinstance(cs, dict):
+        fields = dict(cs)
+    else:
+        fields = {k: getattr(cs, k, None) for k in _CS_FIELDS}
+    out = {k: v for k, v in fields.items() if v is not None}
+    if isinstance(out.get("content_md5"), bytearray):
+        out["content_md5"] = bytes(out["content_md5"])
+    return out
+
+
+def _write_extra(content_settings: Any = None, metadata: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """Per-call write options for the Rust backend (``None`` when there are
+    none, so the batch paths stay in use)."""
+    extra: dict[str, Any] = {}
+    cs = _content_settings_option(content_settings)
+    if cs:
+        extra["content_settings"] = cs
+    if metadata:
+        extra["metadata"] = {str(k): str(v) for k, v in metadata.items()}
+    return extra or None
+
+
 class AzureBlobFileSystem(ObjectStoreFileSystem):
     """Drop-in replacement for ``adlfs.AzureBlobFileSystem``.
 
@@ -85,6 +128,7 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
 
     protocol = ("abfs", "az", "abfss")
     root_marker = ""
+    _rm_skips_nonempty_dirs = True
     _rust_protocol = "abfs"
 
     def __init__(
@@ -125,7 +169,12 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
         self.client_id = client_id
         self.client_secret = client_secret
         self.tenant_id = tenant_id
-        self.anon = anon
+        if anon is not None:
+            self.anon = anon
+        else:
+            # adlfs resolves the attribute from $AZURE_STORAGE_ANON (as the
+            # Rust backend does for the connection).
+            self.anon = os.getenv("AZURE_STORAGE_ANON", "false").lower() not in ("false", "0", "f", "")
         self.location_mode = location_mode
         self.blocksize = blocksize
         self.default_fill_cache = default_fill_cache
@@ -264,12 +313,10 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
         # listed. adlfs ignores ``maxdepth`` (so ``cp``/``rm``/``get`` with
         # ``maxdepth`` act on the whole tree); fsfast honours it, as
         # fsspec's contract (and its abstract test suite) requires.
-        if prefix:
-            raise NotImplementedError("fsfast.AzureBlobFileSystem.find does not support prefix=")
         _check_maxdepth(maxdepth)
         full = self._listing_key(path)
         found = self._fix_all(self._rfs.find(full, None, True, True))
-        return self._adlfs_find(full, found, withdirs, detail, maxdepth)
+        return self._adlfs_find(full, found, withdirs, detail, maxdepth, prefix)
 
     async def _find(
         self,
@@ -279,13 +326,11 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
         maxdepth: int | None = None,
         **kwargs: Any,
     ) -> Any:
-        if prefix:
-            raise NotImplementedError("fsfast.AzureBlobFileSystem.find does not support prefix=")
         _check_maxdepth(maxdepth)
         detail = kwargs.pop("detail", False)
         full = self._listing_key(path)
         found = self._fix_all(await self._rfs.find_async(full, None, True, True))
-        return self._adlfs_find(full, found, withdirs, detail, maxdepth)
+        return self._adlfs_find(full, found, withdirs, detail, maxdepth, prefix)
 
     @staticmethod
     def _adlfs_find(
@@ -294,13 +339,18 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
         withdirs: bool,
         detail: bool,
         maxdepth: int | None = None,
+        prefix: str = "",
     ) -> Any:
         if len(found) == 1:
             (only,) = found.values()
             if only["type"] == "file" and only["name"] == full:
                 return [full]
-        target = f"{full}/"
-        cut = len(target)
+        # adlfs's ``prefix=`` keeps the names starting with
+        # ``path/prefix``. fsfast filters the listing of ``path`` (adlfs
+        # lists with ``name_starts_with``; the result is the same, adlfs
+        # transfers less for a narrow prefix of a large tree).
+        cut = len(full) + 1
+        target = f"{full}/{prefix.strip('/')}" if prefix else f"{full}/"
         out = {
             k: v
             for k, v in sorted(found.items())
@@ -355,7 +405,7 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
             raise NotImplementedError("fsfast.AzureBlobFileSystem.ls does not list versions")
         if invalidate_cache:
             self.dircache.clear()
-        return super().ls(path, detail=detail, refresh=return_glob)
+        return super().ls(self._ls_target(path), detail=detail, refresh=return_glob)
 
     async def _ls(
         self,
@@ -372,7 +422,15 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
             raise NotImplementedError("fsfast.AzureBlobFileSystem.ls does not list versions")
         if invalidate_cache:
             self.dircache.clear()
-        return await super()._ls(path, detail=detail, refresh=return_glob)
+        return await super()._ls(self._ls_target(path), detail=detail, refresh=return_glob)
+
+    def _ls_target(self, path: Any) -> Any:
+        """adlfs lists the containers for ``""``, ``"."``, ``"*"`` and
+        ``"/"`` (each optionally followed by ``/``)."""
+        container, key, _ = self.split_path(path)
+        if container in ("", ".", "*", "/") and key in ("", "/"):
+            return ""
+        return path
 
     @staticmethod
     def _names(out: list[dict[str, Any]]) -> list[str]:
@@ -381,24 +439,80 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
     # ------------------------------------------------------------------
     # directories
 
+    # -- containers (adlfs: mkdir creates only top-level containers; any
+    # path below a container is a no-op)
+
+    def _probe_failed(self, container: str, exc: Exception) -> bool:
+        # adlfs ``_container_exists``: with ``assume_container_exists=None``
+        # a failed probe (e.g. no permission to read the container's
+        # properties) warns and assumes the container exists.
+        if self.assume_container_exists is None:
+            warnings.warn(
+                f"Failed to fetch container properties for {container}. Assume it exists already",
+                stacklevel=4,
+            )
+            return True
+        raise ValueError(f"Failed to fetch container properties for {container} for {exc}") from exc
+
+    def _container_exists(self, container: str) -> bool:
+        if self.assume_container_exists:
+            return True
+        try:
+            self._rfs.info(container)
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            return self._probe_failed(container, e)
+        return True
+
+    async def _container_exists_async(self, container: str) -> bool:
+        if self.assume_container_exists:
+            return True
+        try:
+            await self._rfs.info_async(container)
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            return self._probe_failed(container, e)
+        return True
+
+    @staticmethod
+    def _mkdir_check(container: str, exists: bool, create_parents: bool, exist_ok: bool) -> bool:
+        """adlfs ``_mkdir``'s checks; returns whether to create the
+        container."""
+        if not create_parents and not exists:
+            raise PermissionError("Azure Container does not exist.  Set create_parents=True to create!!")
+        if exists and not exist_ok:
+            raise FileExistsError(
+                f"Cannot overwrite existing Azure container -- {container} already exists."
+            )
+        return not exists
+
     def makedir(self, path: Any, exist_ok: bool = False) -> None:
-        """Create a container (adlfs ``makedir``)."""
-        container, path_, _ = self.split_path(path)
-        if self.exists(container) and not path_ and not exist_ok:
-            raise FileExistsError(container)
-        if not self.exists(container):
-            self.mkdir(container)
+        """Create a container (adlfs ``makedir``: an existing container
+        raises ``FileExistsError`` unless ``exist_ok``)."""
+        self.mkdir(path, create_parents=True, exist_ok=exist_ok)
 
     def mkdir(self, path: Any, create_parents: bool = True, delimiter: str = "/", **kwargs: Any) -> None:
+        container = self.split_path(path)[0]
         try:
-            self._rfs.mkdir(self._strip(path), create_parents)
+            exists = self._container_exists(container)
+            if self._mkdir_check(container, exists, create_parents, kwargs.get("exist_ok", True)):
+                self._rfs.mkdir(container, True)
         finally:
+            # The container (and with it the root listing) and the path.
+            self.invalidate_cache(container)
             self.invalidate_cache(path)
 
     async def _mkdir(self, path: Any, create_parents: bool = True, delimiter: str = "/", **kwargs: Any) -> None:
+        container = self.split_path(path)[0]
         try:
-            await self._rfs.mkdir_async(self._strip(path), create_parents)
+            exists = await self._container_exists_async(container)
+            if self._mkdir_check(container, exists, create_parents, kwargs.get("exist_ok", True)):
+                await self._rfs.mkdir_async(container, True)
         finally:
+            # The container (and with it the root listing) and the path.
+            self.invalidate_cache(container)
             self.invalidate_cache(path)
 
     def rmdir(self, path: Any, delimiter: str = "/", **kwargs: Any) -> None:
@@ -512,17 +626,96 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
     ) -> Any:
         from ._file import FsfastFile
 
-        if metadata:
-            raise NotImplementedError(
-                "fsfast.AzureBlobFileSystem.open does not set metadata; call setxattrs() after writing"
-            )
-        return FsfastFile(
+        extra = None
+        if mode != "rb":
+            extra = _write_extra(kwargs.pop("content_settings", None), metadata)
+        # An explicit size (here or on the filesystem) sets the Rust
+        # handle's block size; otherwise the backend's tuned defaults apply
+        # (8 MiB upload blocks and ranged reads), while ``f.blocksize``
+        # reports adlfs's value.
+        explicit = block_size or (self.blocksize if self.blocksize != _DEFAULT_BLOCK_SIZE else None)
+        f = FsfastFile(
             self,
             self._strip(path),
             mode,
-            block_size=block_size or self.blocksize,
+            block_size=explicit,
             autocommit=autocommit,
             cache_type="readahead" if cache_type is None else cache_type,
             cache_options=cache_options,
             version=version_id,
+            extra=extra,
         )
+        f.blocksize = block_size or self.blocksize
+        return f
+
+    # -- writes with adlfs's per-call ``content_settings=``
+
+    @staticmethod
+    def _pipe_mode(mode: str, overwrite: bool | None) -> str:
+        # adlfs: ``overwrite=False`` (or fsspec's ``mode="create"``) fails
+        # on an existing blob.
+        return "create" if overwrite is False else mode
+
+    def pipe_file(
+        self, path: Any, value: Any, overwrite: bool = True, max_concurrency: int | None = None, **kwargs: Any
+    ) -> None:
+        mode = self._pipe_mode(kwargs.pop("mode", "overwrite"), overwrite)
+        extra = _write_extra(kwargs.pop("content_settings", None))
+        try:
+            self._rfs.pipe_file(self._strip(path), self._payload(value), mode, extra)
+        finally:
+            self.invalidate_cache(path)
+
+    async def _pipe_file(
+        self, path: Any, value: Any, overwrite: bool = True, max_concurrency: int | None = None, **kwargs: Any
+    ) -> None:
+        mode = self._pipe_mode(kwargs.pop("mode", "overwrite"), overwrite)
+        extra = _write_extra(kwargs.pop("content_settings", None))
+        try:
+            await self._rfs.pipe_file_async(self._strip(path), self._payload(value), mode, extra)
+        finally:
+            self.invalidate_cache(path)
+
+    def put_file(
+        self,
+        lpath: Any,
+        rpath: Any,
+        callback: Any = None,
+        mode: str = "overwrite",
+        overwrite: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        callback = callback or DEFAULT_CALLBACK
+        kwargs.pop("delimiter", None)
+        kwargs.pop("max_concurrency", None)
+        mode = self._pipe_mode(mode, overwrite)
+        extra = _write_extra(kwargs.pop("content_settings", None))
+        if extra is None:
+            return super().put_file(lpath, rpath, callback=callback, mode=mode)
+        lpath = os.fspath(lpath)
+        size = os.path.getsize(lpath) if os.path.isfile(lpath) else 0
+        callback.set_size(size)
+        try:
+            self._put_streamed(lpath, rpath, mode, extra)
+        finally:
+            self.invalidate_cache(rpath)
+        callback.relative_update(size)
+
+    def put(
+        self,
+        lpath: Any,
+        rpath: Any,
+        recursive: bool = False,
+        callback: Any = None,
+        maxdepth: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        extra = _write_extra(kwargs.pop("content_settings", None))
+        if extra is None:
+            return super().put(lpath, rpath, recursive=recursive, callback=callback, maxdepth=maxdepth, **kwargs)
+        mode = kwargs.get("mode", "overwrite")
+        try:
+            for lp, rp in self._put_pairs(lpath, rpath, recursive, maxdepth):
+                self._put_streamed(lp, rp, mode, extra)
+        finally:
+            self._invalidate_paths(rpath)

@@ -16,9 +16,11 @@ the references do.
 
 from __future__ import annotations
 
+import errno
 import functools
 import os
 from collections.abc import Callable, Iterable
+from glob import has_magic
 from typing import Any
 
 from ._base import FsfastFileSystem, _is_exc
@@ -65,6 +67,11 @@ class ObjectStoreFileSystem(FsfastFileSystem):
     # The reference uploads pipe_file directly, even in a transaction.
     _pipe_defers_in_transaction = False
     _implicit_dirs = True
+    #: ``rm(dir)`` without ``recursive`` leaves a non-empty directory in
+    #: place instead of raising (adlfs: it deletes only the blob named
+    #: ``dir``, which does not exist; s3fs/gcsfs never reach a directory
+    #: step because their directories are implicit).
+    _rm_skips_nonempty_dirs = False
 
     # ------------------------------------------------------------------
     # cache helpers
@@ -323,6 +330,51 @@ class ObjectStoreFileSystem(FsfastFileSystem):
         return self._find_result(root, found, maxdepth, withdirs, detail, True)
 
     # ------------------------------------------------------------------
+    # uploads with per-call parameters (s3fs ``ContentType=``, adlfs
+    # ``content_settings=``): without them the Rust batch upload is used;
+    # with them each file streams through a write handle that carries them.
+
+    def _put_streamed(self, lpath: str, rpath: str, mode: str, extra: dict[str, Any]) -> None:
+        """Upload one local file through a write handle with ``extra``."""
+        if os.path.isdir(lpath):
+            return  # prefixes need no object
+        wmode = "xb" if mode == "create" else "wb"
+        writer = self._rfs.open_write(self._strip(rpath), wmode, block_size=None, extra=extra)
+        try:
+            chunk_size = getattr(self, "default_block_size", None) or self.blocksize
+            with open(lpath, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    writer.write(chunk)
+        except BaseException:
+            writer.abort()
+            raise
+        writer.close()
+
+    def _put_pairs(
+        self, lpath: Any, rpath: Any, recursive: bool, maxdepth: int | None
+    ) -> list[tuple[str, str]]:
+        """``(local, remote)`` pairs of a ``put``, expanded as fsspec's
+        ``put`` expands them."""
+        if isinstance(lpath, list) and isinstance(rpath, list):
+            return list(zip([os.fspath(p) for p in lpath], rpath))
+        from fsspec.implementations.local import LocalFileSystem as _Local
+        from fsspec.utils import other_paths
+
+        lfs = _Local()
+        lpaths = lfs.expand_path(lpath, recursive=recursive, maxdepth=maxdepth)
+        if isinstance(lpath, str) and (not recursive or maxdepth is not None):
+            lpaths = [p for p in lpaths if not lfs.isdir(p)]
+        dest_is_dir = isinstance(rpath, str) and (rpath.endswith("/") or self.isdir(rpath))
+        exists = isinstance(lpath, str) and (
+            (has_magic(lpath) and len(lpaths) == 1)
+            or (not has_magic(lpath) and dest_is_dir and not lpath.endswith("/"))
+        )
+        rpaths = other_paths(
+            lpaths, self._strip_protocol(rpath), exists=exists, flatten=not isinstance(lpath, str)
+        )
+        return list(zip(lpaths, rpaths))
+
+    # ------------------------------------------------------------------
     # mutations invalidate
 
     pipe_file = _invalidating(FsfastFileSystem.pipe_file)
@@ -378,12 +430,22 @@ class ObjectStoreFileSystem(FsfastFileSystem):
             for p in paths:
                 self.invalidate_cache(p)
 
+    def _rm_dir_results(self, results: list[Any]) -> None:
+        """Raise the first failure of a directory step of ``rm``; with
+        :attr:`_rm_skips_nonempty_dirs` a non-empty directory is left
+        alone instead."""
+        for r in results:
+            if _is_exc(r):
+                if self._rm_skips_nonempty_dirs and isinstance(r, OSError) and r.errno == errno.ENOTEMPTY:
+                    continue
+                raise r
+
     def _rm_expanded(self, paths: list[str]) -> Any:
         for step, items in self._rm_plan(paths, self._kinds(paths)):
             if step == "files":
                 self._rfs.rm_files(items, on_error="raise")
             else:
-                self._rfs.rmdir_many(items, on_error="raise", ignore_missing=True)
+                self._rm_dir_results(self._rfs.rmdir_many(items, on_error="return", ignore_missing=True))
 
     async def _rm_expanded_async(self, paths: list[str]) -> Any:
         kinds = await self._kinds_async(paths)
@@ -391,7 +453,9 @@ class ObjectStoreFileSystem(FsfastFileSystem):
             if step == "files":
                 await self._rfs.rm_files_async(items, on_error="raise")
             else:
-                await self._rfs.rmdir_many_async(items, on_error="raise", ignore_missing=True)
+                self._rm_dir_results(
+                    await self._rfs.rmdir_many_async(items, on_error="return", ignore_missing=True)
+                )
 
     def copy(self, path1: Any, path2: Any, recursive: bool = False, maxdepth: int | None = None, on_error: str | None = None, **kwargs: Any) -> None:
         try:
@@ -415,8 +479,15 @@ class ObjectStoreFileSystem(FsfastFileSystem):
             # a no-op on gcsfs). Prefixes need nothing, so one makedirs of
             # the target's bucket does the same.
             bucket = self._strip(rpath).split("/", 1)[0]
-            if bucket:
+            if bucket and not self.exists(bucket):
+                # Expand while the target is still missing (fsspec copies
+                # the directory's contents to a new target), then create
+                # the bucket; the expanded lists are uploaded as given.
+                pairs = self._put_pairs(lpath, rpath, recursive, maxdepth)
                 self.makedirs(bucket, exist_ok=True)
+                if not pairs:
+                    return
+                lpath, rpath = [lp for lp, _ in pairs], [rp for _, rp in pairs]
         try:
             super().put(lpath, rpath, recursive=recursive, callback=callback or DEFAULT_CALLBACK, maxdepth=maxdepth, **kwargs)
         finally:

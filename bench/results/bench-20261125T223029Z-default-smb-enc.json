@@ -1,0 +1,1940 @@
+{
+ "meta": {
+  "created_at": "20261125T223029Z",
+  "label": "default-smb-enc",
+  "profile": "default",
+  "impls": [
+   "fsfast",
+   "reference",
+   "sshfs",
+   "fsf",
+   "native"
+  ],
+  "workloads": [
+   "W1",
+   "W2",
+   "W3",
+   "W4",
+   "W5",
+   "W6",
+   "W7",
+   "W8"
+  ],
+  "fsf": "fsf 0.1.0",
+  "fsf_path": "/home/user/fsfast/target/release/fsf",
+  "git": {
+   "sha": "10cff483de1f56676ae8a740d707e4003d07d74e",
+   "dirty": true
+  },
+  "machine": {
+   "host": "vm",
+   "platform": "Linux-6.18.44-fc-v880-x86_64-with-glibc2.39",
+   "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+   "cpus": 4,
+   "mem_gib": 15.7,
+   "python": "3.13.18",
+   "loadavg_start": [
+    2.8193359375,
+    1.8203125,
+    2.5712890625
+   ]
+  },
+  "python_packages": {
+   "fsfast": "0.1.0",
+   "fsspec": "2026.9.0",
+   "s3fs": "2026.9.0",
+   "gcsfs": "2026.8.2",
+   "adlfs": "2026.8.0",
+   "smbprotocol": "1.17.0",
+   "paramiko": "5.1.0",
+   "sshfs": "2026.11.0",
+   "asyncssh": "2.24.1",
+   "aiohttp": "3.14.5",
+   "aiobotocore": "3.10.0",
+   "botocore": "1.43.117",
+   "azure-storage-blob": "12.31.1",
+   "cryptography": "50.0.2"
+  },
+  "services": {
+   "s3 (RustFS)": {
+    "container": "fsfast-s3",
+    "image": "rustfs/rustfs:latest",
+    "image_id": "sha256:ee717072290b",
+    "created": "2026-11-25T16:26:33.009209222Z",
+    "labels": {
+     "version": "v1.0.6"
+    },
+    "version": "rustfs 1.0.6"
+   },
+   "gcs (fake-gcs-server)": {
+    "container": "fsfast-gcs",
+    "image": "fsouza/fake-gcs-server:latest",
+    "image_id": "sha256:797ce226d62f",
+    "created": "2026-11-25T16:26:52.101191537Z",
+    "labels": {
+     "org.opencontainers.image.version": "1.56.1"
+    }
+   },
+   "azure (Azurite)": {
+    "container": "fsfast-azure",
+    "image": "mcr.microsoft.com/azure-storage/azurite:latest",
+    "image_id": "sha256:c26024d62bf4",
+    "created": "2026-11-25T16:27:12.60802538Z",
+    "version": "3.38.0"
+   },
+   "smb (Samba smbd)": "Version 4.19.5-Ubuntu",
+   "sftp (OpenSSH sshd)": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+   "http (nginx)": "nginx version: nginx/1.24.0 (Ubuntu)",
+   "smbclient": "Version 4.19.5-Ubuntu",
+   "ssh client": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+   "curl": "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3 brotli/1.1.0 zstd/1.5.5 libidn2/2.3.7 libpsl/0.21.2 (+libidn2/2.3.7) libssh/0.10.6/openssl/zlib nghttp2/1.59.0 librtmp/2.3 OpenLDAP/2.6.10"
+  },
+  "fsf_extra_args": [],
+  "local_dir": "/tmp",
+  "loadavg_end": [
+   3.10205078125,
+   1.65380859375,
+   1.95703125
+  ]
+ },
+ "params": {
+  "size": 268435456,
+  "chunk": 8388608,
+  "small_count": 1000,
+  "small_size": 4096,
+  "info_count": 1000,
+  "ls_entries": 10000,
+  "ranges": 500,
+  "range_size": 65536,
+  "copy_count": 64,
+  "copy_size": 4194304,
+  "delete_count": 5000,
+  "repeat": 3,
+  "warmup": 1,
+  "concurrency": 32,
+  "seed": 24301
+ },
+ "runs": [
+  {
+   "impl": "fsfast",
+   "target": "smb-enc",
+   "root": "/enc/fsbench-20261125t223029z-2044-fsfast",
+   "results": [
+    {
+     "workload": "W1",
+     "name": "seq-read",
+     "description": "read one large object (cat_file)",
+     "impl": "fsfast",
+     "params": {
+      "size": 268435456
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.302022,
+      0.329302,
+      0.327017
+     ],
+     "best_s": 0.302022,
+     "median_s": 0.327017,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 888.7940319723514,
+      "median": 820.8607550181887
+     },
+     "ops_per_s": {
+      "best": 3.311015784637449,
+      "median": 3.0579446070573804
+     },
+     "cpu_s": {
+      "best": 0.495704,
+      "median": 0.52435
+     },
+     "stats_last_iter": {
+      "requests": 1,
+      "errors": 0,
+      "bytes_read": 268435456,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "read": {
+        "count": 1,
+        "mean_us": 250716.0,
+        "p50_us": 250716.0,
+        "p90_us": 250716.0,
+        "p99_us": 250716.0,
+        "max_us": 250716.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W1",
+     "name": "seq-read-open",
+     "description": "read one large object through open() in chunk-sized read() calls",
+     "impl": "fsfast",
+     "params": {
+      "size": 268435456,
+      "read_size": 8388608
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.181384,
+      0.203829,
+      0.183235
+     ],
+     "best_s": 0.181384,
+     "median_s": 0.183235,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 1479.9259210736618,
+      "median": 1464.9764715647254
+     },
+     "ops_per_s": {
+      "best": 5.513153676218025,
+      "median": 5.457462636995038
+     },
+     "cpu_s": {
+      "best": 0.189114,
+      "median": 0.210607
+     },
+     "stats_last_iter": {
+      "requests": 1,
+      "errors": 0,
+      "bytes_read": 268435456,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "open": {
+        "count": 1,
+        "mean_us": 1152.0,
+        "p50_us": 1152.0,
+        "p90_us": 1152.0,
+        "p99_us": 1152.0,
+        "max_us": 1152.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W2",
+     "name": "seq-write",
+     "description": "write one large object through open('wb') in chunk-sized write() calls",
+     "impl": "fsfast",
+     "params": {
+      "size": 268435456,
+      "write_size": 8388608
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.404431,
+      0.202425,
+      0.186391
+     ],
+     "best_s": 0.186391,
+     "median_s": 0.202425,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 1440.1739449023703,
+      "median": 1326.0951669515223
+     },
+     "ops_per_s": {
+      "best": 5.365066025042423,
+      "median": 4.9400894602817385
+     },
+     "cpu_s": {
+      "best": 0.192682,
+      "median": 0.200937
+     },
+     "stats_last_iter": {
+      "requests": 2,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 268435456,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "open": {
+        "count": 1,
+        "mean_us": 1794.0,
+        "p50_us": 1794.0,
+        "p90_us": 1794.0,
+        "p99_us": 1794.0,
+        "max_us": 1794.0
+       },
+       "close": {
+        "count": 1,
+        "mean_us": 36082.0,
+        "p50_us": 36082.0,
+        "p90_us": 36082.0,
+        "p99_us": 36082.0,
+        "max_us": 36082.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W3",
+     "name": "small-read",
+     "description": "cat() of small_count small files",
+     "impl": "fsfast",
+     "params": {
+      "count": 1000,
+      "file_size": 4096
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.045526,
+      0.052096,
+      0.060789
+     ],
+     "best_s": 0.045526,
+     "median_s": 0.052096,
+     "bytes_per_iter": 4096000,
+     "ops_per_iter": 1000,
+     "mb_per_s": {
+      "best": 89.97106625863475,
+      "median": 78.62357907558122
+     },
+     "ops_per_s": {
+      "best": 21965.5923482995,
+      "median": 19195.209735249322
+     },
+     "cpu_s": {
+      "best": 0.046995,
+      "median": 0.052074
+     },
+     "stats_last_iter": {
+      "requests": 1000,
+      "errors": 0,
+      "bytes_read": 4096000,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "read": {
+        "count": 1000,
+        "mean_us": 1601.0,
+        "p50_us": 950.0,
+        "p90_us": 4052.0,
+        "p99_us": 5084.0,
+        "max_us": 5985.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W4",
+     "name": "small-write",
+     "description": "pipe() of small_count small files",
+     "impl": "fsfast",
+     "params": {
+      "count": 1000,
+      "file_size": 4096
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.624815,
+      0.629273,
+      0.62686
+     ],
+     "best_s": 0.624815,
+     "median_s": 0.62686,
+     "bytes_per_iter": 4096000,
+     "ops_per_iter": 1000,
+     "mb_per_s": {
+      "best": 6.555541940309914,
+      "median": 6.534151000213627
+     },
+     "ops_per_s": {
+      "best": 1600.474106520975,
+      "median": 1595.25170903653
+     },
+     "cpu_s": {
+      "best": 0.134873,
+      "median": 0.13752
+     },
+     "stats_last_iter": {
+      "requests": 1000,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 4096000,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "write": {
+        "count": 1000,
+        "mean_us": 28204.0,
+        "p50_us": 30617.0,
+        "p90_us": 42598.0,
+        "p99_us": 53930.0,
+        "max_us": 56896.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-info",
+     "description": "info() on info_count files, one call after another",
+     "impl": "fsfast",
+     "params": {
+      "count": 1000
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.178881,
+      0.162007,
+      0.149282
+     ],
+     "best_s": 0.149282,
+     "median_s": 0.162007,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1000,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 6698.736241200595,
+      "median": 6172.578505111394
+     },
+     "cpu_s": {
+      "best": 0.113975,
+      "median": 0.117058
+     },
+     "stats_last_iter": {
+      "requests": 1000,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "info": {
+        "count": 1000,
+        "mean_us": 141.0,
+        "p50_us": 137.0,
+        "p90_us": 170.0,
+        "p99_us": 320.0,
+        "max_us": 718.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-ls",
+     "description": "ls(detail=True) of a ls_entries-entry directory",
+     "impl": "fsfast",
+     "params": {
+      "entries": 10000
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.128784,
+      0.149275,
+      0.121724
+     ],
+     "best_s": 0.121724,
+     "median_s": 0.128784,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 8.215296703530154,
+      "median": 7.764922138224387
+     },
+     "cpu_s": {
+      "best": 0.016646,
+      "median": 0.022972
+     },
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 82152.96703530154,
+      "median": 77649.22138224386
+     },
+     "stats_last_iter": {
+      "requests": 1,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "list": {
+        "count": 1,
+        "mean_us": 113203.0,
+        "p50_us": 113203.0,
+        "p90_us": 113203.0,
+        "p99_us": 113203.0,
+        "max_us": 113203.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-find",
+     "description": "find() of the same directory",
+     "impl": "fsfast",
+     "params": {
+      "entries": 10000
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.144906,
+      0.137206,
+      0.137122
+     ],
+     "best_s": 0.137122,
+     "median_s": 0.137206,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 7.292751577301377,
+      "median": 7.288308403794568
+     },
+     "cpu_s": {
+      "best": 0.027953,
+      "median": 0.038399
+     },
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 72927.51577301377,
+      "median": 72883.08403794568
+     },
+     "stats_last_iter": {
+      "requests": 1,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "list": {
+        "count": 1,
+        "mean_us": 121418.0,
+        "p50_us": 121418.0,
+        "p90_us": 121418.0,
+        "p99_us": 121418.0,
+        "max_us": 121418.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W6",
+     "name": "random-read",
+     "description": "cat_ranges() of `ranges` random range_size ranges of the large object",
+     "impl": "fsfast",
+     "params": {
+      "size": 268435456,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.048634,
+      0.044407,
+      0.038718
+     ],
+     "best_s": 0.038718,
+     "median_s": 0.044407,
+     "bytes_per_iter": 32768000,
+     "ops_per_iter": 500,
+     "mb_per_s": {
+      "best": 846.3223023761564,
+      "median": 737.9014993414524
+     },
+     "ops_per_s": {
+      "best": 12913.853490847112,
+      "median": 11259.483327353706
+     },
+     "cpu_s": {
+      "best": 0.050124,
+      "median": 0.050379
+     },
+     "stats_last_iter": {
+      "requests": 1,
+      "errors": 0,
+      "bytes_read": 32768000,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "read": {
+        "count": 1,
+        "mean_us": 31473.0,
+        "p50_us": 31473.0,
+        "p90_us": 31473.0,
+        "p99_us": 31473.0,
+        "max_us": 31473.0
+       }
+      }
+     }
+    },
+    {
+     "workload": "W7",
+     "name": "copy",
+     "description": "copy() of copy_count files of copy_size within the filesystem",
+     "impl": "fsfast",
+     "params": {
+      "count": 64,
+      "file_size": 4194304
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.069798,
+      0.057709,
+      0.063685
+     ],
+     "best_s": 0.057709,
+     "median_s": 0.063685,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 64,
+     "mb_per_s": {
+      "best": 4651.512663193188,
+      "median": 4215.064576276631
+     },
+     "ops_per_s": {
+      "best": 1109.0070398314447,
+      "median": 1004.9497070972038
+     },
+     "cpu_s": {
+      "best": 0.025949,
+      "median": 0.02803
+     },
+     "stats_last_iter": {
+      "requests": 129,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "info": {
+        "count": 64,
+        "mean_us": 795.0,
+        "p50_us": 775.0,
+        "p90_us": 1609.0,
+        "p99_us": 1920.0,
+        "max_us": 1920.0
+       },
+       "copy": {
+        "count": 64,
+        "mean_us": 55396.0,
+        "p50_us": 57344.0,
+        "p90_us": 59930.0,
+        "p99_us": 59930.0,
+        "max_us": 59930.0
+       },
+       "other": {
+        "count": 1,
+        "mean_us": 248.0,
+        "p50_us": 248.0,
+        "p90_us": 248.0,
+        "p99_us": 248.0,
+        "max_us": 248.0
+       }
+      }
+     },
+     "method": "copy(list, list)"
+    },
+    {
+     "workload": "W8",
+     "name": "delete",
+     "description": "rm() of delete_count files",
+     "impl": "fsfast",
+     "params": {
+      "count": 5000,
+      "file_size": 4096
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.666394,
+      0.676974,
+      0.671833
+     ],
+     "best_s": 0.666394,
+     "median_s": 0.671833,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 5000,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 7503.066897347642,
+      "median": 7442.328887376247
+     },
+     "cpu_s": {
+      "best": 0.62341,
+      "median": 0.627321
+     },
+     "stats_last_iter": {
+      "requests": 5001,
+      "errors": 0,
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "info": {
+        "count": 5000,
+        "mean_us": 989.0000000000001,
+        "p50_us": 850.0,
+        "p90_us": 1932.0,
+        "p99_us": 2911.0,
+        "max_us": 4353.0
+       },
+       "delete": {
+        "count": 1,
+        "mean_us": 513375.0,
+        "p50_us": 513375.0,
+        "p90_us": 513375.0,
+        "p99_us": 513375.0,
+        "max_us": 513375.0
+       }
+      }
+     }
+    }
+   ],
+   "share": "enc",
+   "class": "fsfast._smb.SMBFileSystem",
+   "wall_s": 40.05,
+   "max_rss_mib": 619.2,
+   "exit_code": 0,
+   "loadavg_before": [
+    2.67333984375,
+    1.806640625,
+    2.5625
+   ],
+   "loadavg_after": [
+    3.8017578125,
+    2.220703125,
+    2.67138671875
+   ],
+   "description": "fsfast.SMBFileSystem"
+  },
+  {
+   "impl": "reference",
+   "target": "smb-enc",
+   "root": "/enc/fsbench-20261125t223029z-2044-reference",
+   "results": [
+    {
+     "workload": "W1",
+     "name": "seq-read",
+     "description": "read one large object (cat_file)",
+     "impl": "reference",
+     "params": {
+      "size": 268435456
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      1.560287,
+      1.481834,
+      1.524545
+     ],
+     "best_s": 1.481834,
+     "median_s": 1.524545,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 181.15084214105357,
+      "median": 176.0757446542286
+     },
+     "ops_per_s": {
+      "best": 0.6748394747862726,
+      "median": 0.655933263354855
+     },
+     "cpu_s": {
+      "best": 1.352254,
+      "median": 1.408364
+     }
+    },
+    {
+     "workload": "W1",
+     "name": "seq-read-open",
+     "description": "read one large object through open() in chunk-sized read() calls",
+     "impl": "reference",
+     "params": {
+      "size": 268435456,
+      "read_size": 8388608
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.96639,
+      0.938544,
+      0.853609
+     ],
+     "best_s": 0.853609,
+     "median_s": 0.938544,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 314.4712151116231,
+      "median": 286.01252077901006
+     },
+     "ops_per_s": {
+      "best": 1.1714965668008592,
+      "median": 1.0654796688966828
+     },
+     "cpu_s": {
+      "best": 0.742958,
+      "median": 0.802461
+     }
+    },
+    {
+     "workload": "W2",
+     "name": "seq-write",
+     "description": "write one large object through open('wb') in chunk-sized write() calls",
+     "impl": "reference",
+     "params": {
+      "size": 268435456,
+      "write_size": 8388608
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      1.230852,
+      1.497796,
+      1.363102
+     ],
+     "best_s": 1.230852,
+     "median_s": 1.363102,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 218.08918084038643,
+      "median": 196.92990717435964
+     },
+     "ops_per_s": {
+      "best": 0.8124455095841975,
+      "median": 0.7336210726736473
+     },
+     "cpu_s": {
+      "best": 1.098088,
+      "median": 1.177323
+     }
+    },
+    {
+     "workload": "W3",
+     "name": "small-read",
+     "description": "cat() of small_count small files",
+     "impl": "reference",
+     "params": {
+      "count": 1000,
+      "file_size": 4096
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      2.878928,
+      2.881415,
+      2.877819
+     ],
+     "best_s": 2.877819,
+     "median_s": 2.878928,
+     "bytes_per_iter": 4096000,
+     "ops_per_iter": 1000,
+     "mb_per_s": {
+      "best": 1.4233002782842608,
+      "median": 1.4227517536294665
+     },
+     "ops_per_s": {
+      "best": 347.48541950299335,
+      "median": 347.351502350944
+     },
+     "cpu_s": {
+      "best": 2.108522,
+      "median": 2.10922
+     }
+    },
+    {
+     "workload": "W4",
+     "name": "small-write",
+     "description": "pipe() of small_count small files",
+     "impl": "reference",
+     "params": {
+      "count": 1000,
+      "file_size": 4096
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      3.476745,
+      3.37102,
+      3.252038
+     ],
+     "best_s": 3.252038,
+     "median_s": 3.37102,
+     "bytes_per_iter": 4096000,
+     "ops_per_iter": 1000,
+     "mb_per_s": {
+      "best": 1.259517828524922,
+      "median": 1.2150625527181584
+     },
+     "ops_per_s": {
+      "best": 307.4994698547173,
+      "median": 296.6461310347066
+     },
+     "cpu_s": {
+      "best": 1.937699,
+      "median": 2.007973
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-info",
+     "description": "info() on info_count files, one call after another",
+     "impl": "reference",
+     "params": {
+      "count": 1000
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      2.789259,
+      2.523088,
+      2.668292
+     ],
+     "best_s": 2.523088,
+     "median_s": 2.668292,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1000,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 396.33971977345834,
+      "median": 374.7716277085662
+     },
+     "cpu_s": {
+      "best": 2.178198,
+      "median": 2.336853
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-ls",
+     "description": "ls(detail=True) of a ls_entries-entry directory",
+     "impl": "reference",
+     "params": {
+      "entries": 10000
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      27.860748,
+      27.917932,
+      27.244905
+     ],
+     "best_s": 27.244905,
+     "median_s": 27.860748,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 0.03670411007655631,
+      "median": 0.03589279130121701
+     },
+     "cpu_s": {
+      "best": 23.725516,
+      "median": 24.321568
+     },
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 367.0411007655631,
+      "median": 358.9279130121701
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-find",
+     "description": "find() of the same directory",
+     "impl": "reference",
+     "params": {
+      "entries": 10000
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      28.297113,
+      27.692401,
+      25.351432
+     ],
+     "best_s": 25.351432,
+     "median_s": 27.692401,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 0.03944550370221126,
+      "median": 0.03611098929108645
+     },
+     "cpu_s": {
+      "best": 22.133504,
+      "median": 24.049658
+     },
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 394.4550370221126,
+      "median": 361.1098929108645
+     }
+    },
+    {
+     "workload": "W6",
+     "name": "random-read",
+     "description": "cat_ranges() of `ranges` random range_size ranges of the large object",
+     "impl": "reference",
+     "params": {
+      "size": 268435456,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      1.434323,
+      1.35152,
+      1.356781
+     ],
+     "best_s": 1.35152,
+     "median_s": 1.356781,
+     "bytes_per_iter": 32768000,
+     "ops_per_iter": 500,
+     "mb_per_s": {
+      "best": 24.24529513802977,
+      "median": 24.1512771495596
+     },
+     "ops_per_s": {
+      "best": 369.9538442692531,
+      "median": 368.51924361510623
+     },
+     "cpu_s": {
+      "best": 0.982043,
+      "median": 0.985198
+     }
+    },
+    {
+     "workload": "W7",
+     "name": "copy",
+     "description": "copy() of copy_count files of copy_size within the filesystem",
+     "impl": "reference",
+     "params": {
+      "count": 64,
+      "file_size": 4194304
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.411857,
+      0.43712,
+      0.431279
+     ],
+     "best_s": 0.411857,
+     "median_s": 0.431279,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 64,
+     "mb_per_s": {
+      "best": 651.7689298205416,
+      "median": 622.4166737611954
+     },
+     "ops_per_s": {
+      "best": 155.39382215035954,
+      "median": 148.395698967265
+     },
+     "cpu_s": {
+      "best": 0.248481,
+      "median": 0.258252
+     },
+     "method": "copy() per file"
+    },
+    {
+     "workload": "W8",
+     "name": "delete",
+     "description": "rm() of delete_count files",
+     "impl": "reference",
+     "params": {
+      "count": 5000,
+      "file_size": 4096
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      23.079295,
+      25.258888,
+      24.801932
+     ],
+     "best_s": 23.079295,
+     "median_s": 24.801932,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 5000,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 216.6443957412067,
+      "median": 201.5972020472028
+     },
+     "cpu_s": {
+      "best": 18.646206,
+      "median": 20.005751
+     }
+    }
+   ],
+   "share": "enc",
+   "class": "fsspec.implementations.smb.SMBFileSystem",
+   "wall_s": 626.889,
+   "max_rss_mib": 595.1,
+   "exit_code": 0,
+   "loadavg_before": [
+    3.8017578125,
+    2.220703125,
+    2.67138671875
+   ],
+   "loadavg_after": [
+    0.84228515625,
+    1.04931640625,
+    1.78759765625
+   ],
+   "description": "fsspec SMBFileSystem (smbprotocol)"
+  },
+  {
+   "impl": "fsf",
+   "target": "smb-enc",
+   "results": [
+    {
+     "best_s": 0.193911256,
+     "bytes_per_iter": 268435456,
+     "description": "large sequential read of one --size file (parallel ranged reads)",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3,
+      "kind": "iteration",
+      "max": 233.174713,
+      "mean": 210.09455,
+      "min": 193.910456,
+      "p50": 203.198481,
+      "p90": 233.174713,
+      "p99": 233.174713
+     },
+     "mb_per_s": {
+      "best": 1384.3211659667656,
+      "median": 1321.0439520347413
+     },
+     "median_s": 0.203199489,
+     "name": "seq-read",
+     "ops_per_iter": 1,
+     "ops_per_s": {
+      "best": 5.156998209531477,
+      "median": 4.921272218356808
+     },
+     "params": {
+      "block_size": null,
+      "io_concurrency": null,
+      "size": 268435456
+     },
+     "stats": {
+      "bytes_read": 805306368,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 387,
+      "requests_by_op": {
+       "open": 3,
+       "read": 384
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.193911256,
+      0.23317572,
+      0.203199489
+     ],
+     "warmup": 1,
+     "workload": "W1",
+     "impl": "fsf",
+     "fsf_group": "big"
+    },
+    {
+     "best_s": 0.179019937,
+     "bytes_per_iter": 268435456,
+     "description": "large sequential write of one --size file (--block-size chunks)",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3,
+      "kind": "iteration",
+      "max": 211.860494,
+      "mean": 190.166327,
+      "min": 179.019297,
+      "p50": 179.61919,
+      "p90": 211.860494,
+      "p99": 211.860494
+     },
+     "mb_per_s": {
+      "best": 1499.4724079251575,
+      "median": 1494.4647887440779
+     },
+     "median_s": 0.179619793,
+     "name": "seq-write",
+     "ops_per_iter": 1,
+     "ops_per_s": {
+      "best": 5.585970014054915,
+      "median": 5.567315178901247
+     },
+     "params": {
+      "block_size": 2097152,
+      "size": 268435456
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 805306368,
+      "errors": 0,
+      "requests": 387,
+      "requests_by_op": {
+       "open": 3,
+       "write": 384
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.179619793,
+      0.179019937,
+      0.21186114
+     ],
+     "warmup": 1,
+     "workload": "W2",
+     "impl": "fsf",
+     "fsf_group": "big"
+    },
+    {
+     "best_s": 0.026073423,
+     "bytes_per_iter": 32768000,
+     "description": "--ranges random reads of --range-size from one --size file",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 1500,
+      "kind": "op",
+      "max": 4.432778,
+      "mean": 1.7825291419999982,
+      "min": 0.265328,
+      "p50": 1.704773,
+      "p90": 2.30443,
+      "p99": 4.035313
+     },
+     "mb_per_s": {
+      "best": 1256.7586542050885,
+      "median": 1197.843209605673
+     },
+     "median_s": 0.027355834,
+     "name": "random-read",
+     "ops_per_iter": 500,
+     "ops_per_s": {
+      "best": 19176.615206986826,
+      "median": 18277.63686532094
+     },
+     "params": {
+      "concurrency": 32,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301,
+      "size": 268435456
+     },
+     "stats": {
+      "bytes_read": 98304000,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 1503,
+      "requests_by_op": {
+       "open": 3,
+       "read": 1500
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.034545006,
+      0.026073423,
+      0.027355834
+     ],
+     "warmup": 1,
+     "workload": "W6",
+     "impl": "fsf",
+     "fsf_group": "big"
+    },
+    {
+     "best_s": 0.044440641,
+     "bytes_per_iter": 4096000,
+     "description": "read --count files of --file-size, --concurrency in flight",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3000,
+      "kind": "op",
+      "max": 7.043012,
+      "mean": 1.3962213790000004,
+      "min": 0.083117,
+      "p50": 1.015798,
+      "p90": 2.883471,
+      "p99": 5.909791
+     },
+     "mb_per_s": {
+      "best": 92.1678874973923,
+      "median": 89.99684022324402
+     },
+     "median_s": 0.045512709,
+     "name": "small-read",
+     "ops_per_iter": 1000,
+     "ops_per_s": {
+      "best": 22501.92565854304,
+      "median": 21971.884820127936
+     },
+     "params": {
+      "concurrency": 32,
+      "count": 1000,
+      "file_size": 4096
+     },
+     "stats": {
+      "bytes_read": 12288000,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 0,
+      "requests_by_op": {},
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.044440641,
+      0.045512709,
+      0.045864455
+     ],
+     "warmup": 1,
+     "workload": "W3",
+     "impl": "fsf",
+     "fsf_group": "small"
+    },
+    {
+     "best_s": 0.523103678,
+     "bytes_per_iter": 4096000,
+     "description": "write --count files of --file-size, --concurrency in flight",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3000,
+      "kind": "op",
+      "max": 50.981806,
+      "mean": 17.463388738666662,
+      "min": 0.994554,
+      "p50": 17.219135,
+      "p90": 29.307886,
+      "p99": 44.926209
+     },
+     "mb_per_s": {
+      "best": 7.830187728100814,
+      "median": 7.654413443876893
+     },
+     "median_s": 0.535116117,
+     "name": "small-write",
+     "ops_per_iter": 1000,
+     "ops_per_s": {
+      "best": 1911.6669258058628,
+      "median": 1868.7532821965071
+     },
+     "params": {
+      "concurrency": 32,
+      "count": 1000,
+      "file_size": 4096
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 12288000,
+      "errors": 0,
+      "requests": 3000,
+      "requests_by_op": {
+       "write": 3000
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.535116117,
+      0.523103678,
+      0.613279421
+     ],
+     "warmup": 1,
+     "workload": "W4",
+     "impl": "fsf",
+     "fsf_group": "small"
+    },
+    {
+     "best_s": 0.172537322,
+     "bytes_per_iter": 0,
+     "description": "info on --count files, ls of --dirs directories, one recursive find",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3000,
+      "kind": "op",
+      "max": 2.923687,
+      "mean": 0.18909581933333328,
+      "min": 0.117046,
+      "p50": 0.167827,
+      "p90": 0.257881,
+      "p99": 0.420927
+     },
+     "mb_per_s": null,
+     "median_s": 0.185040287,
+     "name": "metadata-info",
+     "ops_per_iter": 1000,
+     "ops_per_s": {
+      "best": 5795.847463078163,
+      "median": 5404.228539701736
+     },
+     "params": {
+      "concurrency": 1,
+      "count": 1000,
+      "dirs": 1,
+      "file_size": 100
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 3000,
+      "requests_by_op": {
+       "info": 3000
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.210795274,
+      0.185040287,
+      0.172537322
+     ],
+     "warmup": 1,
+     "workload": "W5",
+     "impl": "fsf",
+     "fsf_group": "info"
+    },
+    {
+     "best_s": 0.108039097,
+     "bytes_per_iter": 0,
+     "description": "info on --count files, ls of --dirs directories, one recursive find",
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 92559.08534666854,
+      "median": 91540.0112967697
+     },
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3,
+      "kind": "op",
+      "max": 146.431736,
+      "mean": 121.23399233333333,
+      "min": 108.033712,
+      "p50": 109.236529,
+      "p90": 146.431736,
+      "p99": 146.431736
+     },
+     "mb_per_s": null,
+     "median_s": 0.109241848,
+     "name": "metadata-ls",
+     "ops_per_iter": 1,
+     "ops_per_s": {
+      "best": 9.255908534666853,
+      "median": 9.15400112967697
+     },
+     "params": {
+      "concurrency": 32,
+      "count": 10000,
+      "dirs": 1,
+      "file_size": 100
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 3,
+      "requests_by_op": {
+       "list": 3
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.109241848,
+      0.146437309,
+      0.108039097
+     ],
+     "warmup": 1,
+     "workload": "W5",
+     "impl": "fsf",
+     "fsf_group": "ls"
+    },
+    {
+     "best_s": 0.111187924,
+     "bytes_per_iter": 0,
+     "description": "info on --count files, ls of --dirs directories, one recursive find",
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 89937.82454288831,
+      "median": 89820.58141257559
+     },
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3,
+      "kind": "op",
+      "max": 144.214806,
+      "mean": 122.24485800000001,
+      "min": 111.18731,
+      "p50": 111.332458,
+      "p90": 144.214806,
+      "p99": 144.214806
+     },
+     "mb_per_s": null,
+     "median_s": 0.111333058,
+     "name": "metadata-find",
+     "ops_per_iter": 1,
+     "ops_per_s": {
+      "best": 8.993782454288832,
+      "median": 8.982058141257559
+     },
+     "params": {
+      "concurrency": 32,
+      "count": 10000,
+      "dirs": 1,
+      "file_size": 100
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 9,
+      "requests_by_op": {
+       "info": 3,
+       "list": 6
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.111333058,
+      0.144215468,
+      0.111187924
+     ],
+     "warmup": 1,
+     "workload": "W5",
+     "impl": "fsf",
+     "fsf_group": "ls"
+    },
+    {
+     "best_s": 0.052572484,
+     "bytes_per_iter": 268435456,
+     "description": "copy --count files of --file-size (to --dest when given)",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 192,
+      "kind": "op",
+      "max": 60.020057,
+      "mean": 28.086034781249996,
+      "min": 6.250849,
+      "p50": 25.138842,
+      "p90": 37.597207,
+      "p99": 55.663761
+     },
+     "mb_per_s": {
+      "best": 5106.0067087566185,
+      "median": 4331.328696454851
+     },
+     "median_s": 0.061975314,
+     "name": "copy",
+     "ops_per_iter": 64,
+     "ops_per_s": {
+      "best": 1217.3668643847986,
+      "median": 1032.6692334305883
+     },
+     "params": {
+      "concurrency": 32,
+      "count": 64,
+      "dest": null,
+      "file_size": 4194304,
+      "method": "SameFs"
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 192,
+      "requests_by_op": {
+       "copy": 192
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.074800319,
+      0.052572484,
+      0.061975314
+     ],
+     "warmup": 1,
+     "workload": "W7",
+     "impl": "fsf",
+     "fsf_group": "copy"
+    },
+    {
+     "best_s": 0.39591185,
+     "bytes_per_iter": 0,
+     "description": "delete --count files in one batch (rm_files)",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 3,
+      "kind": "batch",
+      "max": 446.301119,
+      "mean": 418.95277533333336,
+      "min": 395.822549,
+      "p50": 414.734658,
+      "p90": 446.301119,
+      "p99": 446.301119
+     },
+     "mb_per_s": null,
+     "median_s": 0.414812965,
+     "name": "delete",
+     "ops_per_iter": 5000,
+     "ops_per_s": {
+      "best": 12629.07387086292,
+      "median": 12053.625180206218
+     },
+     "params": {
+      "count": 5000,
+      "file_size": 4096
+     },
+     "stats": {
+      "bytes_read": 0,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 15000,
+      "requests_by_op": {
+       "delete": 15000
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.414812965,
+      0.446391127,
+      0.39591185
+     ],
+     "warmup": 1,
+     "workload": "W8",
+     "impl": "fsf",
+     "fsf_group": "delete"
+    }
+   ],
+   "groups": [
+    {
+     "group": "big",
+     "url": "smb://127.0.0.1/enc/fsbench-20261125t223029z-2044-fsf-big",
+     "config": {
+      "block_size": null,
+      "concurrency": 32,
+      "count": 256,
+      "dest": null,
+      "dirs": null,
+      "file_size": 16384,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301,
+      "size": 268435456,
+      "warmup": 1,
+      "workloads": [
+       "W1",
+       "W2",
+       "W6"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 4,
+      "removed_files": 1
+     },
+     "error": null,
+     "exit_code": 0
+    },
+    {
+     "group": "small",
+     "url": "smb://127.0.0.1/enc/fsbench-20261125t223029z-2044-fsf-small",
+     "config": {
+      "block_size": null,
+      "concurrency": 32,
+      "count": 1000,
+      "dest": null,
+      "dirs": null,
+      "file_size": 4096,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 262144,
+      "ranges": 256,
+      "seed": 24301,
+      "size": 67108864,
+      "warmup": 1,
+      "workloads": [
+       "W3",
+       "W4"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 4,
+      "removed_files": 1000
+     },
+     "error": null,
+     "exit_code": 0
+    },
+    {
+     "group": "info",
+     "url": "smb://127.0.0.1/enc/fsbench-20261125t223029z-2044-fsf-info",
+     "config": {
+      "block_size": null,
+      "concurrency": 1,
+      "count": 1000,
+      "dest": null,
+      "dirs": 1,
+      "file_size": 100,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 262144,
+      "ranges": 256,
+      "seed": 24301,
+      "size": 67108864,
+      "warmup": 1,
+      "workloads": [
+       "W5"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 4,
+      "removed_files": 1000
+     },
+     "error": null,
+     "exit_code": 0
+    },
+    {
+     "group": "ls",
+     "url": "smb://127.0.0.1/enc/fsbench-20261125t223029z-2044-fsf-ls",
+     "config": {
+      "block_size": null,
+      "concurrency": 32,
+      "count": 10000,
+      "dest": null,
+      "dirs": 1,
+      "file_size": 100,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 262144,
+      "ranges": 256,
+      "seed": 24301,
+      "size": 67108864,
+      "warmup": 1,
+      "workloads": [
+       "W5"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 4,
+      "removed_files": 10000
+     },
+     "error": null,
+     "exit_code": 0
+    },
+    {
+     "group": "copy",
+     "url": "smb://127.0.0.1/enc/fsbench-20261125t223029z-2044-fsf-copy",
+     "config": {
+      "block_size": null,
+      "concurrency": 32,
+      "count": 64,
+      "dest": null,
+      "dirs": null,
+      "file_size": 4194304,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 262144,
+      "ranges": 256,
+      "seed": 24301,
+      "size": 67108864,
+      "warmup": 1,
+      "workloads": [
+       "W7"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 4,
+      "removed_files": 64
+     },
+     "error": null,
+     "exit_code": 0
+    },
+    {
+     "group": "delete",
+     "url": "smb://127.0.0.1/enc/fsbench-20261125t223029z-2044-fsf-delete",
+     "config": {
+      "block_size": null,
+      "concurrency": 32,
+      "count": 5000,
+      "dest": null,
+      "dirs": null,
+      "file_size": 4096,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 262144,
+      "ranges": 256,
+      "seed": 24301,
+      "size": 67108864,
+      "warmup": 1,
+      "workloads": [
+       "W8"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 3,
+      "removed_files": 0
+     },
+     "error": null,
+     "exit_code": 0
+    }
+   ],
+   "version": "0.1.0",
+   "wall_s": 36.104,
+   "loadavg_before": [
+    0.84228515625,
+    1.04931640625,
+    1.78759765625
+   ],
+   "loadavg_after": [
+    2.8232421875,
+    1.53173828125,
+    1.923828125
+   ]
+  },
+  {
+   "impl": "native",
+   "target": "smb-enc",
+   "results": [
+    {
+     "workload": "W2",
+     "name": "seq-write",
+     "impl": "native",
+     "tool": "smbclient (encrypted)",
+     "warmup": 1,
+     "note": "includes process start, connect and session setup (~33 ms alone)",
+     "iterations": 3,
+     "times_s": [
+      0.543134,
+      0.683218,
+      0.597907
+     ],
+     "best_s": 0.543134,
+     "median_s": 0.597907,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 494.2345534180203,
+      "median": 448.95820131597407
+     },
+     "ops_per_s": {
+      "best": 1.8411671870128077,
+      "median": 1.672499631777309
+     }
+    },
+    {
+     "workload": "W1",
+     "name": "seq-read",
+     "impl": "native",
+     "tool": "smbclient (encrypted)",
+     "warmup": 1,
+     "note": "includes process start, connect and session setup (~33 ms alone)",
+     "iterations": 3,
+     "times_s": [
+      0.379003,
+      0.355102,
+      0.375903
+     ],
+     "best_s": 0.355102,
+     "median_s": 0.375903,
+     "bytes_per_iter": 268435456,
+     "ops_per_iter": 1,
+     "mb_per_s": {
+      "best": 755.9382164152504,
+      "median": 714.1091400348994
+     },
+     "ops_per_s": {
+      "best": 2.8160893038483352,
+      "median": 2.660263851414991
+     }
+    },
+    {
+     "workload": "W5",
+     "name": "metadata-ls",
+     "impl": "native",
+     "tool": "smbclient (encrypted)",
+     "warmup": 1,
+     "note": "includes process start, connect and session setup (~33 ms alone)",
+     "iterations": 3,
+     "times_s": [
+      0.186827,
+      0.184813,
+      0.167896
+     ],
+     "best_s": 0.167896,
+     "median_s": 0.184813,
+     "bytes_per_iter": 0,
+     "ops_per_iter": 1,
+     "mb_per_s": null,
+     "ops_per_s": {
+      "best": 5.956052185041429,
+      "median": 5.410876005801142
+     },
+     "items_per_iter": 10000,
+     "items_per_s": {
+      "best": 59560.52185041429,
+      "median": 54108.760058011416
+     }
+    }
+   ],
+   "wall_s": 16.054,
+   "loadavg_before": [
+    2.8232421875,
+    1.53173828125,
+    1.923828125
+   ],
+   "loadavg_after": [
+    3.10205078125,
+    1.65380859375,
+    1.95703125
+   ]
+  }
+ ]
+}

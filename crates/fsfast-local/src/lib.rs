@@ -75,7 +75,54 @@ const RM_BATCH: usize = 64;
 /// blocking pool otherwise; [`spawn_blocking`] always uses the pool and is
 /// used for fan-out (work that must run in parallel) and for work that can
 /// take long (copies of unknown size, large writes).
-pub(crate) use fsfast_core::blocking::{blocking, spawn_blocking};
+///
+/// Steps that open a path use [`blocking_deferrable`]: inline, they first
+/// check that the path is not a named pipe, device or socket
+/// ([`open_may_block`]), whose `open` can wait forever for another process
+/// and would leave the caller unable to see Ctrl-C.
+pub(crate) use fsfast_core::blocking::{Attempt, blocking, blocking_deferrable, spawn_blocking};
+
+/// Whether opening `os` may wait indefinitely: a named pipe waits for its
+/// other end, and devices or sockets can block too. Such opens are never
+/// run inline (one extra `stat`, only on the inline path); a path that does
+/// not exist (yet) or is a regular file or directory opens at once.
+#[cfg(unix)]
+pub(crate) fn open_may_block(os: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(os).is_ok_and(|m| {
+        let t = m.file_type();
+        t.is_fifo() || t.is_char_device() || t.is_block_device() || t.is_socket()
+    })
+}
+
+/// Off Unix there are no named pipes in the file namespace.
+#[cfg(not(unix))]
+pub(crate) fn open_may_block(_os: &Path) -> bool {
+    false
+}
+
+/// Run an opening step through [`blocking_deferrable`]: inline unless
+/// [`open_may_block`] says the path could block, else on the pool.
+pub(crate) async fn blocking_open<T, F>(os: PathBuf, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let mut f = Some(f);
+    blocking_deferrable(move |inline| {
+        if inline && open_may_block(&os) {
+            return Attempt::Defer;
+        }
+        match f.take() {
+            Some(f) => Attempt::Done(f()),
+            None => Attempt::Done(Err(Error::new(
+                fsfast_core::ErrorKind::Other,
+                "blocking step ran twice",
+            ))),
+        }
+    })
+    .await
+}
 
 /// Largest `pipe_file` payload written inline by a synchronous caller
 /// (larger payloads go to the blocking pool so the caller keeps checking
@@ -351,7 +398,7 @@ impl FileSystem for LocalFileSystem {
             hints.request_size = bs;
         }
         let (p, os) = Self::os_path(path);
-        let (file, info) = blocking(move || {
+        let (file, info) = blocking_open(os.clone(), move || {
             let (file, _) = open_file(&os, &p)?;
             let info = stat::info_open(&p, &file)?;
             Ok((file, info))
@@ -377,7 +424,7 @@ impl FileSystem for LocalFileSystem {
         let (p, os) = Self::os_path(path);
         let (mode, auto_mkdir) = (opts.mode, self.auto_mkdir);
         let (pp, oo) = (p.clone(), os.clone());
-        let (file, original_len) = blocking(move || {
+        let (file, original_len) = blocking_open(os.clone(), move || {
             if auto_mkdir {
                 ops::ensure_parent(&oo).map_err(|e| io_err(e, &pp))?;
             }
@@ -406,7 +453,7 @@ impl FileSystem for LocalFileSystem {
         let (p, os) = Self::os_path(path);
         let hints = self.hints;
         let name = p.clone();
-        let opened = blocking(move || {
+        let opened = blocking_open(os.clone(), move || {
             let (file, meta) = open_file(&os, &name)?;
             let r = range.resolve(meta.len());
             let len = (r.end - r.start) as usize;
@@ -455,6 +502,7 @@ impl FileSystem for LocalFileSystem {
         let (p, os) = Self::os_path(path);
         let (mode, auto_mkdir) = (opts.mode, self.auto_mkdir);
         let inline_ok = data.len() <= INLINE_WRITE_MAX;
+        let os_check = os.clone();
         let work = move || {
             if auto_mkdir {
                 ops::ensure_parent(&os).map_err(|e| io_err(e, &p))?;
@@ -481,7 +529,7 @@ impl FileSystem for LocalFileSystem {
             Ok(())
         };
         if inline_ok {
-            blocking(work).await
+            blocking_open(os_check, work).await
         } else {
             spawn_blocking(work).await
         }
@@ -644,7 +692,7 @@ impl FileSystem for LocalFileSystem {
     async fn touch(&self, path: &str, truncate: bool) -> Result<()> {
         let (p, os) = Self::os_path(path);
         let auto_mkdir = self.auto_mkdir;
-        blocking(move || {
+        blocking_open(os.clone(), move || {
             if auto_mkdir {
                 ops::ensure_parent(&os).map_err(|e| io_err(e, &p))?;
             }

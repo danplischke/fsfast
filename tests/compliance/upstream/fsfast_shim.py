@@ -101,12 +101,36 @@ def _patch_fsspec_memory_fixtures() -> None:
     fixtures.MemoryFixtures.fs = fs
 
 
+def _adlfs_container_names() -> set[str]:
+    """Container names that appear as string literals in adlfs's tests
+    (the suite creates fixed names such as ``data``, ``catdir``,
+    ``putdir``)."""
+    import ast
+
+    tests = os.path.join(UPSTREAM, f"adlfs-{_version('adlfs')}", "adlfs", "tests")
+    names: set[str] = set()
+    for fn in os.listdir(tests):
+        if not fn.endswith(".py"):
+            continue
+        with open(os.path.join(tests, fn)) as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                head = node.value.split("/", 1)[0]
+                if 3 <= len(head) <= 63 and all(c.islower() or c.isdigit() or c == "-" for c in head):
+                    names.add(head)
+    return names
+
+
 def _patch_adlfs_conftest() -> None:
     """adlfs's conftest starts an Azurite docker container (session
-    autouse fixture); the shared Azurite service is used instead. Its
-    ``storage`` fixture creates and finally deletes the container ``data``,
-    so refuse to run if that container already exists (it would be someone
-    else's)."""
+    autouse fixture); the shared Azurite service is used instead.
+
+    The suite uses fixed container names (``data``, ``catdir``, ...), so
+    it refuses to run if any container named in its sources already exists
+    (it could be someone else's), and at the end deletes the containers
+    named in its sources that it created (tests that fail midway leave
+    them behind)."""
     conftest = importlib.import_module("adlfs.tests.conftest")
     from adlfs.tests.constants import ACCOUNT_NAME, KEY, URL
 
@@ -115,12 +139,37 @@ def _patch_adlfs_conftest() -> None:
         from azure.storage.blob import BlobServiceClient
 
         conn = f"DefaultEndpointsProtocol=http;AccountName={ACCOUNT_NAME};AccountKey={KEY};BlobEndpoint={URL}/{ACCOUNT_NAME};"
-        names = [c["name"] for c in BlobServiceClient.from_connection_string(conn).list_containers()]
-        if "data" in names:
-            pytest.exit("adlfs suite: Azurite already has a container 'data' (not ours); not running", 3)
-        yield None
+        client = BlobServiceClient.from_connection_string(conn)
+        ours = _adlfs_container_names()
+        before = {c["name"] for c in client.list_containers()}
+        clash = sorted(before & ours)
+        if clash:
+            pytest.exit(f"adlfs suite: Azurite already has containers {clash} (not ours); not running", 3)
+        try:
+            yield None
+        finally:
+            for c in client.list_containers():
+                if c["name"] in ours and c["name"] not in before:
+                    client.delete_container(c["name"])
 
     conftest.spawn_azurite = spawn_azurite
+
+
+def _patch_gcsfs_conftest() -> None:
+    """gcsfs's fixtures close the aiohttp session on teardown through
+    ``GCSFileSystem.close_session(gcs.loop, gcs._session, ...)``, a gcsfs
+    internal (fsfast has no aiohttp session; its connections live in the
+    Rust backend and close with it). Only that teardown step is replaced."""
+    conftest = importlib.import_module("gcsfs.tests.conftest")
+
+    def _close_gcs(gcs: object) -> None:
+        return None
+
+    async def _close_gcs_async(gcs: object) -> None:
+        return None
+
+    conftest._close_gcs = _close_gcs
+    conftest._close_gcs_async = _close_gcs_async
 
 
 def _setup() -> None:
@@ -139,6 +188,14 @@ def _setup() -> None:
         _extend("fsspec", root)
         _extend("fsspec.tests", os.path.join(root, "tests"))
         _extend("fsspec.implementations", os.path.join(root, "implementations"))
+        if IMPL == "ref":
+            # The installed sshfs package registers itself for sftp/ssh
+            # through an entry point; fsspec's tests (and the baseline)
+            # are about fsspec's own paramiko-based class.
+            for proto in ("sftp", "ssh"):
+                fsspec.register_implementation(
+                    proto, "fsspec.implementations.sftp.SFTPFileSystem", clobber=True
+                )
         if IMPL == "fsfast":
             swaps = {
                 "fsspec.implementations.local": ("LocalFileSystem", fsfast.LocalFileSystem),
@@ -163,6 +220,7 @@ def _setup() -> None:
             for mod in ("gcsfs", "gcsfs.core"):
                 _swap(mod, "GCSFileSystem", fsfast.GCSFileSystem)
             fsfast.install(["gs", "gcs"])
+            _patch_gcsfs_conftest()
     elif SUITE == "adlfs":
         _patch_adlfs_conftest()
         if IMPL == "fsfast":
@@ -193,12 +251,29 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for key, (kind, reason) in table.items():
             if triage.matches(key, item.nodeid):
                 used.add(key)
-                if kind == "skip":
+                if kind == "skip" or (kind == "skip-root" and os.geteuid() == 0):
                     item.add_marker(pytest.mark.skip(reason=f"[fsfast triage] {reason}"))
+                elif kind == "skip-root":
+                    pass
                 else:
                     item.add_marker(pytest.mark.xfail(reason=f"[fsfast triage] {reason}", strict=False))
                 break
     config._fsfast_triage_used = used  # type: ignore[attr-defined]
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter, config: pytest.Config) -> None:
+    """List triage entries that matched no collected test (stale entries,
+    or tests not selected in this run)."""
+    used = getattr(config, "_fsfast_triage_used", None)
+    if used is None:
+        return
+    import triage
+
+    unused = sorted(set(triage.TABLE.get(SUITE, {})) - used)
+    if unused:
+        terminalreporter.write_sep("-", f"fsfast triage: {len(unused)} entries matched no collected test")
+        for key in unused:
+            terminalreporter.write_line(f"  {key}")
 
 
 # ---------------------------------------------------------------------------

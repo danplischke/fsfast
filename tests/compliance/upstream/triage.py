@@ -10,6 +10,8 @@ id ends with ``key`` (``file.py::test_name`` or ``::test_name``; a trailing
     offer; running it says nothing about fsfast.
 ``xfail``
     an intentional, documented deviation (docs/dev/python-parity.md).
+``skip-root``
+    skipped only when running as root (permission checks root bypasses).
 
 Every entry must say why. Tests not listed must pass.
 """
@@ -75,8 +77,6 @@ TABLE: dict[str, dict[str, tuple[str, str]]] = {
         "::test_versions*": ("xfail", "write handles do not expose version_id"),
         "::test_fsspec_versions_multiple": ("xfail", "write handles do not expose version_id"),
         "::test_versioned_file_fullpath": ("xfail", "write handles do not expose version_id"),
-        "::test_versions_unaware": ("xfail", "write handles do not expose version_id"),
-        "::test_versions_dircached": ("xfail", "write handles do not expose version_id"),
         "::test_touch_versions": ("xfail", "write handles do not expose version_id"),
         "::test_version_sizes": ("xfail", "pipe_file returns None, not the PutObject response (VersionId)"),
         "::test_async_stream": ("xfail", "open_async (async file objects) is not implemented"),
@@ -86,6 +86,8 @@ TABLE: dict[str, dict[str, tuple[str, str]]] = {
         "::test_raise_exception_when_file_has_changed_during_reading*": ("xfail", "raises fsfast.PreconditionFailed (OSError), not s3fs.utils.FileExpired"),
     },
     "fsspec": {
+        # --- environment
+        "mv.py::test_move_raises_error_with_tmpdir_permission*": ("skip-root", "makes a directory read-only, which root ignores (fails for fsspec too when run as root)"),
         # --- local: reference internals
         "test_local.py::test_transaction_ends_when_a_commit_fails": ("skip", "patches LocalFileOpener.commit, which fsfast's files do not use"),
         "test_local.py::test_multiple_file_transaction_use_umask_cache": ("skip", "counts hits of fsspec's private get_umask cache"),
@@ -135,8 +137,113 @@ TABLE: dict[str, dict[str, tuple[str, str]]] = {
         "test_sftp.py::test_host_key_policy_passed_through*": ("skip", "replaces paramiko.SSHClient with a fake and inspects fs.client"),
         "test_sftp.py::test_host_key_policy_not_passed_to_connect": ("skip", "replaces paramiko.SSHClient with a fake and inspects its connect() arguments"),
     },
-    "gcsfs": {},
-    "adlfs": {},
+    "gcsfs": {
+        # --- fail for gcsfs too on fake-gcs-server (run.sh --ref): its
+        # filesystem backend cannot hold an object "a" next to "a/b", and
+        # it keeps no directory placeholder objects "dir/"
+        "test_core.py::test_simple_upload": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (object next to a same-named prefix)"),
+        "test_core.py::test_large_upload": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (object next to a same-named prefix)"),
+        "test_core.py::test_multi_upload": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (object next to a same-named prefix)"),
+        "test_core.py::test_rm_recursive": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (object next to a same-named prefix)"),
+        "test_core.py::test_dir_marker": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (no 'dir/' placeholder objects)"),
+        "test_core.py::test_dir_marker_info_eq_ls": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (no 'dir/' placeholder objects)"),
+        "test_core.py::test_tree": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (no 'dir/' placeholder objects)"),
+        "test_core.py::test_glob": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (no 'dir/' placeholder objects)"),
+        "test_core.py::test_expand_path_regional": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (no 'dir/' placeholder objects)"),
+        "test_core.py::test_walk": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (no 'dir/' placeholder objects)"),
+        "gcsfs_test.py::TestGcsfsPipe::test_pipe_exclusive": ("skip", "emulator: fails for gcsfs too on fake-gcs-server (ifGenerationMatch=0 overwrite answered with HTTP 500)"),
+        # --- reference internals: gcsfs's aiohttp session, _call/_get_object,
+        # its GCSFile buffers/prefetcher and google-auth plumbing
+        "test_core.py::test_info_on_directory_with_only_subdirectories": ("skip", "counts calls of gcsfs's private _call"),
+        "test_core.py::test_pickle": ("skip", "compares gcs.session (the aiohttp session) after unpickling"),
+        "test_core.py::test_current": ("skip", "compares gcs.session (the aiohttp session)"),
+        "test_core.py::test_rm_batch_error": ("skip", "patches gcsfs's private _call (batch delete responses)"),
+        "test_core.py::test_rm_batch_not_found_invalidates_stale_cache": ("skip", "patches gcsfs's private _call (batch delete responses)"),
+        "test_core.py::test_move": ("skip", "mocks gcsfs's private _mv_file and counts its awaits"),
+        "test_core.py::test_move_recursive_no_slash": ("skip", "mocks gcsfs's private _mv_file and counts its awaits"),
+        "test_core.py::test_move_recursive_with_slash": ("skip", "mocks gcsfs's private _mv_file and counts its awaits"),
+        "test_core.py::test_move_with_glob_pattern": ("skip", "mocks gcsfs's private _mv_file and counts its awaits"),
+        "test_core.py::test_move_list_to_dir": ("skip", "mocks gcsfs's private _mv_file and counts its awaits"),
+        "test_core.py::test_move_list_to_list": ("skip", "mocks gcsfs's private _mv_file and counts its awaits"),
+        "test_core.py::test_move_raises_filenotfound": ("skip", "mocks gcsfs's private _mv_file"),
+        "test_core.py::test_move_implicit_directories_ignore_filenotfound": ("skip", "mocks gcsfs's private _mv_file"),
+        "test_core.py::test_move_non_recursive_empty_after_filter": ("skip", "mocks gcsfs's private _mv"),
+        "test_core.py::test_mv_file": ("skip", "on an emulator it mocks gcsfs's private _call (moveTo request)"),
+        "test_core.py::test_mv_file_cache": ("skip", "on an emulator it mocks gcsfs's private _call (moveTo request)"),
+        "test_core.py::test_mv_file_calls_move_to": ("skip", "mocks gcsfs's private _call (moveTo request)"),
+        "test_core.py::test_mv_file_fallback": ("skip", "mocks gcsfs's private _call (moveTo request)"),
+        "test_core.py::test_mv_file_raises_filenotfound_from_moveto": ("skip", "mocks gcsfs's private _call (moveTo request)"),
+        "test_core.py::test_mv_file_idempotency_retries": ("skip", "patches gcsfs's private _set_session/aiohttp session"),
+        "test_core.py::test_put_file_resumable_upload_cleanup_on_chunk_failure*": ("skip", "patches gcsfs's private _call (resumable upload requests)"),
+        "test_core.py::test_read_small": ("skip", "inspects GCSFile.cache (fsspec cache object); fsfast caches in Rust"),
+        "test_core.py::test_readline_from_cache": ("skip", "inspects GCSFile.cache (fsspec cache object); fsfast caches in Rust"),
+        "test_core.py::test_write_blocks": ("skip", "inspects GCSFile.buffer"),
+        "test_core.py::test_request_user_project": ("skip", "calls gcsfs's raw request method call()"),
+        "test_core.py::test_request_user_project_string": ("skip", "calls gcsfs's raw request method call()"),
+        "test_core.py::test_request_header": ("skip", "calls gcsfs's raw request method call()"),
+        "test_core.py::test_user_project_fallback_google_default": ("skip", "patches gcsfs.credentials.gauth (google-auth); fsfast resolves ADC in Rust"),
+        "test_core.py::test_raise_on_project_mismatch": ("skip", "patches gcsfs.credentials.gauth (google-auth); fsfast resolves ADC in Rust"),
+        "test_core.py::test_cat_file_routing_and_thresholds": ("skip", "patches gcsfs's private concurrency thresholds/_cat_file_* helpers"),
+        "test_core.py::test_cat_file_concurrent_*": ("skip", "calls gcsfs's private _cat_file_concurrent/_cat_file_sequential"),
+        "test_core.py::test_cat_file_default_concurrency": ("skip", "calls gcsfs's private _cat_file_concurrent"),
+        "test_core.py::test_cat_file_explicit_concurrency": ("skip", "calls gcsfs's private _cat_file_concurrent"),
+        "test_core.py::test_cat_file_generation": ("skip", "mocks gcsfs's private _call/_process_limits"),
+        "test_core.py::test_prefetcher_default_concurrency": ("skip", "inspects GCSFile's adaptive prefetcher"),
+        "test_core.py::test_gcsfile_prefetch_*": ("skip", "inspects GCSFile's adaptive prefetcher (_prefetch_engine, cache_source)"),
+        "test_core.py::test_gcsfile_multithreaded_read_integrity": ("skip", "calls GCSFile's private _fetch_range"),
+        "test_core.py::test_gcsfile_not_satisfiable_range": ("skip", "calls GCSFile's private _fetch_range"),
+        "test_core.py::test_info_parallel*": ("skip", "patches gcsfs's private _get_object/_get_directory_info"),
+        "test_core.py::test_get_file_*": ("skip", "patches gcsfs's private _get_file_request/_get_threshold_for_disk_reads"),
+        "test_core.py::test_init_local_file": ("skip", "calls gcsfs's private _init_local_file"),
+        "test_core.py::test_open_generation_forwarded": ("skip", "patches gcsfs.core.GCSFile and checks its constructor arguments"),
+        "test_core.py::test_get_headers_includes_cache_type": ("skip", "calls gcsfs's private _get_headers"),
+        "test_core.py::test_user_agent_includes_cache_type_and_source_in_read": ("skip", "inspects request headers through gcs.session (aiohttp)"),
+        "test_core_versioned.py::*": ("skip", "emulator: fake-gcs-server cannot create versioned buckets (fails for gcsfs too: HTTP 500 'does not support versioning')"),
+        "test_dircache.py::TestDirCacheUpdaterWrite::*": ("skip", "calls gcsfs's private _write_file_cache_update"),
+        "test_dircache.py::TestDirCacheUpdaterRm::*": ("skip", "calls gcsfs's private _rm_file(s)_cache_update"),
+        "test_dircache.py::TestDirCacheUpdaterMv::*": ("skip", "calls gcsfs's private _mv_file_cache_update"),
+        "test_dircache.py::TestDirCacheUpdaterMkdirRmdir::*": ("skip", "replaces gcsfs's private _call with a fake; with fsfast the bucket requests would really be sent (creating 'new-bucket' on the shared emulator)"),
+        "test_mapping.py::test_gcsmap_uses_extended_gcsfilesystem": ("skip", "reloads the gcsfs module (undoing the class swap for the rest of the run) to test gcsfs's ExtendedGcsFileSystem"),
+        # --- intentional deviations (docs/dev/python-parity.md)
+        "test_core.py::test_isfile": ("xfail", "assigns gcs.version_aware = True after construction; fsfast parses '#generation' paths per the constructor's version_aware (it is part of the instance key)"),
+        "test_core.py::test_default_gcp_universe": ("xfail", "reuses the cached instance built by test_custom_gcp_universe under another GOOGLE_CLOUD_UNIVERSE_DOMAIN; fsfast resolves the endpoint at construction, gcsfs on every request"),
+        "test_core.py::test_write_file_cache_invalidates_only_immediate_parent_standard": ("xfail", "a write drops the cached listings of all ancestors, not only the parent (never stale, sometimes one extra listing)"),
+    },
+    "adlfs": {
+        # --- reference internals: the azure-storage-blob clients adlfs
+        # drives (patched or inspected), its private helpers and its file
+        # object internals
+        "test_connect_client.py::*": ("skip", "patches azure.storage.blob BlobServiceClient constructors and checks their arguments"),
+        "test_fetch_range.py::*": ("skip", "calls AzureBlobFile's private _fetch_range"),
+        "test_spec.py::test_anon_off*": ("skip", "patches azure.storage.blob.aio.BlobServiceClient.__init__ and inspects its arguments (the fs.anon check before it passes)"),
+        "test_spec.py::test_anon_true*": ("skip", "patches azure.storage.blob.aio.BlobServiceClient.__init__ and inspects its arguments (the fs.anon check before it passes)"),
+        "test_spec.py::test_blobfile_default_blocksize": ("skip", "uses fs.service_client (azure SDK client)"),
+        "test_spec.py::test_blocksize_from_blobfile*": ("skip", "uses fs.service_client (azure SDK client)"),
+        "test_spec.py::test_cat_file_timeout": ("skip", "patches the azure SDK's download_blob"),
+        "test_spec.py::test_get_file_timeout": ("skip", "patches the azure SDK's download_blob"),
+        "test_spec.py::test_pipe_file_timeout": ("skip", "patches the azure SDK's upload_blob"),
+        "test_spec.py::test_put_file_timeout": ("skip", "patches the azure SDK's upload_blob"),
+        "test_spec.py::test_cat_file_versioned": ("skip", "patches the azure SDK's BlobClient (fake version ids)"),
+        "test_spec.py::test_cp_file_versioned": ("skip", "patches the azure SDK's BlobClient (fake version ids)"),
+        "test_spec.py::test_get_file_versioned": ("skip", "patches the azure SDK's BlobClient (fake version ids)"),
+        "test_spec.py::test_exists_versioned": ("skip", "patches the azure SDK's BlobClient (fake version ids)"),
+        "test_spec.py::test_isfile_versioned": ("skip", "patches the azure SDK's BlobClient (fake version ids)"),
+        "test_spec.py::test_url_versioned": ("skip", "patches the azure SDK's generate_blob_sas"),
+        "test_spec.py::test_url_with_conn_str": ("skip", "patches the azure SDK's generate_blob_sas"),
+        "test_spec.py::test_rm_file_versioned_blob": ("skip", "patches the azure SDK's ContainerClient (fake version ids)"),
+        "test_spec.py::test_details_versioned": ("skip", "calls adlfs's private _details"),
+        "test_spec.py::test_open_file": ("skip", "inspects AzureBlobFile.container_client (azure SDK client)"),
+        "test_spec.py::test_rm_recursive": ("skip", "patches the azure SDK's ContainerClient.delete_blob and checks its call order (the listing checks before it pass)"),
+        "test_spec.py::test_rm_recursive_call_order": ("skip", "patches adlfs's private _rm_files"),
+        "test_spec.py::test_uses_block_size_for_partitioned_uploads": ("skip", "patches the azure SDK's BlobClient.stage_block/commit_block_list"),
+        "test_spec.py::test_lazy_metadata_*": ("skip", "patches adlfs.spec.get_blob_metadata and reads AzureBlobFile.metadata, an adlfs file attribute fsfast files do not have"),
+        # --- intentional deviations / gaps (docs/dev/python-parity.md)
+        "test_loop.py::*": ("xfail", "uses an azure.identity.aio (async) credential; fsfast needs a synchronous credential"),
+        "test_pickling.py::test_fs_pickling": ("xfail", "passes an unknown option (kwarg1); fsfast rejects unknown options with ValueError, adlfs keeps them in fs.kwargs"),
+        "test_spec.py::test_ls_versioned": ("xfail", "ls(versions=True) is not implemented"),
+        "test_spec.py::test_write_populates_version_id_when_version_aware": ("xfail", "write handles do not expose version_id"),
+        "test_spec.py::test_write_does_not_populate_version_id_when_not_version_aware": ("xfail", "write handles do not expose version_id"),
+    },
 }
 
 

@@ -59,6 +59,10 @@ def backend() -> np_.Backend:
             # As in s3fs: the generic mv copies the tree, then fails copying
             # the directory entry and leaves the source in place.
             "mv dir": "adlfs raises FileNotFoundError after copying",
+            # adlfs ignores maxdepth; fsfast honours it, as fsspec's
+            # contract and its abstract test suite require.
+            "find maxdepth": "adlfs lists the whole tree",
+            "find maxdepth withdirs": "adlfs lists the whole tree",
         },
         resync={
             "mv dir": lambda fs, root: fs.rm(f"{root}/tree", recursive=True),

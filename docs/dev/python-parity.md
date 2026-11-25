@@ -113,17 +113,27 @@ Each item below is either a reference bug or a limitation that fsfast does not c
 - **open of a prefix.** gcsfs opens it as an empty object; fsfast raises `FileNotFoundError`.
 - **Not provided:**
   - `setxattrs` (object PATCH) raises `NotImplementedError`;
-  - `ls`/`find` with `prefix=` or `versions=`;
+  - `ls`/`find` with `versions=`;
   - `mkdir` with `location`, `enable_versioning` or other bucket settings.
+- **ls/find with prefix=** give gcsfs's results (same entries, the same find-directory dicts, prefixed listings are not cached). fsfast filters a listing of the directory instead of sending gcsfs's narrower prefix request, so it transfers more for a narrow prefix of a large directory.
+- **version_aware is fixed at construction.** It is part of the instance key; assigning `fs.version_aware = True` later does not make the backend parse `path#generation` (gcsfs reads the attribute on every call). Pass `version_aware=True` to the constructor.
+- **The endpoint is resolved at construction** from `endpoint_url`, `$STORAGE_EMULATOR_HOST` and `$GOOGLE_CLOUD_UNIVERSE_DOMAIN`; gcsfs re-reads the environment on every request. `base`, `batch_url_base`, `on_google` and `url()` report the endpoint in use.
+- **Write invalidation.** A write drops the cached listings of every ancestor; gcsfs drops only the parent when it is cached (never stale either way).
 - **token.** google-auth user `Credentials` objects become their `authorized_user` dict, or else their access token. Other credential objects raise `NotImplementedError`.
-- **Provided:** `url`, `merge` (compose), `getxattr`, `buckets`, `split_path`, `modified`/`created`, and `open(..., metadata=..., fixed_key_metadata=..., content_type=...)`.
+- **Provided:** `url`, `merge` (compose), `getxattr`, `buckets`, `split_path`, `modified`/`created`, `mv_file` (rejects a destination generation like gcsfs), `on_google`, `base`, `batch_url_base`, and `open(..., metadata=..., fixed_key_metadata=..., content_type=...)`.
 
 ### abfs
 - **open "ab".** adlfs appends only to append blobs (`ResourceExistsError` for a block blob). fsfast also appends to block blobs, by re-staging the existing blocks.
 - **Transactions.** adlfs uploads on close even inside a transaction. fsfast defers the upload to the commit.
 - **Recursive mv of a directory** fails in adlfs as in s3fs; fsfast moves the tree.
 - **Opening a directory** fails in adlfs with `TypeError`; fsfast raises `IsADirectoryError`.
-- **find mirrors adlfs.** It ignores `maxdepth`, never lists the root, and returns `[path]` for a file.
+- **find mirrors adlfs** except for `maxdepth`: it never lists the root and returns `[path]` for a file, but it honours `maxdepth`, which adlfs ignores (fsspec's contract and its abstract test suite require it; with adlfs `cp`/`rm`/`get` with `maxdepth` act on the whole tree).
+- **find(prefix=)** gives adlfs's result (names starting with `path/prefix`); fsfast filters the listing of `path` instead of listing with `name_starts_with`.
+- **rm(dir) without recursive** leaves a non-empty directory in place, as adlfs does (it deletes only a blob named like the directory).
+- **mkdir/makedir follow adlfs:** only containers are created; an existing container raises `FileExistsError` with `exist_ok=False` (the default of `makedir`); `create_parents=False` for a missing container raises `PermissionError`; with `assume_container_exists=None` a failed container probe warns and assumes the container exists.
+- **ls of `"."`, `"*"`, `"/"`** lists the containers, as in adlfs.
+- **blocksize** defaults to adlfs's 50 MiB (`fs.blocksize`, `f.blocksize`); the Rust handles keep their tuned defaults (8 MiB upload blocks and ranged reads) unless a block size is given. `anon` resolves `$AZURE_STORAGE_ANON` like adlfs.
+- **Unknown constructor options** raise `ValueError`; adlfs keeps them in `fs.kwargs`.
 - **content_settings** is azure's `ContentSettings` (with `content_md5` as a `bytearray`) when the Azure SDK is installed. Otherwise it is a dict with the same keys in the same order.
 - **invalidate_cache(path)** also drops the ancestors' listings (adlfs drops only the path's).
 - **rmdir copies adlfs.** A container path deletes the container, even a non-empty one, in one request (`delete_container`). Any path below a container, or a missing container, is a silent no-op. Covered by `test_rmdir_semantics`.
@@ -135,15 +145,15 @@ Each item below is either a reference bug or a limitation that fsfast does not c
   - Async credentials raise `NotImplementedError`.
 - **Not provided:**
   - `ls(versions=...)`/`version_id`;
-  - `find(prefix=)`;
   - `url(content_*=...)` overrides;
-  - `open(..., metadata=...)`, which raises `NotImplementedError` (use `setxattrs`).
-- **Provided:** `url`/`sign` (SAS), `getxattr`, `setxattrs`, `makedir`, `split_path`, `modified`/`created`.
+  - the adlfs file attribute `f.metadata` (lazy blob metadata) and `f.version_id` after a write.
+- **Provided:** `url`/`sign` (SAS), `getxattr`, `setxattrs`, `makedir`, `split_path`, `modified`/`created`, `content_settings=` (dict or `ContentSettings`) on `open`/`pipe_file`/`put_file`/`put`, `metadata=` on `open`, `overwrite=False` on `pipe_file`/`put_file`. Inside a transaction the per-call settings of a spooled write are not applied (the upload at commit goes through `put_file`).
 
 ### smb
 - **Errors.** smbclient raises `SMBOSError`, an `OSError` that is not a `FileNotFoundError`. fsfast raises the precise subclass with the same errno: the tests compare errnos.
 - **cp_file and copy.** fsspec smb has no `cp_file` (`NotImplementedError`), and `copy(recursive=True)` fails with `TypeError`. fsfast copies server-side with `FSCTL_SRV_COPYCHUNK`.
 - **created()** can differ by 1 µs. fsspec rounds a float timestamp; fsfast truncates the exact FILETIME.
+- **glob matches directories.** fsspec's smb `glob("dir/*")` never matches a subdirectory (its find keys directories as `"dir/sub/"`, which the pattern does not match), so `get`/`cp`/`rm` of a glob with `recursive=True` silently skip them. fsfast matches directories, named without the trailing `/`, as fsspec's glob does on every other backend and as fsspec's abstract test suite requires.
 - **share_access** is per filesystem. Overriding it in `open()` raises `NotImplementedError`.
 - **put/copy create directories.** `put`/`put_file` create parent directories, as fsspec's generic `put_file` does, and `copy` creates the target directories.
 - **Extra:** `connection_info(share)`.
@@ -168,3 +178,6 @@ Each item below is either a reference bug or a limitation that fsfast does not c
 ## Fixes made in backend crates
 
 - **fsfast-http** (`crates/fsfast-http/src/info.rs`, `requote`): `info()["url"]` left a `%` that does not start an escape unescaped. yarl, and so fsspec, writes it as `%25`. This showed for names containing `%`. A unit test (`requote_escapes_a_lone_percent_like_yarl`) checks yarl's outputs.
+- **fsfast-azure** (`crates/fsfast-azure/src/write.rs`, `BlobHeaders::from_options`): a per-call `metadata` option (adlfs `open(..., metadata=...)`) was rejected as unknown; it is now merged into the blob's metadata. Unit test `write::tests::metadata_from_extra`.
+
+The upstream compliance runs that found these are in [compliance.md](compliance.md).

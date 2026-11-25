@@ -17,6 +17,23 @@ __all__ = ["GCSFileSystem"]
 DEFAULT_PROJECT = os.getenv("GCSFS_DEFAULT_PROJECT", "")
 
 
+def _gcp_universe_domain() -> str:
+    """gcsfs ``_gcp_universe_domain``."""
+    return os.getenv("GOOGLE_CLOUD_UNIVERSE_DOMAIN", "googleapis.com")
+
+
+def _location() -> str:
+    """gcsfs ``_location``: ``$STORAGE_EMULATOR_HOST`` (``http://`` added
+    when it has no scheme) or ``https://storage.<universe domain>``. The
+    Rust backend resolves its endpoint the same way."""
+    emulator = os.getenv("STORAGE_EMULATOR_HOST", "")
+    if emulator not in {"default", ""}:
+        if not emulator.startswith(("http://", "https://")):
+            emulator = f"http://{emulator}"
+        return emulator
+    return f"https://storage.{_gcp_universe_domain()}"
+
+
 def _token_option(token: Any) -> Any:
     """gcsfs ``token`` values as fsfast-gcs options: strings, paths and
     dicts pass through; a ``google.oauth2.credentials.Credentials`` (user
@@ -111,6 +128,10 @@ class GCSFileSystem(ObjectStoreFileSystem):
         self.default_location = default_location
         self.version_aware = version_aware
         self._endpoint = endpoint_url
+        # The Rust backend resolves its endpoint once, at construction
+        # (gcsfs re-reads $STORAGE_EMULATOR_HOST on every request); report
+        # the endpoint actually in use.
+        self._resolved_location = endpoint_url or _location()
         opts: dict[str, Any] = dict(kwargs)
         opts.update(
             project=project or None,
@@ -216,10 +237,21 @@ class GCSFileSystem(ObjectStoreFileSystem):
         refresh: bool = False,
         **kwargs: Any,
     ) -> list[Any]:
-        if prefix or versions:
-            raise NotImplementedError("fsfast.GCSFileSystem.ls does not support prefix= or versions=")
+        if versions:
+            raise NotImplementedError("fsfast.GCSFileSystem.ls does not support versions=")
         if refresh:
             self.invalidate_cache(path)
+        if prefix:
+            key = self._listing_key(path)
+            listdir = self._prefix_dir(key, prefix)
+            try:
+                entries = self._ls_entries(listdir, refresh)
+            except FileNotFoundError:
+                entries = []
+            out = self._prefix_entries(listdir, f"{key}/{prefix}", entries)
+            if not out and "/" in key:
+                out = [self._object_or_missing(key, self._rfs.info(key))]
+            return out if detail else self._names(out)
         return super().ls(path, detail=detail, refresh=refresh)
 
     async def _ls(
@@ -231,11 +263,94 @@ class GCSFileSystem(ObjectStoreFileSystem):
         refresh: bool = False,
         **kwargs: Any,
     ) -> list[Any]:
-        if prefix or versions:
-            raise NotImplementedError("fsfast.GCSFileSystem.ls does not support prefix= or versions=")
+        if versions:
+            raise NotImplementedError("fsfast.GCSFileSystem.ls does not support versions=")
         if refresh:
             self.invalidate_cache(path)
+        if prefix:
+            key = self._listing_key(path)
+            listdir = self._prefix_dir(key, prefix)
+            try:
+                entries = await self._ls_entries_async(listdir, refresh)
+            except FileNotFoundError:
+                entries = []
+            out = self._prefix_entries(listdir, f"{key}/{prefix}", entries)
+            if not out and "/" in key:
+                out = [self._object_or_missing(key, await self._rfs.info_async(key))]
+            return out if detail else self._names(out)
         return await super()._ls(path, detail=detail, refresh=refresh)
+
+    # gcsfs's ``prefix=`` lists ``path`` with the object-name prefix
+    # ``path/prefix``. fsfast filters the full listing (from the listings
+    # cache when it is there) instead of a second, narrower request: the
+    # result is the same and the full listing can be reused; for a huge
+    # directory and a narrow prefix gcsfs transfers less.
+
+    @staticmethod
+    def _prefix_dir(key: str, prefix: str) -> str:
+        """The directory whose one-level listing holds the matches of
+        ``prefix`` (gcsfs lists with ``delimiter="/"``, so a prefix with a
+        ``/`` lists below that directory)."""
+        head = prefix.rpartition("/")[0]
+        return f"{key}/{head}" if head else key
+
+    def _prefix_entries(self, listdir: str, full: str, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self._is_listing(listdir, entries):
+            return []
+        return [
+            e
+            for e in entries
+            if (e["name"].rstrip("/") + ("/" if e["type"] == "directory" else "")).startswith(full)
+        ]
+
+    @staticmethod
+    def _object_or_missing(key: str, info: dict[str, Any]) -> dict[str, Any]:
+        # gcsfs falls back to GETting ``path`` as an object, which fails
+        # for a prefix ("directory").
+        if info["type"] == "directory":
+            raise FileNotFoundError(key)
+        return info
+
+    def _find_prefix_result(
+        self,
+        root: str,
+        prefix: str,
+        found: list[dict[str, Any]],
+        maxdepth: int | None,
+        withdirs: bool,
+        detail: bool,
+    ) -> Any:
+        """gcsfs ``_find`` with ``prefix=``: objects whose names start with
+        ``root/prefix``, their parent directories below ``root`` when
+        ``withdirs``; the listings cache is left alone (partial listing)."""
+        full = f"{root}/{prefix}"
+        objects = [o for o in found if o["type"] != "directory" and o["name"].startswith(full)]
+        out = list(objects)
+        if withdirs:
+            # gcsfs ``_get_dirs_and_update_cache``: the parents that match
+            # the prefix, in its find-directory shape.
+            dirs: dict[str, dict[str, Any]] = {}
+            for o in objects:
+                parent = self._parent(o["name"])
+                while len(parent) >= len(root) and parent.startswith(full) and parent not in dirs:
+                    dir_key = self.split_path(parent)[1]
+                    if dir_key:
+                        dirs[parent] = {
+                            "Key": dir_key,
+                            "Size": 0,
+                            "name": parent,
+                            "StorageClass": "DIRECTORY",
+                            "type": "directory",
+                            "size": 0,
+                        }
+                    parent = self._parent(parent)
+            out = sorted(out + list(dirs.values()), key=lambda x: x["name"])
+        if maxdepth:
+            depth = root.count("/") + maxdepth
+            out = [o for o in out if o["name"].count("/") <= depth]
+        if detail:
+            return {o["name"]: o for o in out}
+        return [o["name"] for o in out]
 
     def find(
         self,
@@ -247,9 +362,35 @@ class GCSFileSystem(ObjectStoreFileSystem):
         versions: bool = False,
         **kwargs: Any,
     ) -> Any:
-        if prefix or versions:
-            raise NotImplementedError("fsfast.GCSFileSystem.find does not support prefix= or versions=")
+        if versions:
+            raise NotImplementedError("fsfast.GCSFileSystem.find does not support versions=")
+        if prefix:
+            if maxdepth is not None and maxdepth < 1:
+                raise ValueError("maxdepth must be at least 1")
+            found = self._fix_all(self._rfs.find(self._strip(path), None, False, True, as_list=True))
+            return self._find_prefix_result(self._listing_key(path), prefix, found, maxdepth, withdirs, detail)
         return super().find(path, maxdepth=maxdepth, withdirs=withdirs, detail=detail)
+
+    async def _find(
+        self,
+        path: Any,
+        maxdepth: int | None = None,
+        withdirs: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        prefix = kwargs.pop("prefix", "")
+        if kwargs.pop("versions", False):
+            raise NotImplementedError("fsfast.GCSFileSystem.find does not support versions=")
+        if prefix:
+            if maxdepth is not None and maxdepth < 1:
+                raise ValueError("maxdepth must be at least 1")
+            found = self._fix_all(
+                await self._rfs.find_async(self._strip(path), None, False, True, as_list=True)
+            )
+            return self._find_prefix_result(
+                self._listing_key(path), prefix, found, maxdepth, withdirs, kwargs.pop("detail", False)
+            )
+        return await super()._find(path, maxdepth=maxdepth, withdirs=withdirs, **kwargs)
 
     # ------------------------------------------------------------------
     # buckets
@@ -306,6 +447,26 @@ class GCSFileSystem(ObjectStoreFileSystem):
     # gcsfs extras
 
     @property
+    def _location(self) -> str:
+        return self._resolved_location
+
+    @property
+    def batch_url_base(self) -> str:
+        """Batch API base URL (gcsfs ``batch_url_base``)."""
+        return f"{self._location}/batch/storage/v1"
+
+    @property
+    def base(self) -> str:
+        """JSON API base URL (gcsfs ``base``)."""
+        return f"{self._location}/storage/v1/"
+
+    @property
+    def on_google(self) -> bool:
+        """Whether the endpoint is Google's (not an emulator), as gcsfs
+        decides it."""
+        return f"torage.{_gcp_universe_domain()}" in self._location
+
+    @property
     def buckets(self) -> list[str]:
         """Names of the project's buckets (``"name/"``, as gcsfs lists them)."""
         return [b["name"] for b in self.ls("", detail=True)]
@@ -331,6 +492,21 @@ class GCSFileSystem(ObjectStoreFileSystem):
             )
         finally:
             self.invalidate_cache(path)
+
+    async def _mv_file(self, path1: Any, path2: Any, **kwargs: Any) -> None:
+        if self.split_path(self._strip(path2))[2]:
+            raise ValueError("Cannot move to specific object generation")
+        await super()._mv_file(path1, path2)
+
+    def mv_file(self, path1: Any, path2: Any, **kwargs: Any) -> None:
+        """Move one object (gcsfs ``mv_file``)."""
+        if self.split_path(self._strip(path2))[2]:
+            raise ValueError("Cannot move to specific object generation")
+        try:
+            self._rfs.mv_file(self._strip(path1), self._strip(path2))
+        finally:
+            self.invalidate_cache(path1)
+            self.invalidate_cache(path2)
 
     def getxattr(self, path: Any, attr: str) -> Any:
         """One user metadata value of an object."""

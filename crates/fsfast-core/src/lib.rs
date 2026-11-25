@@ -25,7 +25,7 @@ pub mod value;
 pub use async_trait::async_trait;
 pub use bytes::Bytes;
 
-pub use blocking::blocking;
+pub use blocking::{Attempt, blocking, blocking_deferrable};
 pub use error::{Detail, Error, ErrorKind, Result};
 pub use fs::{
     Capabilities, FileSystem, FindOptions, IoHints, ReadHandle, ReadOptions, WriteHandle,
