@@ -15,9 +15,15 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # One feature per compiled-in backend. Adding a backend is one line here plus
 # one match arm in `src/registry.rs`.
-default = ["local", "memory"]
+default = ["local", "memory", "http", "s3", "smb", "sftp", "gcs", "azure"]
 local = ["dep:fsfast-local"]
 memory = ["dep:fsfast-memory"]
+http = ["dep:fsfast-http"]
+s3 = ["dep:fsfast-s3"]
+smb = ["dep:fsfast-smb"]
+sftp = ["dep:fsfast-sftp"]
+gcs = ["dep:fsfast-gcs"]
+azure = ["dep:fsfast-azure"]
 # Set by maturin (see the root pyproject.toml): do not link libpython into the
 # extension module. Left off for `cargo test`, which embeds an interpreter.
 extension-module = ["pyo3/extension-module"]
@@ -27,6 +33,12 @@ fsfast-core.workspace = true
 fsfast-engine.workspace = true
 fsfast-local = { workspace = true, optional = true }
 fsfast-memory = { workspace = true, optional = true }
+fsfast-http = { workspace = true, optional = true }
+fsfast-s3 = { workspace = true, optional = true }
+fsfast-smb = { workspace = true, optional = true }
+fsfast-sftp = { workspace = true, optional = true }
+fsfast-gcs = { workspace = true, optional = true }
+fsfast-azure = { workspace = true, optional = true }
 arc-swap = "1"
 bytes.workspace = true
 futures.workspace = true

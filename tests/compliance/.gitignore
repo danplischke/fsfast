@@ -1,0 +1,3 @@
+# upstream test sources fetched by upstream/fetch.sh, and run reports
+.upstream/
+reports/

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use fsfast_core::{Detail, FileType, Value};
+use fsfast_core::{Detail, ErrorKind, FileType, Value};
 
 use super::*;
 

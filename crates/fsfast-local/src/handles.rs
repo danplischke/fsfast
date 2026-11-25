@@ -14,8 +14,8 @@ use fsfast_core::{
 use futures::{StreamExt, stream};
 use tokio::task::JoinHandle;
 
-use crate::blocking;
 use crate::stat::io_err;
+use crate::{blocking, spawn_blocking};
 
 /// `pread` at an absolute offset; safe to call concurrently on one `File`.
 #[cfg(unix)]
@@ -96,7 +96,8 @@ pub(crate) async fn read_parallel(
         stream::iter(pieces.into_iter().map(|(off, mut piece)| {
             let file = file.clone();
             let name = name.clone();
-            blocking(move || {
+            // The pool, not inline: the pieces are read in parallel.
+            spawn_blocking(move || {
                 let n = pread_full(&file, off, &mut piece).map_err(|e| io_err(e, &name))?;
                 Ok((piece, n))
             })
@@ -219,7 +220,8 @@ impl ReadHandle for LocalReadHandle {
         let small_reads = stream::iter(batches.into_iter().map(|batch| {
             let file = self.file.clone();
             let name = self.name.clone();
-            blocking(move || {
+            // The pool, not inline: batches are read in parallel.
+            spawn_blocking(move || {
                 batch
                     .into_iter()
                     .map(|g| {

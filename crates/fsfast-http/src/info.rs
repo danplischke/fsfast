@@ -161,7 +161,8 @@ fn has_empty_path(raw: &str) -> bool {
 }
 
 /// yarl's requoting of percent-escapes: `%XX` of an unreserved character
-/// (RFC 3986 §2.3) becomes the character, other escapes get upper-case hex.
+/// (RFC 3986 §2.3) becomes the character, other escapes get upper-case hex,
+/// and a `%` that does not start an escape is itself escaped (`%25`).
 /// The input is a serialized URL (ASCII).
 fn requote(url: &str) -> String {
     let b = url.as_bytes();
@@ -182,6 +183,9 @@ fn requote(url: &str) -> String {
                 out.push_str(&hex.to_ascii_uppercase());
             }
             i += 3;
+        } else if b[i] == b'%' {
+            out.push_str("%25");
+            i += 1;
         } else {
             out.push(char::from(b[i]));
             i += 1;
@@ -311,6 +315,15 @@ pub fn link_info(url: String) -> FileInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requote_escapes_a_lone_percent_like_yarl() {
+        // yarl: str(URL("http://h/a +%ü")) == "http://h/a%20+%25%C3%BC"
+        assert_eq!(requote("http://h/a%20+%%C3%BC"), "http://h/a%20+%25%C3%BC");
+        assert_eq!(requote("http://h/100%"), "http://h/100%25");
+        assert_eq!(requote("http://h/%4"), "http://h/%254");
+        assert_eq!(requote("http://h/%7e%2f"), "http://h/~%2F");
+    }
     use fsfast_http_transport::header::HeaderValue;
     use std::time::SystemTime;
 

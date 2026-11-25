@@ -4,7 +4,7 @@
 //!   lists and dicts).
 //! * [`FileInfo`] → the fsspec `info()` dict `{"name", "size", "type",
 //!   **extra}`, with the extra keys in the reference implementation's order
-//!   (see [`crate::registry::Backend::info_keys`]).
+//!   (see [`crate::registry::Backend::layouts`]).
 //! * `storage_options` dicts → [`Options`].
 //! * Byte buffers: results are built straight into a Python `bytes` object
 //!   (one copy from the backend's buffer, with the interpreter released for
@@ -222,32 +222,56 @@ fn type_str(py: Python<'_>, t: FileType) -> &Bound<'_, PyString> {
     }
 }
 
-/// [`FileInfo`] → the fsspec info dict: `name`, `size`, `type`, then the
-/// backend's native keys in the reference implementation's order, then any
-/// other extra keys (sorted).
+/// [`FileInfo`] → the fsspec info dict, keys in the reference
+/// implementation's order (see [`Backend::layouts`]): `name`, `size` and
+/// `type` first unless the layout places them, then the layout's keys, then
+/// any other extra keys (sorted). An extra key named `name`, `size` or
+/// `type` overrides the core field (SMB directory names with a trailing
+/// slash, Azure's `size: None` for directories).
 pub(crate) fn info_to_py<'py>(
     py: Python<'py>,
     info: &FileInfo,
     backend: &Backend,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    d.set_item(pyo3::intern!(py, "name"), PyString::new(py, &info.name))?;
-    d.set_item(pyo3::intern!(py, "size"), info.size)?;
-    d.set_item(pyo3::intern!(py, "type"), type_str(py, info.file_type))?;
-    if info.extra.is_empty() {
-        return Ok(d);
-    }
-    let keys = backend.interned_keys(py);
-    let mut done = 0;
-    for (name, key) in backend.info_keys.iter().zip(keys) {
-        if let Some(v) = info.extra.get(*name) {
-            d.set_item(key.bind(py), value_to_py(py, v)?)?;
-            done += 1;
+    let (layout, keys) = backend.layout(py, info);
+    let core = |d: &Bound<'py, PyDict>, name: &str| -> PyResult<()> {
+        let key = match name {
+            "name" => pyo3::intern!(py, "name"),
+            "size" => pyo3::intern!(py, "size"),
+            _ => pyo3::intern!(py, "type"),
+        };
+        if let Some(v) = info.extra.get(name) {
+            return d.set_item(key, value_to_py(py, v)?);
+        }
+        match name {
+            "name" => d.set_item(key, PyString::new(py, &info.name)),
+            "size" => d.set_item(key, info.size),
+            _ => d.set_item(key, type_str(py, info.file_type)),
+        }
+    };
+    for name in ["name", "size", "type"] {
+        if !layout.contains(&name) {
+            core(&d, name)?;
         }
     }
-    if done < info.extra.len() {
+    let mut done = 0;
+    for (name, key) in layout.iter().zip(keys) {
+        match *name {
+            "name" | "size" | "type" => core(&d, name)?,
+            _ => {
+                if let Some(v) = info.extra.get(*name) {
+                    d.set_item(key.bind(py), value_to_py(py, v)?)?;
+                    done += 1;
+                }
+            }
+        }
+    }
+    let is_core = |k: &str| matches!(k, "name" | "size" | "type");
+    let overrides = info.extra.keys().filter(|k| is_core(k)).count();
+    if done + overrides < info.extra.len() {
         for (k, v) in &info.extra {
-            if !backend.info_keys.contains(&k.as_str()) {
+            if !is_core(k) && !layout.contains(&k.as_str()) {
                 d.set_item(k, value_to_py(py, v)?)?;
             }
         }

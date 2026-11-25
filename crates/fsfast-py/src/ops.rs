@@ -29,13 +29,14 @@ use futures::stream::{self, FuturesOrdered, StreamExt};
 use crate::errors::invalid;
 use crate::file::{RustReader, RustWriter};
 use crate::out::{Item, PyOut};
-use crate::registry::Backend;
+use crate::registry::{AnyFs, Backend};
 
 /// The backend instance together with the fork generation it was built in
 /// (see [`crate::runtime::fork_generation`]).
 struct FsSlot {
     generation: u64,
     fs: DynFileSystem,
+    any: AnyFs,
 }
 
 /// Shared state of a `RustFileSystem`.
@@ -52,14 +53,15 @@ impl FsInner {
     pub(crate) fn new(protocol: &str, options: Options) -> Result<Self> {
         crate::runtime::watch_forks();
         let backend = crate::registry::lookup(protocol)?;
-        let fs = (backend.build)(options.clone())?;
+        let built = (backend.build)(options.clone())?;
         Ok(FsInner {
             backend,
             protocol: protocol.to_owned(),
             options,
             slot: ArcSwap::from_pointee(FsSlot {
                 generation: crate::runtime::fork_generation(),
-                fs,
+                fs: built.fs,
+                any: built.any,
             }),
             stats: Arc::new(Stats::new()),
         })
@@ -69,17 +71,29 @@ impl FsInner {
     /// connections bound to the parent's runtime are rebuilt from the
     /// original options first (see `Backend::rebuild_after_fork`).
     pub(crate) fn fs(&self) -> Result<DynFileSystem> {
-        let slot = self.slot.load();
+        Ok(self.slot()?.fs.clone())
+    }
+
+    /// The backend instance as its concrete type (for backend-specific
+    /// methods), rebuilt after a fork like [`FsInner::fs`].
+    pub(crate) fn any(&self) -> Result<AnyFs> {
+        Ok(self.slot()?.any.clone())
+    }
+
+    fn slot(&self) -> Result<Arc<FsSlot>> {
+        let slot = self.slot.load_full();
         let generation = crate::runtime::fork_generation();
         if slot.generation == generation || !self.backend.rebuild_after_fork {
-            return Ok(slot.fs.clone());
+            return Ok(slot);
         }
-        let fs = (self.backend.build)(self.options.clone())?;
-        self.slot.store(Arc::new(FsSlot {
+        let built = (self.backend.build)(self.options.clone())?;
+        let fresh = Arc::new(FsSlot {
             generation,
-            fs: fs.clone(),
-        }));
-        Ok(fs)
+            fs: built.fs,
+            any: built.any,
+        });
+        self.slot.store(fresh.clone());
+        Ok(fresh)
     }
 }
 
@@ -339,6 +353,7 @@ pub(crate) async fn find(
     maxdepth: Option<i64>,
     withdirs: bool,
     detail: bool,
+    as_list: bool,
 ) -> Result<PyOut> {
     let maxdepth = match maxdepth {
         None => None,
@@ -348,7 +363,9 @@ pub(crate) async fn find(
     let b = fs.fs()?;
     let opts = FindOptions { maxdepth, withdirs };
     let v = fs.stats.measure(OpKind::List, b.find(&path, &opts)).await?;
-    Ok(if detail {
+    Ok(if detail && as_list {
+        PyOut::InfoList(v)
+    } else if detail {
         PyOut::InfoMap(v)
     } else {
         PyOut::Names(v.into_iter().map(|i| i.name).collect())
@@ -640,10 +657,14 @@ pub(crate) async fn pipe_file(
     path: String,
     data: Bytes,
     mode: WriteMode,
+    extra: Options,
 ) -> Result<PyOut> {
     let b = fs.fs()?;
     let n = data.len() as u64;
-    let opts = WriteOptions::default().with_mode(mode);
+    let opts = WriteOptions {
+        extra,
+        ..WriteOptions::default().with_mode(mode)
+    };
     fs.stats
         .measure(OpKind::Write, b.pipe_file(&path, data, &opts))
         .await?;
@@ -937,6 +958,8 @@ pub(crate) struct OpenReadOptions {
     pub request_size: Option<usize>,
     pub concurrency: Option<usize>,
     pub version: Option<String>,
+    /// Backend-specific read options (`ReadOptions::extra`).
+    pub extra: Options,
 }
 
 /// Open a file for reading behind a [`FileReader`].
@@ -946,6 +969,7 @@ pub(crate) async fn open_read(fs: Arc<FsInner>, path: String, o: OpenReadOptions
     let ropts = ReadOptions {
         block_size: o.request_size,
         version: o.version,
+        extra: o.extra,
         ..ReadOptions::default()
     };
     let handle = fs
@@ -986,11 +1010,13 @@ pub(crate) async fn open_write(
     mode: WriteMode,
     block_size: Option<usize>,
     buffer_size: Option<usize>,
+    extra: Options,
 ) -> Result<PyOut> {
     let b = fs.fs()?;
     let opts = WriteOptions {
         mode,
         block_size,
+        extra,
         ..WriteOptions::default()
     };
     let handle = fs
@@ -1006,6 +1032,18 @@ pub(crate) async fn open_write(
         buffer,
         fs.stats.clone(),
     ))))
+}
+
+/// A backend-specific method (see [`crate::ext`]).
+pub(crate) async fn call(fs: Arc<FsInner>, method: String, args: Options) -> Result<PyOut> {
+    let ext = fs.backend.ext.ok_or_else(|| {
+        Error::unsupported(format!(
+            "the {} backend has no method {method:?}",
+            fs.backend.name()
+        ))
+    })?;
+    let any = fs.any()?;
+    ext(any, method, args).await
 }
 
 /// Release pooled connections.
@@ -1236,6 +1274,7 @@ mod tests {
                     "/a".into(),
                     Bytes::from_static(b"0123456789"),
                     WriteMode::Overwrite,
+                    Options::new(),
                 )
                 .await
                 .unwrap();
@@ -1244,6 +1283,7 @@ mod tests {
                     "/b".into(),
                     Bytes::from_static(b"abcdef"),
                     WriteMode::Overwrite,
+                    Options::new(),
                 )
                 .await
                 .unwrap();
@@ -1385,6 +1425,7 @@ mod tests {
                     "/d/x".into(),
                     Bytes::from_static(b"1"),
                     WriteMode::Overwrite,
+                    Options::new(),
                 )
                 .await
                 .unwrap();
@@ -1431,6 +1472,7 @@ mod tests {
                     "/x".into(),
                     Bytes::from_static(b"0123456789"),
                     WriteMode::Overwrite,
+                    Options::new(),
                 )
                 .await
                 .unwrap();
@@ -1467,7 +1509,7 @@ mod tests {
         #[test]
         fn find_rejects_zero_maxdepth() {
             rt().block_on(async {
-                let e = find(fs(), "/".into(), Some(0), false, false)
+                let e = find(fs(), "/".into(), Some(0), false, false, false)
                     .await
                     .err()
                     .unwrap();

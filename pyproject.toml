@@ -19,6 +19,8 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
+# Reference implementations for the live parity tests (tests/python/test_net_*.py).
+parity = ["s3fs", "gcsfs", "adlfs", "smbprotocol", "paramiko", "aiohttp", "hypothesis"]
 
 [project.urls]
 Repository = "https://github.com/danplischke/fsfast"

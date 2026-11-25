@@ -1,0 +1,215 @@
+# fsfast CI. See docs/dev/ci.md for what each job does and how to run the
+# same commands locally.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Smaller debug artefacts: faster links, less cache and disk.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: "1"
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # fsfast-py's PyO3 build script needs an interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: clippy (fsf with only the in-process backends)
+        run: cargo clippy -p fsfast-cli --no-default-features --features local,memory --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test (no services)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Let fsfast-py's tests find libpython
+        run: |
+          echo "PYO3_PYTHON=$(command -v python)" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${pythonLocation}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No FSFAST_TEST_* variables are set: every service-backed test must
+      # print a skip message and pass.
+      - run: cargo test --workspace --locked
+
+  services:
+    name: integration tests (live services) + Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Python test environment (.venv, as in development)
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r .github/requirements-test.txt
+          {
+            echo "PYO3_PYTHON=$PWD/.venv/bin/python"
+            echo "LD_LIBRARY_PATH=${pythonLocation}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # Differential tests against the reference implementations.
+            echo "FSFAST_TEST_FSSPEC_PYTHON=$PWD/.venv/bin/python"
+            # S3 tests against moto_server from the venv.
+            echo "FSFAST_TEST_MOTO=1"
+          } >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: services
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Build before starting the services so the containers are not
+      # competing with the compiler for the runner's cores.
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+      - name: Start test services (RustFS, Samba, OpenSSH, fake-gcs-server, Azurite)
+        run: .github/scripts/ci-services.sh
+      - name: Rust tests with live services
+        run: cargo test --workspace --locked
+      - name: Build the Python extension
+        run: VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release -m crates/fsfast-py/Cargo.toml
+      - name: Python tests
+        run: .venv/bin/python -m pytest tests/python -q -ra
+      - name: fsf smoke benchmark on every service
+        run: |
+          cargo build --locked -p fsfast-cli
+          .venv/bin/python bench/run.py --fsf target/debug/fsf --profile tiny --targets all \
+            --out bench-results --label ci-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fsf-smoke-bench
+          path: bench-results/
+          if-no-files-found: ignore
+      - name: Service logs
+        if: failure()
+        run: |
+          scripts/test-services.sh status || true
+          for c in fsfast-s3 fsfast-gcs fsfast-azure; do
+            echo "::group::docker logs $c"; sudo docker logs --tail 200 "$c" 2>&1 || true; echo "::endgroup::"
+          done
+          echo "::group::samba logs"; sudo sh -c 'tail -n 100 /tmp/fsfast-test/smb/log/*' || true; echo "::endgroup::"
+
+  wheels:
+    name: wheel ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Windows is best effort (see docs/dev/ci.md): a failure there is
+    # reported but does not fail the workflow.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: "2_28"
+            experimental: false
+          - name: linux-aarch64
+            # Native arm64 runner: the wheel is built in the manylinux
+            # container and then tested on the same machine.
+            os: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: "2_28"
+            experimental: false
+          - name: macos-universal2
+            os: macos-latest
+            target: universal2-apple-darwin
+            manylinux: ""
+            experimental: false
+          - name: windows-x64
+            os: windows-latest
+            target: x64
+            manylinux: ""
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build the abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - name: Install the wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r .github/requirements-test.txt
+          python -m pip install --no-index --find-links dist fsfast
+          python -c "import fsfast, fsfast._core; print(fsfast.__file__)"
+      - name: pytest against the installed wheel
+        shell: bash
+        # The source tree's python/ directory is not on sys.path, so the
+        # installed wheel is what gets imported and tested.
+        run: python -m pytest tests/python -q -ra -p no:cacheprovider
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz

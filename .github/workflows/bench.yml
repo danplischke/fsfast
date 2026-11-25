@@ -1,0 +1,84 @@
+# Nightly macro benchmarks with fsf against the local test services.
+# Shared GitHub runners are noisy, so the regression check is informational
+# here; docs/PLAN.md §8.3 asks for dedicated runners for a hard gate (point
+# `runs-on` at a self-hosted runner and drop `continue-on-error`).
+name: Benchmarks
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "bench/run.py profile"
+        type: choice
+        options: [tiny, default, large]
+        default: default
+      targets:
+        description: "targets (memory local s3 gcs azure smb smb-enc sftp | all)"
+        default: all
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      - name: Build fsf (release)
+        run: cargo build --release --locked -p fsfast-cli
+      - name: Start test services
+        run: .github/scripts/ci-services.sh
+      - name: Run the benchmarks
+        env:
+          PROFILE: ${{ inputs.profile || 'default' }}
+          TARGETS: ${{ inputs.targets || 'all' }}
+        run: |
+          # shellcheck disable=SC2086 # TARGETS is a space-separated list
+          python bench/run.py --fsf target/release/fsf --profile "$PROFILE" \
+            --targets $TARGETS --out bench-results --label "$PROFILE"
+      - name: Restore the benchmark history
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-history
+          key: bench-history-${{ inputs.profile || 'default' }}-${{ github.run_id }}
+          restore-keys: bench-history-${{ inputs.profile || 'default' }}-
+      - name: Compare with the trailing median
+        continue-on-error: true
+        run: |
+          mkdir -p bench-history
+          python bench/compare.py bench-results/*.json --history bench-history --threshold 0.05
+      - name: Add this run to the history
+        if: always()
+        run: |
+          mkdir -p bench-history
+          cp bench-results/*.json bench-history/
+          python - <<'PY'
+          from pathlib import Path
+          files = sorted(Path("bench-history").glob("*.json"))
+          for p in files[:-20]:  # keep the 20 newest runs
+              p.unlink()
+          PY
+      - name: Save the benchmark history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bench-history
+          key: bench-history-${{ inputs.profile || 'default' }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ inputs.profile || 'default' }}-${{ github.run_id }}
+          path: bench-results/

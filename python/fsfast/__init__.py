@@ -15,8 +15,13 @@ or swap them into fsspec's registry so existing code picks them up::
     fsfast.install()                 # every protocol fsfast implements
     fsfast.install(["memory"])       # selected protocols
 
-Setting ``FSFAST_OVERRIDE=file,memory`` (or ``all``) in the environment
+Setting ``FSFAST_OVERRIDE=file,memory,s3`` (or ``all``) in the environment
 installs them when ``fsfast`` is imported.
+
+Protocols: ``file``/``local``, ``memory``, ``http``/``https``
+(fsspec's HTTPFileSystem), ``s3``/``s3a`` (s3fs), ``smb`` and
+``sftp``/``ssh`` (fsspec's), ``gs``/``gcs`` (gcsfs) and
+``abfs``/``az``/``abfss`` (adlfs).
 """
 
 from __future__ import annotations
@@ -32,15 +37,27 @@ from ._base import FsfastFileSystem
 from ._core import PreconditionFailed, available_protocols, runtime_info
 from ._file import FsfastFile
 from ._local import LocalFileSystem
+from ._azure import AzureBlobFileSystem
+from ._gcs import GCSFileSystem
+from ._http import HTTPFileSystem
 from ._memory import MemoryFileSystem
+from ._s3 import S3FileSystem
+from ._sftp import SFTPFileSystem
+from ._smb import SMBFileSystem
 
 __version__: str = _core.__version__
 
 __all__ = [
+    "AzureBlobFileSystem",
     "FsfastFile",
     "FsfastFileSystem",
+    "GCSFileSystem",
+    "HTTPFileSystem",
     "LocalFileSystem",
     "MemoryFileSystem",
+    "S3FileSystem",
+    "SFTPFileSystem",
+    "SMBFileSystem",
     "PreconditionFailed",
     "__version__",
     "available_protocols",
@@ -57,7 +74,23 @@ CLASSES: dict[str, type[FsfastFileSystem]] = {
     "file": LocalFileSystem,
     "local": LocalFileSystem,
     "memory": MemoryFileSystem,
+    "http": HTTPFileSystem,
+    "https": HTTPFileSystem,
+    "s3": S3FileSystem,
+    "s3a": S3FileSystem,
+    "smb": SMBFileSystem,
+    "sftp": SFTPFileSystem,
+    "ssh": SFTPFileSystem,
+    "gs": GCSFileSystem,
+    "gcs": GCSFileSystem,
+    "abfs": AzureBlobFileSystem,
+    "az": AzureBlobFileSystem,
+    "abfss": AzureBlobFileSystem,
 }
+
+# Classes of protocols whose backend is not compiled into this build of the
+# extension are left out, so install() never registers a broken class.
+CLASSES = {k: v for k, v in CLASSES.items() if v._rust_protocol in _core.available_protocols()}
 
 _previous: dict[str, Any] = {}
 

@@ -18,7 +18,7 @@ use crate::convert::{bytes_from_py, options_from_py, options_to_py};
 use crate::errors::to_pyerr;
 use crate::ops::{self, FsInner, OnError, OpenReadOptions, write_mode};
 use crate::out::{Converted, PyOut, convert};
-use crate::runtime::{block_on, future_into_py};
+use crate::runtime::{block_on, block_on_inline, spawn_async};
 
 /// A Rust filesystem backend (local, memory, ...) created by
 /// `make_filesystem(protocol, options)`.
@@ -63,7 +63,9 @@ impl RustFileSystem {
         self.inner.clone()
     }
 
-    /// Run `fut` synchronously and convert its result.
+    /// Run a batch future synchronously and convert its result. Its items
+    /// run concurrently, so their blocking steps go to the blocking pool
+    /// (inline they would run one after another).
     fn sync<'py, F>(&self, py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
     where
         F: Future<Output = Result<PyOut>> + Send,
@@ -72,15 +74,22 @@ impl RustFileSystem {
         convert(py, out, self.inner.backend)
     }
 
-    /// Return an asyncio awaitable for `fut`.
-    ///
-    /// The future is first polled once on the calling thread (with the
-    /// interpreter released). If that completes it — operations served from
-    /// memory or caches — the result is returned as an already-resolved
-    /// asyncio future, skipping every thread hop of the general path
-    /// (tokio worker, blocking pool, event-loop wake-up). Otherwise the
-    /// partially polled future continues on the runtime through
-    /// `pyo3-async-runtimes` (its next poll registers the real waker).
+    /// Run one operation synchronously and convert its result. The calling
+    /// thread waits for it anyway, so the backend may run its short blocking
+    /// steps (a `stat`, a small read or write) inline on this thread instead
+    /// of paying a blocking-pool round trip (`fsfast_core::blocking`).
+    fn sync_one<'py, F>(&self, py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+    where
+        F: Future<Output = Result<PyOut>> + Send,
+    {
+        let out = block_on_inline(py, fut)?;
+        convert(py, out, self.inner.backend)
+    }
+
+    /// Return an asyncio awaitable for `fut` (see
+    /// [`crate::runtime::spawn_async`]): polled once on the calling thread
+    /// (an already-resolved future when that completes it), then resolved
+    /// through the event loop's completion queue.
     ///
     /// Without a running event loop this raises `RuntimeError` *before*
     /// polling, so a call that fails has no side effects.
@@ -88,45 +97,17 @@ impl RustFileSystem {
     where
         F: Future<Output = Result<PyOut>> + Send + 'static,
     {
-        let event_loop = pyo3_async_runtimes::get_running_loop(py)?;
         let backend = self.inner.backend;
-        let slot = crate::runtime::runtime();
-        let mut fut = Box::pin(fut);
-        let first = py.detach(|| {
-            // Detached, so waiting for a pending fork is fine here.
-            let _gate = crate::gate::enter();
-            let _ctx = slot.handle().enter();
-            fut.as_mut()
-                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-        });
-        match first {
-            std::task::Poll::Ready(out) => {
-                resolved_future(py, &event_loop, convert(py, out, backend))
-            }
-            std::task::Poll::Pending => future_into_py(py, event_loop, async move {
-                Ok(Converted {
+        spawn_async(
+            py,
+            Box::pin(async move {
+                Converted {
                     out: fut.await,
                     backend,
-                })
+                }
             }),
-        }
+        )
     }
-}
-
-/// An asyncio future of `event_loop` (the running loop) already holding
-/// `result` (or its exception), so awaiting it returns or raises
-/// immediately.
-fn resolved_future<'py>(
-    py: Python<'py>,
-    event_loop: &Bound<'py, PyAny>,
-    result: PyResult<Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let fut = event_loop.call_method0(pyo3::intern!(py, "create_future"))?;
-    match result {
-        Ok(v) => fut.call_method1(pyo3::intern!(py, "set_result"), (v,))?,
-        Err(e) => fut.call_method1(pyo3::intern!(py, "set_exception"), (e.into_value(py),))?,
-    };
-    Ok(fut)
 }
 
 #[pymethods]
@@ -181,7 +162,7 @@ impl RustFileSystem {
 
     /// fsspec `info(path)` dict.
     fn info<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::info(self.fs(), path))
+        self.sync_one(py, ops::info(self.fs(), path))
     }
 
     /// Awaitable `info(path)`.
@@ -192,7 +173,7 @@ impl RustFileSystem {
     /// `(modified, created)` timestamps of `path` as timezone-aware UTC
     /// datetimes (`None` where the backend does not know them).
     fn times<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::times(self.fs(), path))
+        self.sync_one(py, ops::times(self.fs(), path))
     }
 
     /// Awaitable `times`.
@@ -229,7 +210,7 @@ impl RustFileSystem {
     /// Directory listing: info dicts, or names when `detail=False`.
     #[pyo3(signature = (path, detail=true))]
     fn ls<'py>(&self, py: Python<'py>, path: String, detail: bool) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::ls(self.fs(), path, detail))
+        self.sync_one(py, ops::ls(self.fs(), path, detail))
     }
 
     /// Awaitable `ls`.
@@ -244,8 +225,10 @@ impl RustFileSystem {
     }
 
     /// Recursive listing sorted by name: `{name: info}` when `detail`, else
-    /// a list of names.
-    #[pyo3(signature = (path, maxdepth=None, withdirs=false, detail=false))]
+    /// a list of names. `as_list=True` (with `detail`) returns the list of
+    /// info dicts instead, keeping entries that share a name (an object
+    /// store's file `a` next to its prefix `a/`), which the dict collapses.
+    #[pyo3(signature = (path, maxdepth=None, withdirs=false, detail=false, as_list=false))]
     fn find<'py>(
         &self,
         py: Python<'py>,
@@ -253,12 +236,16 @@ impl RustFileSystem {
         maxdepth: Option<i64>,
         withdirs: bool,
         detail: bool,
+        as_list: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::find(self.fs(), path, maxdepth, withdirs, detail))
+        self.sync_one(
+            py,
+            ops::find(self.fs(), path, maxdepth, withdirs, detail, as_list),
+        )
     }
 
     /// Awaitable `find`.
-    #[pyo3(signature = (path, maxdepth=None, withdirs=false, detail=false))]
+    #[pyo3(signature = (path, maxdepth=None, withdirs=false, detail=false, as_list=false))]
     fn find_async<'py>(
         &self,
         py: Python<'py>,
@@ -266,13 +253,17 @@ impl RustFileSystem {
         maxdepth: Option<i64>,
         withdirs: bool,
         detail: bool,
+        as_list: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.spawn(py, ops::find(self.fs(), path, maxdepth, withdirs, detail))
+        self.spawn(
+            py,
+            ops::find(self.fs(), path, maxdepth, withdirs, detail, as_list),
+        )
     }
 
     /// Whether `path` exists.
     fn exists<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::exists(self.fs(), path))
+        self.sync_one(py, ops::exists(self.fs(), path))
     }
 
     /// Awaitable `exists`.
@@ -296,7 +287,7 @@ impl RustFileSystem {
         end: Option<i64>,
         seek_read: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::cat_file(self.fs(), path, start, end, seek_read))
+        self.sync_one(py, ops::cat_file(self.fs(), path, start, end, seek_read))
     }
 
     /// Awaitable `cat_file`.
@@ -383,7 +374,7 @@ impl RustFileSystem {
     /// (`readahead` default, `none`, `blockcache`, `background`, `mmap`,
     /// `bytes`, `first`, `all`); `block_size`/`max_blocks` size block caches;
     /// `request_size`/`concurrency` override the backend's I/O hints.
-    #[pyo3(signature = (path, cache_type="readahead", block_size=None, max_blocks=None, request_size=None, concurrency=None, version=None))]
+    #[pyo3(signature = (path, cache_type="readahead", block_size=None, max_blocks=None, request_size=None, concurrency=None, version=None, extra=None))]
     #[allow(clippy::too_many_arguments)]
     fn open_read<'py>(
         &self,
@@ -395,6 +386,7 @@ impl RustFileSystem {
         request_size: Option<usize>,
         concurrency: Option<usize>,
         version: Option<String>,
+        extra: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let o = OpenReadOptions {
             cache_type: cache_type.to_owned(),
@@ -403,12 +395,13 @@ impl RustFileSystem {
             request_size,
             concurrency,
             version,
+            extra: options_from_py(extra)?,
         };
-        self.sync(py, ops::open_read(self.fs(), path, o))
+        self.sync_one(py, ops::open_read(self.fs(), path, o))
     }
 
     /// Awaitable `open_read`.
-    #[pyo3(signature = (path, cache_type="readahead", block_size=None, max_blocks=None, request_size=None, concurrency=None, version=None))]
+    #[pyo3(signature = (path, cache_type="readahead", block_size=None, max_blocks=None, request_size=None, concurrency=None, version=None, extra=None))]
     #[allow(clippy::too_many_arguments)]
     fn open_read_async<'py>(
         &self,
@@ -420,6 +413,7 @@ impl RustFileSystem {
         request_size: Option<usize>,
         concurrency: Option<usize>,
         version: Option<String>,
+        extra: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let o = OpenReadOptions {
             cache_type: cache_type.to_owned(),
@@ -428,6 +422,7 @@ impl RustFileSystem {
             request_size,
             concurrency,
             version,
+            extra: options_from_py(extra)?,
         };
         self.spawn(py, ops::open_read(self.fs(), path, o))
     }
@@ -436,31 +431,35 @@ impl RustFileSystem {
 
     /// Write a whole file from a bytes-like object. `mode` is `overwrite`
     /// or `create` (fsspec) — or `wb`/`xb`/`ab`.
-    #[pyo3(signature = (path, data, mode="overwrite"))]
+    #[pyo3(signature = (path, data, mode="overwrite", extra=None))]
     fn pipe_file<'py>(
         &self,
         py: Python<'py>,
         path: String,
         data: &Bound<'py, PyAny>,
         mode: &str,
+        extra: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = self::mode(py, mode)?;
         let data = bytes_from_py(data)?;
-        self.sync(py, ops::pipe_file(self.fs(), path, data, m))
+        let extra = options_from_py(extra)?;
+        self.sync_one(py, ops::pipe_file(self.fs(), path, data, m, extra))
     }
 
     /// Awaitable `pipe_file`.
-    #[pyo3(signature = (path, data, mode="overwrite"))]
+    #[pyo3(signature = (path, data, mode="overwrite", extra=None))]
     fn pipe_file_async<'py>(
         &self,
         py: Python<'py>,
         path: String,
         data: &Bound<'py, PyAny>,
         mode: &str,
+        extra: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = self::mode(py, mode)?;
         let data = bytes_from_py(data)?;
-        self.spawn(py, ops::pipe_file(self.fs(), path, data, m))
+        let extra = options_from_py(extra)?;
+        self.spawn(py, ops::pipe_file(self.fs(), path, data, m, extra))
     }
 
     /// `pipe_file` for many files (`paths[i]` gets `datas[i]`).
@@ -506,7 +505,7 @@ impl RustFileSystem {
     /// Open a file for writing (`mode` `wb`, `xb` or `ab`). `block_size` is
     /// the backend's part size hint; `buffer_size` the write-buffer size
     /// (default: the backend's request size within 64 KiB..16 MiB).
-    #[pyo3(signature = (path, mode="wb", block_size=None, buffer_size=None))]
+    #[pyo3(signature = (path, mode="wb", block_size=None, buffer_size=None, extra=None))]
     fn open_write<'py>(
         &self,
         py: Python<'py>,
@@ -514,16 +513,18 @@ impl RustFileSystem {
         mode: &str,
         block_size: Option<usize>,
         buffer_size: Option<usize>,
+        extra: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = self::mode(py, mode)?;
+        let extra = options_from_py(extra)?;
         self.sync(
             py,
-            ops::open_write(self.fs(), path, m, block_size, buffer_size),
+            ops::open_write(self.fs(), path, m, block_size, buffer_size, extra),
         )
     }
 
     /// Awaitable `open_write`.
-    #[pyo3(signature = (path, mode="wb", block_size=None, buffer_size=None))]
+    #[pyo3(signature = (path, mode="wb", block_size=None, buffer_size=None, extra=None))]
     fn open_write_async<'py>(
         &self,
         py: Python<'py>,
@@ -531,11 +532,13 @@ impl RustFileSystem {
         mode: &str,
         block_size: Option<usize>,
         buffer_size: Option<usize>,
+        extra: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = self::mode(py, mode)?;
+        let extra = options_from_py(extra)?;
         self.spawn(
             py,
-            ops::open_write(self.fs(), path, m, block_size, buffer_size),
+            ops::open_write(self.fs(), path, m, block_size, buffer_size, extra),
         )
     }
 
@@ -548,7 +551,7 @@ impl RustFileSystem {
         path: String,
         truncate: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::touch(self.fs(), path, truncate))
+        self.sync_one(py, ops::touch(self.fs(), path, truncate))
     }
 
     /// Awaitable `touch`.
@@ -566,7 +569,7 @@ impl RustFileSystem {
 
     /// Delete one file.
     fn rm_file<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::rm_file(self.fs(), path))
+        self.sync_one(py, ops::rm_file(self.fs(), path))
     }
 
     /// Awaitable `rm_file`.
@@ -583,7 +586,7 @@ impl RustFileSystem {
         on_error: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let oe = self::on_error(py, on_error)?;
-        self.sync(py, ops::rm_files(self.fs(), paths, oe))
+        self.sync_one(py, ops::rm_files(self.fs(), paths, oe))
     }
 
     /// Awaitable `rm_files`.
@@ -600,7 +603,7 @@ impl RustFileSystem {
 
     /// Remove an empty directory.
     fn rmdir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::rmdir(self.fs(), path))
+        self.sync_one(py, ops::rmdir(self.fs(), path))
     }
 
     /// Awaitable `rmdir`.
@@ -645,7 +648,7 @@ impl RustFileSystem {
         path: String,
         create_parents: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::mkdir(self.fs(), path, create_parents))
+        self.sync_one(py, ops::mkdir(self.fs(), path, create_parents))
     }
 
     /// Awaitable `mkdir`.
@@ -667,7 +670,7 @@ impl RustFileSystem {
         path: String,
         exist_ok: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::makedirs(self.fs(), path, exist_ok))
+        self.sync_one(py, ops::makedirs(self.fs(), path, exist_ok))
     }
 
     /// Awaitable `makedirs`.
@@ -724,7 +727,7 @@ impl RustFileSystem {
         src: String,
         dst: String,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::cp_file(self.fs(), src, dst))
+        self.sync_one(py, ops::cp_file(self.fs(), src, dst))
     }
 
     /// Awaitable `cp_file`.
@@ -773,7 +776,7 @@ impl RustFileSystem {
         src: String,
         dst: String,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::mv_file(self.fs(), src, dst))
+        self.sync_one(py, ops::mv_file(self.fs(), src, dst))
     }
 
     /// Awaitable `mv_file`.
@@ -826,7 +829,7 @@ impl RustFileSystem {
         mode: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = self::mode(py, mode)?;
-        self.sync(py, ops::put_file(self.fs(), lpath, rpath, m))
+        self.sync_one(py, ops::put_file(self.fs(), lpath, rpath, m))
     }
 
     /// Awaitable `put_file`.
@@ -887,7 +890,7 @@ impl RustFileSystem {
         rpath: String,
         lpath: PathBuf,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::get_file(self.fs(), rpath, lpath))
+        self.sync_one(py, ops::get_file(self.fs(), rpath, lpath))
     }
 
     /// Awaitable `get_file`.
@@ -944,7 +947,7 @@ impl RustFileSystem {
         path: String,
         expiration: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::sign(self.fs(), path, expiration))
+        self.sync_one(py, ops::sign(self.fs(), path, expiration))
     }
 
     /// Awaitable `sign`.
@@ -971,9 +974,35 @@ impl RustFileSystem {
         Ok(())
     }
 
+    /// Call a backend-specific method with keyword arguments (s3fs
+    /// `get_tags`, gcsfs `merge`, SMB `connect`, ...; see the backend's
+    /// Python class). Unknown methods raise `NotImplementedError`.
+    #[pyo3(signature = (method, args=None))]
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        method: String,
+        args: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let args = options_from_py(args)?;
+        self.sync_one(py, ops::call(self.fs(), method, args))
+    }
+
+    /// Awaitable `call`.
+    #[pyo3(signature = (method, args=None))]
+    fn call_async<'py>(
+        &self,
+        py: Python<'py>,
+        method: String,
+        args: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let args = options_from_py(args)?;
+        self.spawn(py, ops::call(self.fs(), method, args))
+    }
+
     /// Release pooled connections (the filesystem stays usable).
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.sync(py, ops::close(self.fs()))
+        self.sync_one(py, ops::close(self.fs()))
     }
 
     /// Awaitable `close`.

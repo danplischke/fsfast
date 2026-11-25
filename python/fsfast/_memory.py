@@ -108,6 +108,8 @@ class MemoryFileSystem(FsfastFileSystem):
     _rust_protocol = "memory"
     _pipe_none_is_empty = True
     _append_tell_from_end = True
+    # fsspec's generic touch (open(path, "wb")) is deferred in a transaction.
+    _touch_defers_in_transaction = True
 
     _strip_protocol = classmethod(_ref.MemoryFileSystem._strip_protocol.__func__)  # type: ignore[assignment,var-annotated]
     _parent = classmethod(AbstractFileSystem._parent.__func__)  # type: ignore[assignment,var-annotated]

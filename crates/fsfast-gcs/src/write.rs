@@ -702,6 +702,17 @@ impl GCSFileSystem {
             Some(b) => round_chunk(b),
             None => self.inner.opts.upload_chunk_size,
         };
+        if meta.create_new {
+            // Fail fast at open, as local files do (and fsspec's abstract
+            // `test_open_exclusive` expects), instead of after uploading
+            // everything; the upload stays conditional (ifGenerationMatch=0),
+            // so a writer racing in after this check still loses.
+            match self.get_object(&bucket, &key, None).await {
+                Ok(_) => return Err(Error::already_exists(name)),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(GcsWriteHandle {
             fs: self.clone(),
             bucket,

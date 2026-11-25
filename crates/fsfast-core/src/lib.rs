@@ -6,11 +6,14 @@
 //! * [`Error`]/[`ErrorKind`]: one error model, mapped to Python exceptions.
 //! * [`OptionReader`]: strict `storage_options` parsing.
 //! * [`ByteRange`], [`coalesce_ranges`]: range arithmetic.
+//! * [`blocking()`]: run blocking work inline (when the polling thread
+//!   allows it) or on tokio's blocking pool.
 //!
 //! Backend crates expose a constructor with the signature
 //! `fn from_options(opts: fsfast_core::Options) -> fsfast_core::Result<Self>`
 //! so the Python bindings can build any backend from keyword arguments.
 
+pub mod blocking;
 pub mod error;
 pub mod fs;
 pub mod info;
@@ -22,6 +25,7 @@ pub mod value;
 pub use async_trait::async_trait;
 pub use bytes::Bytes;
 
+pub use blocking::blocking;
 pub use error::{Detail, Error, ErrorKind, Result};
 pub use fs::{
     Capabilities, FileSystem, FindOptions, IoHints, ReadHandle, ReadOptions, WriteHandle,

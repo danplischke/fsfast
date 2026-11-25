@@ -679,6 +679,18 @@ impl S3FileSystem {
         if opts.mode == WriteMode::CreateNew {
             self.ensure_conditional_writes(&st, &sp.bucket, &sp.key)
                 .await?;
+            // Fail fast at open, as local files do (and fsspec's abstract
+            // `test_open_exclusive` expects), instead of after uploading
+            // everything; the commit stays conditional (If-None-Match), so
+            // a writer racing in after this check still loses.
+            match self
+                .head_object(&st, &sp.bucket, &sp.key, None, extra.as_ref(), &name)
+                .await
+            {
+                Ok(_) => return Err(Error::already_exists(name.clone())),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         let mut headers = option_headers(opts)?;
         let mut append = None;

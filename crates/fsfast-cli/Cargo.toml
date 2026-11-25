@@ -1,5 +1,6 @@
 [package]
 name = "fsfast-cli"
+description = "fsf: command-line access to every fsfast backend (ls/info/cat/cp/rm/mkdir) and the benchmark driver"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,5 +11,43 @@ repository.workspace = true
 name = "fsf"
 path = "src/main.rs"
 
+[lib]
+name = "fsfast_cli"
+path = "src/lib.rs"
+
+[features]
+# One feature per backend crate, all on by default. A build without a
+# backend simply does not know its protocols (`fsf protocols` lists them).
+default = ["local", "memory", "http", "s3", "smb", "sftp", "gcs", "azure"]
+local = ["dep:fsfast-local"]
+memory = ["dep:fsfast-memory"]
+http = ["dep:fsfast-http"]
+s3 = ["dep:fsfast-s3"]
+smb = ["dep:fsfast-smb"]
+sftp = ["dep:fsfast-sftp"]
+gcs = ["dep:fsfast-gcs"]
+azure = ["dep:fsfast-azure"]
+
 [dependencies]
 fsfast-core.workspace = true
+fsfast-engine.workspace = true
+fsfast-local = { workspace = true, optional = true }
+fsfast-memory = { workspace = true, optional = true }
+fsfast-http = { workspace = true, optional = true }
+fsfast-s3 = { workspace = true, optional = true }
+fsfast-smb = { workspace = true, optional = true }
+fsfast-sftp = { workspace = true, optional = true }
+fsfast-gcs = { workspace = true, optional = true }
+fsfast-azure = { workspace = true, optional = true }
+bytes.workspace = true
+clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+fastrand = "2"
+futures.workspace = true
+parking_lot.workspace = true
+serde_json = "1"
+tokio = { workspace = true, features = ["signal", "io-std"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi"] }
+
+[dev-dependencies]
+tempfile = "3"

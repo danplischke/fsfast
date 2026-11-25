@@ -18,6 +18,8 @@ buffers:
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 from errno import ESPIPE
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -31,6 +33,11 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = ["FsfastFile"]
 
 _WRITE_MODES = frozenset({"wb", "ab", "xb"})
+
+
+class _WritePickleError(ValueError, RuntimeError):
+    """Pickling a write-mode file: fsspec's local files raise ``ValueError``,
+    s3fs's and fsspec's buffered files ``RuntimeError``; this is both."""
 
 
 class FsfastFile(io.RawIOBase):
@@ -58,6 +65,8 @@ class FsfastFile(io.RawIOBase):
         cache_type: str = "readahead",
         cache_options: dict[str, Any] | None = None,
         size: int | None = None,
+        version: str | None = None,
+        extra: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self.path = path
@@ -78,6 +87,11 @@ class FsfastFile(io.RawIOBase):
         self._writer: Any = None
         self._target = path
         self._committed = False
+        self._discarded = False
+        #: Deferred write of a backend without rename (object stores): the
+        #: data is spooled locally and uploaded by :meth:`commit`.
+        self._spool: Any = None
+        self._extra = extra
         #: Position of the first byte this handle writes (see
         #: ``FsfastFileSystem._append_tell_from_end``).
         self._tell_base = 0
@@ -90,10 +104,15 @@ class FsfastFile(io.RawIOBase):
                 max_blocks=self.cache_options.get("maxblocks"),
                 request_size=self.cache_options.get("request_size"),
                 concurrency=self.cache_options.get("concurrency"),
+                version=version,
+                extra=extra,
             )
             self.size = self._reader.size
         else:
             if not autocommit and mode == "wb":
+                if fs._spool_transactions:
+                    self._spool = tempfile.NamedTemporaryFile(prefix="fsfast-", delete=False)
+                    return
                 # Deferred write: a hidden sibling renamed into place at commit.
                 self._target = fs._transaction_temp_path(path)
             if mode == "ab" and fs._append_tell_from_end:
@@ -103,7 +122,9 @@ class FsfastFile(io.RawIOBase):
                     found = None
                 if found is not None and found["type"] == "file":
                     self._tell_base = found["size"]
-            self._writer = rfs.open_write(self._target, mode, block_size=explicit_block)
+            self._writer = rfs.open_write(
+                self._target, mode, block_size=explicit_block, extra=extra
+            )
 
     # ------------------------------------------------------------------
     # fsspec attributes
@@ -151,6 +172,14 @@ class FsfastFile(io.RawIOBase):
         if self._reader is None:
             return None
         return SimpleNamespace(name=self._reader.cache_mode, blocksize=self.blocksize)
+
+    def url(self, **kwargs: Any) -> str:
+        """HTTP(S) URL of this file (s3fs/gcsfs files offer this), from the
+        filesystem's ``url``."""
+        url = getattr(self.fs, "url", None)
+        if url is None:
+            raise NotImplementedError(f"{type(self.fs).__name__} has no url()")
+        return url(self.path, **kwargs)
 
     def info(self) -> dict[str, Any]:
         """File information about this path."""
@@ -258,6 +287,9 @@ class FsfastFile(io.RawIOBase):
         """Set the position (``whence`` 0: start, 1: current, 2: end)."""
         loc = int(loc)
         if self.mode != "rb":
+            # Even a no-op seek raises: callers such as zipfile probe
+            # ``seek(tell())`` to decide whether they may later seek back,
+            # and fsfast write handles cannot (they stream).
             raise OSError(ESPIPE, "Seek only available in read mode")
         if self.closed:
             raise ValueError("I/O operation on closed file.")
@@ -268,6 +300,8 @@ class FsfastFile(io.RawIOBase):
             raise ValueError("I/O operation on closed file.")
         if self._reader is not None:
             return self._reader.tell()
+        if self._spool is not None:
+            return self._spool.tell()
         return self._tell_base + self._writer.bytes_written
 
     # ------------------------------------------------------------------
@@ -279,6 +313,8 @@ class FsfastFile(io.RawIOBase):
             if self.closed:
                 raise ValueError("I/O operation on closed file.")
             raise ValueError("File not in write mode")
+        if self._spool is not None:
+            return self._spool.write(data)
         return self._writer.write(data)
 
     def flush(self, force: bool = False) -> None:
@@ -296,6 +332,8 @@ class FsfastFile(io.RawIOBase):
         try:
             if self._reader is not None:
                 self._reader.close()
+            elif self._spool is not None:
+                pass  # uploaded by commit()
             elif self._writer is not None:
                 self._writer.close()
                 if self.autocommit or self._target == self.path:
@@ -311,6 +349,23 @@ class FsfastFile(io.RawIOBase):
 
     def commit(self) -> None:
         """Make a deferred (``autocommit=False``) write visible."""
+        if self._discarded:
+            # s3fs (whose discard drops the upload) raises here too; the
+            # data is gone, so committing must not report success.
+            raise ValueError("Cannot commit a file that was discarded")
+        if self._spool is not None:
+            if self._committed:
+                return
+            self._closed = True
+            spool, self._spool = self._spool, None
+            try:
+                spool.close()
+                self.fs._rfs.put_file(spool.name, self.path, "overwrite")
+            finally:
+                os.unlink(spool.name)
+            self._committed = True
+            self._invalidate()
+            return
         if self._target == self.path or self._committed:
             return
         if not self.closed:
@@ -321,6 +376,14 @@ class FsfastFile(io.RawIOBase):
 
     def discard(self) -> None:
         """Throw away a deferred write."""
+        if not self._committed and (self._spool is not None or self._target != self.path):
+            self._discarded = True
+        if self._spool is not None:
+            self._spool.close()
+            os.unlink(self._spool.name)
+            self._spool = None
+            self._closed = True
+            return
         if self._writer is None or self._committed:
             return
         if not self.closed:
@@ -334,6 +397,9 @@ class FsfastFile(io.RawIOBase):
 
     def abort(self) -> None:
         """Discard a write: nothing written becomes visible."""
+        if self._spool is not None:
+            self.discard()
+            return
         if self._writer is not None and not self.closed:
             self._writer.abort()
         self._closed = True
@@ -343,7 +409,7 @@ class FsfastFile(io.RawIOBase):
 
     def __reduce__(self) -> Any:
         if self.mode != "rb":
-            raise RuntimeError("Pickling a writeable file is not supported")
+            raise _WritePickleError("Pickling a writeable file is not supported")
         return reopen, (
             self.fs,
             self.path,

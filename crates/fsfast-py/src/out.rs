@@ -15,7 +15,7 @@ use fsfast_core::{Error, FileInfo};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 
-use crate::convert::{bytes_to_py, info_to_py, time_to_py};
+use crate::convert::{bytes_to_py, info_to_py, time_to_py, value_to_py};
 use crate::errors::{to_exception, to_pyerr};
 use crate::file::{RustReader, RustWriter};
 use crate::registry::Backend;
@@ -50,6 +50,8 @@ pub(crate) enum PyOut {
     Reader(Box<RustReader>),
     /// A file opened for writing.
     Writer(Box<RustWriter>),
+    /// Any other value (backend-specific methods).
+    Value(fsfast_core::Value),
 }
 
 impl PyOut {
@@ -101,6 +103,7 @@ impl PyOut {
             }
             PyOut::Reader(r) => Bound::new(py, *r)?.into_any(),
             PyOut::Writer(w) => Bound::new(py, *w)?.into_any(),
+            PyOut::Value(v) => value_to_py(py, &v)?,
         })
     }
 }

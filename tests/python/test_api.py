@@ -107,7 +107,11 @@ def test_stats_and_runtime_info(memory_fs):
     assert fsfast.stats(memory_fs)["requests"] == 0
     info = fsfast.runtime_info()
     assert info["pid"] == os.getpid() and info["workers"] >= 1
-    assert set(fsfast.available_protocols()) == {"file", "local", "memory"}
+    assert set(fsfast.available_protocols()) == {
+        "file", "local", "memory", "http", "https", "s3", "s3a", "smb",
+        "sftp", "ssh", "gs", "gcs", "abfs", "az", "abfss",
+    }
+    assert set(fsfast.CLASSES) == set(fsfast.available_protocols())
 
 
 def test_capabilities_and_hints():

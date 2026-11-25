@@ -14,6 +14,9 @@
 //! * **No blocking on the runtime.** Every syscall runs in
 //!   `tokio::task::spawn_blocking`, batched so one operation costs as few
 //!   thread hops as possible (e.g. `cat_file` opens, stats and reads in one).
+//!   Short steps go through `fsfast_core::blocking`, which runs them inline
+//!   instead when the future is driven by a synchronous caller that allows
+//!   it (the Python bindings): a `stat` then costs no thread hop at all.
 //! * **Performance.** `find` lists directories in parallel (one blocking task
 //!   per directory, bounded by `io_hints().max_concurrency`); reads are
 //!   positional (`pread`) on a shared descriptor, so concurrent `read_at`
@@ -39,8 +42,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fsfast_core::{
-    ByteRange, Capabilities, Error, ErrorKind, FileInfo, FileSystem, FindOptions, IoHints,
-    OptionReader, Options, ReadHandle, ReadOptions, Result, WriteHandle, WriteMode, WriteOptions,
+    ByteRange, Capabilities, Error, FileInfo, FileSystem, FindOptions, IoHints, OptionReader,
+    Options, ReadHandle, ReadOptions, Result, WriteHandle, WriteMode, WriteOptions,
 };
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, stream};
@@ -66,19 +69,18 @@ const IGNORED_BASE_OPTIONS: &[&str] = &[
 /// much as a thread hop, so deleting one path per task would double the cost.
 const RM_BATCH: usize = 64;
 
-/// Run blocking filesystem work off the async runtime.
-pub(crate) async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => Err(Error::new(
-            ErrorKind::Cancelled,
-            format!("blocking task cancelled: {e}"),
-        )),
-    }
-}
+/// Blocking filesystem work. [`blocking`] runs the short, sequential steps
+/// of one operation inline when the polling thread allows it (the Python
+/// bindings' synchronous executor, see `fsfast_core::blocking`) and in the
+/// blocking pool otherwise; [`spawn_blocking`] always uses the pool and is
+/// used for fan-out (work that must run in parallel) and for work that can
+/// take long (copies of unknown size, large writes).
+pub(crate) use fsfast_core::blocking::{blocking, spawn_blocking};
+
+/// Largest `pipe_file` payload written inline by a synchronous caller
+/// (larger payloads go to the blocking pool so the caller keeps checking
+/// for signals): about a millisecond of page-cache writes.
+const INLINE_WRITE_MAX: usize = 4 << 20;
 
 /// An error of a two-path operation (rename, copy): the path is `src`, the
 /// message also names `dst`; the kind (see [`stat::os_kind`]), the errno
@@ -295,7 +297,8 @@ impl FileSystem for LocalFileSystem {
                 };
                 running.push(async move {
                     let d = dir.clone();
-                    let listing = blocking(move || stat::list_dir(&d)).await;
+                    // The pool, not inline: directories are listed in parallel.
+                    let listing = spawn_blocking(move || stat::list_dir(&d)).await;
                     (dir, depth, listing)
                 });
             }
@@ -451,7 +454,8 @@ impl FileSystem for LocalFileSystem {
         check_no_extra(&opts.extra, "write")?;
         let (p, os) = Self::os_path(path);
         let (mode, auto_mkdir) = (opts.mode, self.auto_mkdir);
-        blocking(move || {
+        let inline_ok = data.len() <= INLINE_WRITE_MAX;
+        let work = move || {
             if auto_mkdir {
                 ops::ensure_parent(&os).map_err(|e| io_err(e, &p))?;
             }
@@ -475,8 +479,12 @@ impl FileSystem for LocalFileSystem {
                 return Err(io_err(e, &p));
             }
             Ok(())
-        })
-        .await
+        };
+        if inline_ok {
+            blocking(work).await
+        } else {
+            spawn_blocking(work).await
+        }
     }
 
     /// `os.remove`: a directory is an error (`IsADirectory` on Linux), a
@@ -493,14 +501,24 @@ impl FileSystem for LocalFileSystem {
             .chunks(RM_BATCH)
             .map(|c| c.iter().map(|p| Self::os_path(p)).collect())
             .collect();
+        // One batch is one short sequential step (inline for sync callers);
+        // several run in parallel on the pool.
+        let parallel = batches.len() > 1;
         let results: Vec<Result<Vec<Result<()>>>> =
             stream::iter(batches.into_iter().map(|batch| {
-                blocking(move || {
+                let work = move || {
                     Ok(batch
                         .into_iter()
                         .map(|(p, os)| std::fs::remove_file(&os).map_err(|e| io_err(e, &p)))
                         .collect())
-                })
+                };
+                async move {
+                    if parallel {
+                        spawn_blocking(work).await
+                    } else {
+                        blocking(work).await
+                    }
+                }
             }))
             .buffered(self.hints.max_concurrency.max(1))
             .collect()
@@ -559,7 +577,7 @@ impl FileSystem for LocalFileSystem {
         let (s, s_os) = Self::os_path(src);
         let (d, d_os) = Self::os_path(dst);
         let auto_mkdir = self.auto_mkdir;
-        blocking(move || {
+        spawn_blocking(move || {
             ops::cp_file(&s_os, &d_os, WriteMode::Overwrite, auto_mkdir)
                 .map(|_| ())
                 .map_err(|e| io_err2(e, &s, &d))
@@ -578,7 +596,7 @@ impl FileSystem for LocalFileSystem {
         let (s, s_os) = Self::os_path(src);
         let (d, d_os) = Self::os_path(dst);
         let auto_mkdir = self.auto_mkdir;
-        blocking(move || {
+        spawn_blocking(move || {
             if auto_mkdir {
                 ops::ensure_parent(&d_os).map_err(|e| io_err(e, &d))?;
             }
@@ -595,7 +613,7 @@ impl FileSystem for LocalFileSystem {
         let src = local.to_owned();
         let (d, d_os) = Self::os_path(remote);
         let (mode, auto_mkdir) = (opts.mode, self.auto_mkdir);
-        blocking(move || {
+        spawn_blocking(move || {
             let s = src.to_string_lossy();
             ops::cp_file(&src, &d_os, mode, auto_mkdir)
                 .map(|_| ())
@@ -611,7 +629,7 @@ impl FileSystem for LocalFileSystem {
         let (s, s_os) = Self::os_path(remote);
         let dst = local.to_owned();
         let auto_mkdir = self.auto_mkdir;
-        blocking(move || {
+        spawn_blocking(move || {
             let d = dst.to_string_lossy();
             ops::cp_file(&s_os, &dst, WriteMode::Overwrite, auto_mkdir)
                 .map(|_| ())

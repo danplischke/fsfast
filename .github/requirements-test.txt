@@ -1,0 +1,16 @@
+# Python packages for fsfast's tests in CI: the reference implementations the
+# differential/parity tests compare against, and the test tools. Versions
+# match the development .venv (fsspec is pinned: the bindings track it).
+maturin==1.16.0
+fsspec==2026.9.0
+s3fs==2026.9.0
+gcsfs==2026.8.2
+adlfs==2026.8.0
+smbprotocol==1.17.0
+paramiko==5.1.0
+sshfs==2026.11.0
+asyncssh==2.24.1
+moto[server]==5.2.6
+pytest==9.2.0
+pytest-asyncio==1.5.0
+hypothesis==6.170.17

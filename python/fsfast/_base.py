@@ -66,6 +66,13 @@ PYTHON_OPTIONS = frozenset(
 )
 
 
+def _make_local_parents(lpaths: Iterable[str]) -> None:
+    """Create the local parent directory of each path (once per parent)."""
+    for parent in {os.path.dirname(p) for p in lpaths}:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+
 def _is_exc(x: Any) -> bool:
     return isinstance(x, BaseException)
 
@@ -108,6 +115,25 @@ class FsfastFileSystem(AsyncFileSystem):
     #: reference's file is positioned at the end of the stored data, as in
     #: fsspec's memory filesystem) instead of the bytes this handle wrote.
     _append_tell_from_end: ClassVar[bool] = False
+    #: ``pipe``/``pipe_file`` inside a transaction are deferred to commit:
+    #: the references using fsspec's generic ``pipe_file`` (which writes
+    #: through ``open``) do this; object stores and http, whose references
+    #: upload directly, turn it off.
+    _pipe_defers_in_transaction: ClassVar[bool] = True
+    #: ``touch`` inside a transaction is deferred to commit (references
+    #: using fsspec's generic touch: memory, smb, sftp).
+    _touch_defers_in_transaction: ClassVar[bool] = False
+    #: Deferred (``autocommit=False``) writes are spooled locally and
+    #: uploaded at commit instead of being renamed into place (backends
+    #: without an atomic rename: object stores).
+    _spool_transactions: ClassVar[bool] = False
+    #: Directories exist only as key prefixes (object stores): copying a
+    #: directory entry is a no-op instead of a backend call.
+    _implicit_dirs: ClassVar[bool] = False
+    #: ``put``/``put_file`` create missing parent directories of the
+    #: targets first (fsspec's generic ``put_file`` does, for real
+    #: directories; SMB and SFTP inherit it).
+    _put_makes_parents: ClassVar[bool] = False
 
     async_impl = True
     mirror_sync_methods = True
@@ -515,18 +541,34 @@ class FsfastFileSystem(AsyncFileSystem):
         # fsspec: ``f.read(size)``; a negative size reads everything (or is
         # an error below -1, see ``_strict_negative_read``).
         if size < -1 and self._strict_negative_read:
-            self.cat_file(path, 0, 0)  # fails first like open() would
+            self.cat_file(path, start=0, end=0)  # fails first like open() would
             raise ValueError("read length must be non-negative or -1")
-        return self.cat_file(path) if size < 0 else self.cat_file(path, 0, size)
+        return self.cat_file(path) if size < 0 else self.cat_file(path, start=0, end=size)
 
     def tail(self, path: Any, size: int = 1024) -> bytes:
         # An empty range still raises for a missing path, like open() would.
-        return self.cat_file(path, -size) if size > 0 else self.cat_file(path, 0, 0)
+        if size > 0:
+            return self.cat_file(path, start=-size)
+        return self.cat_file(path, start=0, end=0)
 
     # ------------------------------------------------------------------
     # writing
 
+    def _pipe_deferred(self, path: Any, value: Any, mode: str) -> bool:
+        """Inside a transaction, write through a deferred file as fsspec's
+        generic ``pipe_file`` (``open(path, "wb")``) does, so the data only
+        appears at commit. Returns whether it did."""
+        if not (self._intrans and self._pipe_defers_in_transaction):
+            return False
+        if mode == "create" and self.exists(path):
+            raise FileExistsError(path)
+        with self.open(path, "wb") as f:
+            f.write(self._payload(value))
+        return True
+
     def pipe_file(self, path: Any, value: Any, mode: str = "overwrite", **kwargs: Any) -> None:
+        if self._pipe_deferred(path, value, mode):
+            return
         self._rfs.pipe_file(self._strip(path), self._payload(value), mode)
 
     async def _pipe_file(self, path: Any, value: Any, mode: str = "overwrite", **kwargs: Any) -> None:
@@ -536,10 +578,16 @@ class FsfastFileSystem(AsyncFileSystem):
         self.pipe_file(path, value, **kwargs)
 
     def pipe(self, path: Any, value: Any = None, **kwargs: Any) -> None:
+        """Write bytes: ``pipe(path, value)`` for one file, or
+        ``pipe({path: value, ...})`` for many (uploaded concurrently)."""
         if isinstance(path, str):
             self.pipe_file(path, value, **kwargs)
         elif isinstance(path, dict):
             mode = kwargs.get("mode", "overwrite")
+            if self._intrans and self._pipe_defers_in_transaction:
+                for k, v in path.items():
+                    self._pipe_deferred(k, v, mode)
+                return
             self._rfs.pipe_many(
                 self._strip_all(path.keys()),
                 [self._payload(v) for v in path.values()],
@@ -565,6 +613,12 @@ class FsfastFileSystem(AsyncFileSystem):
         )
 
     def touch(self, path: Any, truncate: bool = True, **kwargs: Any) -> None:
+        if self._intrans and self._touch_defers_in_transaction and (truncate or not self.exists(path)):
+            # fsspec's generic touch writes through open(path, "wb"), which
+            # a transaction defers to commit.
+            with self.open(path, "wb"):
+                pass
+            return
         self._rfs.touch(self._strip(path), truncate)
 
     async def _touch(self, path: Any, truncate: bool = True, **kwargs: Any) -> None:
@@ -726,13 +780,26 @@ class FsfastFileSystem(AsyncFileSystem):
         if pairs is None:
             return
         srcs, dsts = pairs
+        kinds = self._kinds(srcs)
+        if self._implicit_dirs or self._put_makes_parents:
+            keep = [i for i, k in enumerate(kinds) if k != "directory"]
+            dirs = [d for d, k in zip(dsts, kinds) if k == "directory"]
+            srcs, dsts, kinds = [srcs[i] for i in keep], [dsts[i] for i in keep], [kinds[i] for i in keep]
+            if self._put_makes_parents:
+                # Real directories: create the target directories, then copy
+                # the files server-side.
+                if dirs:
+                    self._rfs.makedirs_many(dirs, exist_ok=True, on_error="raise")
+                # ...and the parents of file targets (a file copied into a
+                # new directory, as ``put`` does).
+                self._make_parents(dsts)
         results = self._run_pairs(
             lambda s, d, on_error: self._rfs.cp_files(
                 s, d, on_error=on_error, batch_size=self.batch_size
             ),
             srcs,
             dsts,
-            self._kinds(srcs),
+            kinds,
             on_error="return",
         )
         for r in results:
@@ -771,10 +838,24 @@ class FsfastFileSystem(AsyncFileSystem):
         lpath = os.fspath(lpath)
         size = os.path.getsize(lpath) if os.path.isfile(lpath) else 0
         callback.set_size(size)
+        if self._put_makes_parents:
+            if os.path.isdir(lpath):
+                self._rfs.makedirs(self._strip(rpath), True)
+                return
+            self._make_parents([self._strip(rpath)])
         self._rfs.put_file(lpath, self._strip(rpath), mode)
         callback.relative_update(size)
 
+    def _make_parents(self, rpaths: list[str]) -> None:
+        parents = sorted({self._parent(p) for p in rpaths} - {"", self.root_marker})
+        if parents:
+            self._rfs.makedirs_many(parents, exist_ok=True, on_error="raise")
+
     async def _put_file(self, lpath: Any, rpath: Any, mode: str = "overwrite", **kwargs: Any) -> None:
+        if self._put_makes_parents:
+            parent = self._parent(self._strip(rpath))
+            if parent:
+                await self._rfs.makedirs_async(parent, True)
         await self._rfs.put_file_async(os.fspath(lpath), self._strip(rpath), mode)
 
     def put(
@@ -817,7 +898,20 @@ class FsfastFileSystem(AsyncFileSystem):
             )
         mode = kwargs.get("mode", "overwrite")
         kinds = ["directory" if os.path.isdir(p) else "file" for p in lpaths]
+        if self._implicit_dirs:
+            # Prefix directories need no creation.
+            keep = [i for i, k in enumerate(kinds) if k != "directory"]
+            lpaths, rpaths, kinds = [lpaths[i] for i in keep], [rpaths[i] for i in keep], [kinds[i] for i in keep]
         callback.set_size(sum(k != "directory" for k in kinds))
+        if self._put_makes_parents and rpaths:
+            # Directories (and the parents of files) are created up front;
+            # only files go to the backend's put.
+            dirs = [r for r, k in zip(rpaths, kinds) if k == "directory"]
+            keep = [i for i, k in enumerate(kinds) if k != "directory"]
+            lpaths, rpaths, kinds = [lpaths[i] for i in keep], [rpaths[i] for i in keep], [kinds[i] for i in keep]
+            if dirs:
+                self._rfs.makedirs_many(dirs, exist_ok=True, on_error="raise")
+            self._make_parents(rpaths)
         results = self._run_pairs(
             lambda s, d, on_error: self._rfs.put_files(
                 s, d, mode=mode, on_error=on_error, batch_size=self.batch_size
@@ -851,10 +945,21 @@ class FsfastFileSystem(AsyncFileSystem):
                     outfile.write(data)
                     callback.relative_update(len(data))
             return
-        self._rfs.get_file(self._strip(rpath), os.fspath(lpath))
+        lpath = os.fspath(lpath)
+        # fsspec's get_file creates the local parent directory.
+        _make_local_parents([lpath])
+        self._rfs.get_file(self._strip(rpath), lpath)
+        if callback is not DEFAULT_CALLBACK:
+            # The transfer runs in Rust in one call: report it as one step
+            # of the downloaded size (s3fs reports the object size too).
+            size = os.path.getsize(lpath)
+            callback.set_size(size)
+            callback.relative_update(size)
 
     async def _get_file(self, rpath: Any, lpath: Any, **kwargs: Any) -> None:
-        await self._rfs.get_file_async(self._strip(rpath), os.fspath(lpath))
+        lpath = os.fspath(lpath)
+        _make_local_parents([lpath])
+        await self._rfs.get_file_async(self._strip(rpath), lpath)
 
     def get(
         self,
@@ -896,13 +1001,23 @@ class FsfastFileSystem(AsyncFileSystem):
             if isinstance(lpath, str):
                 check_contained(lpath, lpaths)
         callback.set_size(len(lpaths))
+        # Directories are created locally, as fsspec's get_file does; only
+        # files go to the backend (object stores have no directory object
+        # to download).
+        for p, k in zip(lpaths, kinds):
+            if k == "directory":
+                os.makedirs(p, exist_ok=True)
+        files = [i for i, k in enumerate(kinds) if k != "directory"]
+        # fsspec (get_file, and AsyncFileSystem._get) creates the local
+        # parent directory of every target; one makedirs per distinct parent.
+        _make_local_parents([lpaths[i] for i in files])
         results = self._run_pairs(
             lambda s, d, on_error: self._rfs.get_files(
                 s, d, on_error=on_error, batch_size=self.batch_size
             ),
-            rpaths,
-            lpaths,
-            kinds,
+            [rpaths[i] for i in files],
+            [lpaths[i] for i in files],
+            [kinds[i] for i in files],
         )
         callback.relative_update(len(lpaths))
         self._raise_first(results)

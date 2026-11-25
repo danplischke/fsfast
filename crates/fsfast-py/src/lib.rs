@@ -15,6 +15,7 @@
 //!   (`block_on` with signal checks) and async bridges.
 //! * `gate` — the fork gate: `os.fork()` waits for backend code in progress.
 //! * `registry` — compiled-in backends and `make_filesystem`.
+//! * `ext` — backend-specific methods (`RustFileSystem.call`).
 //! * `filesystem` / `ops` — `RustFileSystem` and its operations.
 //! * `file` — `RustReader` / `RustWriter`.
 //! * `convert`, `buffer`, `errors`, `out` — conversions, the buffer
@@ -29,6 +30,7 @@
 mod buffer;
 mod convert;
 mod errors;
+mod ext;
 mod file;
 mod filesystem;
 mod gate;
