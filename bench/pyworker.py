@@ -707,8 +707,9 @@ def expect(got: int, want: int, what: str) -> None:
 
 
 def compact_stats(s: Any) -> Any:
-    """fsfast's stats() without the latency quantiles (request counters are
-    what the report needs)."""
+    """fsfast's stats() without the latency quantiles. For network backends
+    its top-level counters are wire requests (``source: "wire"``) and
+    ``calls`` holds the per-call counters; in-process backends report calls."""
     if not isinstance(s, dict):
         return s
     return {k: v for k, v in s.items() if not k.startswith("latency")}

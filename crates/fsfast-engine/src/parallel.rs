@@ -48,7 +48,21 @@ pub async fn read_parallel(
     concurrency: usize,
     budget: Option<&MemoryBudget>,
 ) -> Result<Bytes> {
-    let range = clamp(range, handle.size());
+    read_parallel_within(handle, range, handle.size(), part_size, concurrency, budget).await
+}
+
+/// [`read_parallel`] clamped to `size` instead of the size at open: the
+/// caller knows the current size of a handle that is not pinned
+/// ([`ReadHandle::current_size`]).
+pub(crate) async fn read_parallel_within(
+    handle: &Arc<dyn ReadHandle>,
+    range: Range<u64>,
+    size: u64,
+    part_size: usize,
+    concurrency: usize,
+    budget: Option<&MemoryBudget>,
+) -> Result<Bytes> {
+    let range = clamp(range, size);
     let len = to_usize(range.end - range.start)?;
     if len == 0 {
         return Ok(Bytes::new());
@@ -110,7 +124,29 @@ pub async fn read_parallel_into(
     concurrency: usize,
     budget: Option<&MemoryBudget>,
 ) -> Result<usize> {
-    let size = handle.size();
+    read_parallel_into_within(
+        handle,
+        offset,
+        dst,
+        handle.size(),
+        part_size,
+        concurrency,
+        budget,
+    )
+    .await
+}
+
+/// [`read_parallel_into`] bounded by `size` instead of the size at open
+/// (see [`read_parallel_within`]).
+pub(crate) async fn read_parallel_into_within(
+    handle: &Arc<dyn ReadHandle>,
+    offset: u64,
+    dst: &mut [u8],
+    size: u64,
+    part_size: usize,
+    concurrency: usize,
+    budget: Option<&MemoryBudget>,
+) -> Result<usize> {
     let n = (dst.len() as u64).min(size.saturating_sub(offset)) as usize;
     if n == 0 {
         return Ok(0);

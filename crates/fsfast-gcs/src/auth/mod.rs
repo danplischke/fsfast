@@ -2,7 +2,7 @@
 //!
 //! | `token` | credentials |
 //! |---|---|
-//! | `None` (default) | gcsfs tries `google_default`, then `cloud` (only against Google's endpoint), then anonymous access, falling through on any failure |
+//! | `None` (default) | gcsfs tries `google_default`, then `cloud` (only against Google's endpoint), then anonymous access, falling through on any failure (except an ADC file of a credential type fsfast does not implement, e.g. `external_account`: that is `Unsupported`, as gcsfs would authenticate with it) |
 //! | `"google_default"` | application default credentials: the `GOOGLE_APPLICATION_CREDENTIALS` file, gcloud's ADC file, then the GCE metadata server; the project comes from them (`GOOGLE_CLOUD_PROJECT` overrides) and must match an explicit `project` |
 //! | `"cloud"` | the GCE metadata server (not against emulators) |
 //! | `"anon"` | no authentication |
@@ -601,6 +601,13 @@ impl Credentials {
                         creds.method = "auto";
                         creds.adc_quota_project = adc_quota;
                     }
+                    // A valid ADC file of a type fsfast does not implement
+                    // (workload identity federation, impersonation, ...):
+                    // gcsfs (google.auth.default) authenticates with it, so
+                    // falling through to anonymous access (or the metadata
+                    // server's identity) would silently use the wrong
+                    // principal and hide the cause behind 401/403s.
+                    Err(e) if e.kind() == ErrorKind::Unsupported => return Err(e),
                     Err(e) => {
                         tracing::debug!(error = %e, "google_default credentials failed; trying the next method");
                         creds.plan = Plan::Lazy {

@@ -882,7 +882,9 @@ impl Reply {
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(NameEntry {
-                        filename: c.string_lossy()?,
+                        // Strict: the name is reused as a path (see
+                        // `string_utf8`); the longname is display only.
+                        filename: c.string_utf8("file name")?,
                         longname: c.string_lossy()?,
                         attrs: FileAttributes::decode(&mut c)?,
                     });
@@ -1107,6 +1109,29 @@ mod tests {
             }),
         ] {
             roundtrip(r);
+        }
+    }
+
+    #[test]
+    fn non_utf8_file_names_are_an_error_not_aliased() {
+        // A NAME entry b"bad\xff" must not decode to "bad\u{FFFD}" (the
+        // name of a different file), it is an error, as in paramiko.
+        let mut body = BytesMut::new();
+        body.put_u32(1);
+        put_string(&mut body, b"bad\xff");
+        put_string(&mut body, b"-rw-r--r-- 1 u u 0 Jan 1 bad\xff");
+        FileAttributes::default().encode(&mut body);
+        let e = Reply::decode(fxp::NAME, body.freeze()).unwrap_err();
+        assert!(e.to_string().contains("not valid UTF-8"), "{e}");
+        // The longname alone (display only) may be lossy.
+        let mut body = BytesMut::new();
+        body.put_u32(1);
+        put_string(&mut body, "ok-é".as_bytes());
+        put_string(&mut body, b"-rw-r--r-- \xff");
+        FileAttributes::default().encode(&mut body);
+        match Reply::decode(fxp::NAME, body.freeze()).unwrap() {
+            Reply::Name(v) => assert_eq!(v[0].filename, "ok-é"),
+            other => panic!("{other:?}"),
         }
     }
 

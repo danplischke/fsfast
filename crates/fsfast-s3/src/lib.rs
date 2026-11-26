@@ -67,9 +67,13 @@
 //! transfer; `request_size` (8 MiB) and `part_size` (16 MiB) size ranged
 //! GETs and upload parts; `config_kwargs={"max_pool_connections": n}` caps
 //! the connections per host (default 256, adaptive, starting at 64). On
-//! HTTPS endpoints object bodies are sent with `UNSIGNED-PAYLOAD` (no
-//! hashing); on plain HTTP they are SHA-256 signed like botocore does, which
+//! HTTPS endpoints object bodies are sent with `UNSIGNED-PAYLOAD`; on plain
+//! HTTP they are SHA-256 signed like botocore does, which
 //! `config_kwargs={"s3": {"payload_signing_enabled": False}}` turns off.
+//! Object bodies carry a `Content-MD5` (needed by Object Lock buckets;
+//! botocore sends a CRC32), which
+//! `config_kwargs={"request_checksum_calculation": "when_required"}` (or
+//! `AWS_REQUEST_CHECKSUM_CALCULATION`) turns off to save the hashing.
 //! `speculative_info=True` makes `info()` of directories one round trip
 //! instead of two.
 //!
@@ -269,7 +273,13 @@ async fn build_state(inner: &Inner) -> Result<State> {
     let env = &opts.env;
     let profiles = Arc::new(ProfileFiles::load(env).await?);
     let profile = profile_name(opts.profile.as_deref(), env);
-    if opts.profile.is_some() && profiles.profile(&profile).is_none() {
+    // botocore raises ProfileNotFound for a selected profile that does not
+    // exist, whether the option or AWS_DEFAULT_PROFILE / AWS_PROFILE selected
+    // it; only the implicit "default" may be missing.
+    let selected = opts.profile.is_some()
+        || env.get("AWS_DEFAULT_PROFILE").is_some()
+        || env.get("AWS_PROFILE").is_some();
+    if selected && profiles.profile(&profile).is_none() {
         return Err(Error::invalid_input(format!(
             "The config profile ({profile}) could not be found"
         )));
@@ -325,6 +335,19 @@ async fn build_state(inner: &Inner) -> Result<State> {
     let payload_signing = opts
         .payload_signing
         .or_else(|| truthy(pnested("payload_signing_enabled")));
+    // botocore: Config, then AWS_REQUEST_CHECKSUM_CALCULATION, then the
+    // profile; "when_supported" by default.
+    let request_checksum = match opts.request_checksum {
+        Some(v) => v,
+        None => match env
+            .get("AWS_REQUEST_CHECKSUM_CALCULATION")
+            .map(|v| (v, "AWS_REQUEST_CHECKSUM_CALCULATION"))
+            .or_else(|| pget("request_checksum_calculation").map(|v| (v, "AWS config profile")))
+        {
+            Some((v, what)) => options::parse_checksum_calculation(&v, what)?,
+            None => true,
+        },
+    };
 
     let mut http = opts.http.clone();
     if !opts.tls_configured
@@ -370,6 +393,7 @@ async fn build_state(inner: &Inner) -> Result<State> {
             signing_region,
             creds,
             payload_signing,
+            request_checksum,
             opts.params.clone(),
             opts.cache_regions,
         ),

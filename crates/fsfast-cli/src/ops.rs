@@ -10,7 +10,7 @@ use fsfast_core::{
     split_range,
 };
 use fsfast_engine::{OpKind, StatsSnapshot};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 
 use crate::target::Resolved;
 
@@ -186,9 +186,22 @@ pub struct Removed {
 /// batch APIs), then directories deepest first on hierarchical backends.
 /// On object stores a bucket/container path is removed as well, as s3fs
 /// does. A missing path is `NotFound`.
+///
+/// A symlink is removed itself, never the tree it points to (fsspec's
+/// `LocalFileSystem.rm` checks `islink` the same way), and a recursive
+/// delete of the filesystem root (an empty path or `/`, which on Azure
+/// means every container of the account) is refused, as adlfs, s3fs and
+/// gcsfs refuse it.
 pub async fn remove(fs: &dyn FileSystem, path: &str, recursive: bool) -> Result<Removed> {
+    let root = fspath::normalize(path);
+    if recursive && root.trim_matches('/').is_empty() {
+        return Err(Error::invalid_input(
+            "refusing to recursively delete the filesystem root; name a directory, bucket or container",
+        )
+        .with_path(path));
+    }
     let info = fs.info(path).await?;
-    if !info.is_dir() {
+    if !info.is_dir() || is_symlink(fs, path, &info).await {
         fs.rm_file(path).await?;
         return Ok(Removed { files: 1, dirs: 0 });
     }
@@ -204,10 +217,12 @@ pub async fn remove(fs: &dyn FileSystem, path: &str, recursive: bool) -> Result<
             },
         )
         .await?;
-    let root = fspath::normalize(path);
+    // Drop only the root *directory* entry: on object stores the root's
+    // own folder marker (`bucket/d/`, a 0-byte file) normalises to the
+    // root too and must be deleted like any other object (s3fs does).
     let (mut dirs, files): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .filter(|e| fspath::normalize(&e.name) != root)
+        .filter(|e| !(e.is_dir() && fspath::normalize(&e.name) == root))
         .partition(|e| e.is_dir());
     let files: Vec<String> = files.into_iter().map(|e| e.name).collect();
     let mut out = Removed::default();
@@ -245,6 +260,42 @@ pub async fn remove(fs: &dyn FileSystem, path: &str, recursive: bool) -> Result<
     Ok(out)
 }
 
+/// Whether `path`, whose (link-following) `info` is a directory, is itself
+/// a symbolic link. The local backend says so in `islink`; other
+/// hierarchical backends (SFTP) follow links in `info` but list them as
+/// `link` entries (READDIR attributes are `lstat` results), so the parent
+/// listing tells. Object stores have no links. One extra parent listing
+/// per directory delete is cheap next to the delete itself.
+async fn is_symlink(fs: &dyn FileSystem, path: &str, info: &fsfast_core::FileInfo) -> bool {
+    if info.file_type == fsfast_core::FileType::Symlink {
+        return true;
+    }
+    match info.extra.get("islink") {
+        Some(fsfast_core::Value::Bool(b)) => return *b,
+        Some(_) => {}
+        None => {}
+    }
+    if !fs.capabilities().hierarchical {
+        return false;
+    }
+    let name = fspath::normalize(path);
+    let parent = fspath::parent(&name);
+    if parent.is_empty() || parent == name {
+        return false;
+    }
+    match fs.ls(&parent).await {
+        Ok(entries) => entries.iter().any(|e| {
+            fspath::normalize(&e.name) == name
+                && (e.file_type == fsfast_core::FileType::Symlink
+                    || matches!(e.extra.get("islink"), Some(fsfast_core::Value::Bool(true))))
+        }),
+        Err(e) => {
+            tracing::debug!(error = %e, parent, "listing the parent for a symlink check failed");
+            false
+        }
+    }
+}
+
 /// Delete everything under `path` best-effort (benchmark cleanup): never
 /// fails on a missing path.
 pub async fn remove_tree_quiet(fs: &dyn FileSystem, path: &str) -> Result<Removed> {
@@ -254,18 +305,37 @@ pub async fn remove_tree_quiet(fs: &dyn FileSystem, path: &str) -> Result<Remove
     }
 }
 
-/// Run `f(i)` for `i in 0..n` with at most `concurrency` in flight, failing
-/// fast on the first error.
+/// Run `f(i)` for `i in 0..n` with at most `concurrency` in flight. After
+/// the first error no new job starts, but the jobs already running are
+/// driven to completion before that error is returned: dropping them
+/// mid-flight would skip their `close`/`abort` (the core contract) and
+/// leave truncated destination files or abandoned uploads behind.
 pub async fn for_each_concurrent<F, Fut>(n: usize, concurrency: usize, f: F) -> Result<()>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    stream::iter((0..n).map(&f))
-        .buffer_unordered(concurrency.max(1))
-        .try_collect::<Vec<()>>()
-        .await
-        .map(|_| ())
+    let mut next = 0..n;
+    let mut running = futures::stream::FuturesUnordered::new();
+    let mut first_err = None;
+    loop {
+        while first_err.is_none() && running.len() < concurrency.max(1) {
+            match next.next() {
+                Some(i) => running.push(f(i)),
+                None => break,
+            }
+        }
+        match running.next().await {
+            None => break,
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Engine counters of one filesystem over a measured interval.

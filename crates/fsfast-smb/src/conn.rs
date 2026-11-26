@@ -18,8 +18,11 @@
 //!   happens in the caller's task ([`Response::recv`]) so it runs in
 //!   parallel across requests instead of serializing on the reader.
 //! * A dropped caller does not disturb the connection: its response is
-//!   discarded when it arrives (credits are still returned), and requests the
-//!   server had turned async are CANCELled.
+//!   discarded when it arrives (credits are still returned), requests the
+//!   server turns async are CANCELled (also when the interim response
+//!   arrives after the caller left), and a standalone CREATE that succeeds
+//!   for nobody has its handle CLOSEd, so it cannot hold a share-mode lock
+//!   on the file for the rest of the connection's life.
 //! * Any connection-level failure (socket error, protocol violation, bad
 //!   signature, failed decryption) marks the connection dead and fails every
 //!   in-flight request with `ConnectionFailed`; the pool reconnects on next
@@ -28,7 +31,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::IoSlice;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -42,10 +45,10 @@ use fsfast_smb_proto::header::{
     TRANSFORM_PROTOCOL_ID, UNSOLICITED_MESSAGE_ID,
 };
 use fsfast_smb_proto::msg::{
-    CancelRequest, EchoRequest, EchoResponse, EncodedMessage, OutgoingFrame, RawMessage,
-    encode_message,
+    CancelRequest, CloseFlags, CloseRequest, CreateResponse, EchoRequest, EchoResponse,
+    EncodedMessage, OutgoingFrame, RawMessage, encode_message,
 };
-use fsfast_smb_proto::{Dialect, NtStatus};
+use fsfast_smb_proto::{Capabilities, Dialect, NtStatus};
 use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -198,6 +201,49 @@ struct Pending {
     dest: Option<BytesMut>,
     /// Counted in `Shared::direct_waiters` until removed.
     has_dest: bool,
+    /// The session's keys, to protect a CANCEL or orphan CLOSE sent by the
+    /// reader task on the caller's behalf.
+    session: Option<Arc<SessionCrypto>>,
+    /// A CANCEL was sent for this request.
+    cancelled: bool,
+    /// Set for a CREATE whose chain does not CLOSE the handle itself.
+    orphan: Option<Orphan>,
+}
+
+/// Where to CLOSE the handle of a CREATE whose caller went away.
+#[derive(Debug, Clone, Copy)]
+struct Orphan {
+    /// From the request: an async final response carries no TreeId.
+    tree_id: u32,
+    session_id: u64,
+    encrypted: bool,
+}
+
+/// The [`Orphan`] of message `i` of a chain: a CREATE not followed by a
+/// related CLOSE in the same chain (compound CREATE+...+CLOSE recipes close
+/// their handle themselves, also when nobody waits for the answer).
+fn orphan_of(
+    msgs: &[EncodedMessage],
+    i: usize,
+    session_id: u64,
+    encrypted: bool,
+) -> Option<Orphan> {
+    let h = msgs[i].header();
+    if h.command != Command::CREATE {
+        return None;
+    }
+    let closed_in_chain = msgs[i + 1..].iter().any(|m| {
+        let mh = m.header();
+        mh.command == Command::CLOSE && mh.flags.contains(HeaderFlags::RELATED_OPERATIONS)
+    });
+    if closed_in_chain {
+        return None;
+    }
+    Some(Orphan {
+        tree_id: h.tree_id().unwrap_or(0),
+        session_id,
+        encrypted,
+    })
 }
 
 /// Answer to a READ sent with [`Shared::send_read`].
@@ -214,6 +260,8 @@ const DIRECT_MIN: usize = 16 << 10;
 
 /// State shared by the connection's tasks and its callers.
 pub(crate) struct Shared {
+    /// This connection (the reader task sends CLOSEs for orphaned handles).
+    me: Weak<Shared>,
     /// For logs.
     pub id: u64,
     pub peer: String,
@@ -283,7 +331,8 @@ impl Connection {
         let (rd, wr) = stream.into_split();
         let (tx, rx) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
-        let shared = Arc::new(Shared {
+        let shared = Arc::new_cyclic(|me| Shared {
+            me: me.clone(),
             id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
             peer,
             credits: Credits::new(max_credits),
@@ -334,10 +383,15 @@ impl Connection {
     }
 
     /// Record the NEGOTIATE result.
+    ///
+    /// Multi-credit requests ([MS-SMB2] §3.2.5.2 `SupportsMultiCredit`)
+    /// need a 2.1+ dialect *and* the server's SMB2_GLOBAL_CAP_LARGE_MTU (as
+    /// smbprotocol checks); without them every request costs one credit and
+    /// moves at most 64 KiB.
     pub fn set_negotiated(&self, n: Negotiated) {
-        self.shared
-            .multi_credit
-            .store(n.dialect.supports_multi_credit(), Ordering::Release);
+        let multi = n.dialect.supports_multi_credit()
+            && n.server_capabilities.contains(Capabilities::LARGE_MTU);
+        self.shared.multi_credit.store(multi, Ordering::Release);
         let _ = self.negotiated.set(n);
     }
 
@@ -494,6 +548,10 @@ impl Shared {
             mids.push((mid, charge));
             mid += u64::from(charge);
         }
+        let session_id = session.map_or(0, |s| s.session_id);
+        let orphans: Vec<Option<Orphan>> = (0..msgs.len())
+            .map(|i| orphan_of(&msgs, i, session_id, encrypt))
+            .collect();
         let mut sign_err = None;
         if !encrypt
             && let Some(s) = session
@@ -540,14 +598,14 @@ impl Shared {
                 return Err(e.with_source(NotSent));
             }
         };
-        let session_id = session.map_or(0, |s| s.session_id);
         let mut responses = Vec::with_capacity(mids.len());
         if dest.is_some() {
             self.direct_waiters.fetch_add(1, Ordering::AcqRel);
         }
         {
             let mut pending = self.pending.lock();
-            for &(mid, charge) in &mids {
+            for (i, &(mid, charge)) in mids.iter().enumerate() {
+                let orphan = orphans[i];
                 let (tx, rx) = oneshot::channel();
                 pending.insert(
                     mid,
@@ -560,6 +618,9 @@ impl Shared {
                         session_id,
                         has_dest: dest.is_some(),
                         dest: dest.take(),
+                        session: sec.session.clone(),
+                        cancelled: false,
+                        orphan,
                     },
                 );
                 responses.push(Response {
@@ -567,6 +628,7 @@ impl Shared {
                     rx: Some(rx),
                     mid,
                     session: sec.session.clone(),
+                    orphan,
                 });
             }
         }
@@ -673,6 +735,20 @@ impl Shared {
         self.credits.on_response(h.credits, settle);
         if h.is_interim() {
             p.async_id = h.async_id();
+            // The caller left before the server turned the request async
+            // (`abandon` could not CANCEL it then): cancel it now instead of
+            // letting it run to completion for nobody.
+            let cancel = match (p.tx.is_none() && !p.cancelled, p.async_id) {
+                (true, Some(a)) => {
+                    p.cancelled = true;
+                    Some((a, p.session_id, p.encrypted, p.session.clone()))
+                }
+                _ => None,
+            };
+            drop(pending);
+            if let Some((async_id, session_id, enc, session)) = cancel {
+                self.send_cancel(h.message_id, async_id, session_id, enc, session.as_ref());
+            }
             return;
         }
         let p = pending.remove(&h.message_id).expect("present above");
@@ -688,12 +764,65 @@ impl Shared {
             self.fail("unencrypted response to an encrypted request");
             return;
         }
-        if let Some(tx) = p.tx {
-            let _ = tx.send(Ok(Delivered::Msg {
+        let unclaimed = match p.tx {
+            Some(tx) => match tx.send(Ok(Delivered::Msg {
                 msg: m,
                 encrypted,
                 dest: p.dest,
-            }));
+            })) {
+                Ok(()) => None,
+                // The caller dropped its receiver in the meantime.
+                Err(Ok(Delivered::Msg { msg, .. })) => Some(msg),
+                Err(_) => None,
+            },
+            None => Some(m),
+        };
+        if let (Some(m), Some(o)) = (unclaimed, p.orphan) {
+            self.close_orphan(&m, o, p.session);
+        }
+    }
+
+    /// CLOSE the handle a successful CREATE response opened for a caller
+    /// that went away. Queued right away when credits allow (like
+    /// `ops::close_detached`), so it reaches the server before the next
+    /// request this connection sends.
+    fn close_orphan(&self, m: &RawMessage, o: Orphan, session: Option<Arc<SessionCrypto>>) {
+        use futures::FutureExt;
+        if m.is_error_response() || self.is_dead() {
+            return;
+        }
+        let Ok(c) = m.decode::<CreateResponse>() else {
+            return;
+        };
+        let Some(shared) = self.me.upgrade() else {
+            return;
+        };
+        let body = CloseRequest {
+            flags: CloseFlags::empty(),
+            file_id: c.file_id,
+        };
+        let h = crate::session::header_for(&body, o.session_id, o.tree_id, self.multi_credit());
+        let Ok(msg) = encode_message(&h, &body) else {
+            return;
+        };
+        tracing::debug!(
+            conn = self.id,
+            file_id = ?c.file_id,
+            "closing the handle of an abandoned CREATE"
+        );
+        let sec = Security {
+            session,
+            encrypt: o.encrypted,
+            force_sign: false,
+        };
+        // The CLOSE's own response is discarded (its `Response` is dropped).
+        let mut fut = Box::pin(async move {
+            let _ = shared.send(vec![msg], &sec).await;
+        });
+        if (&mut fut).now_or_never().is_none()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(fut);
         }
     }
 
@@ -846,7 +975,9 @@ impl Shared {
             match pending.get_mut(&mid) {
                 Some(p) => {
                     p.tx = None;
-                    p.async_id.map(|a| (a, p.session_id, p.encrypted))
+                    let c = p.async_id.map(|a| (a, p.session_id, p.encrypted));
+                    p.cancelled |= c.is_some();
+                    c
                 }
                 None => None,
             }
@@ -927,6 +1058,8 @@ pub(crate) struct Response {
     rx: Option<oneshot::Receiver<Result<Delivered>>>,
     mid: u64,
     session: Option<Arc<SessionCrypto>>,
+    /// Set for a CREATE whose handle must be CLOSEd if nobody reads it.
+    orphan: Option<Orphan>,
 }
 
 impl std::fmt::Debug for Response {
@@ -1157,8 +1290,22 @@ impl Response {
 
 impl Drop for Response {
     fn drop(&mut self) {
-        if self.rx.is_some() {
-            self.shared.abandon(self.mid, self.session.as_ref());
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
+        // Closing first settles the race with the reader: a response sent
+        // before this point is in `rx`; one sent after fails to send and the
+        // reader handles it (and `abandon` below makes later ones go there).
+        rx.close();
+        match rx.try_recv() {
+            Ok(Ok(Delivered::Msg { msg, .. })) => {
+                // Delivered but never read: a CREATE's handle would leak.
+                if let Some(o) = self.orphan {
+                    self.shared.close_orphan(&msg, o, self.session.clone());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => self.shared.abandon(self.mid, self.session.as_ref()),
         }
     }
 }

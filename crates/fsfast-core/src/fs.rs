@@ -166,8 +166,21 @@ pub trait ReadHandle: Send + Sync + fmt::Debug {
     ///
     /// Must return exactly `min(len, size - offset)` bytes (empty at/after
     /// EOF). Implementations split internally if the protocol caps request
-    /// sizes (e.g. SMB `MaxReadSize`).
+    /// sizes (e.g. SMB `MaxReadSize`). For a handle whose size is not fixed
+    /// at open ([`ReadHandle::current_size`] returns `Some`), `size` is the
+    /// file's current size: data appended after open is returned.
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes>;
+
+    /// The file's current size, for handles whose reads are *not* pinned to
+    /// the version observed at open (a local file being appended to), so
+    /// that readers can follow it the way a Python file object reads to the
+    /// current end of file. `None` (the default) means the size is fixed at
+    /// [`ReadHandle::size`] and `read_at` never returns data past it.
+    ///
+    /// Readers call this only when a read reaches the size they know.
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 
     /// Read several ranges. The default coalesces nearby ranges using
     /// [`ReadHandle::io_hints`] and fetches the merged ranges concurrently.

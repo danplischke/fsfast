@@ -462,6 +462,114 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::InvalidInput);
     }
 
+    /// Repeated `flush()` of a growing file must not re-copy everything
+    /// published so far (that made N flushes cost O(N^2) bytes): published
+    /// snapshots share an append-only allocation that grows geometrically, so
+    /// only O(log N) distinct allocations are ever published.
+    #[tokio::test]
+    async fn repeated_flush_does_not_recopy_published_content() {
+        for append in [false, true] {
+            let fs = MemoryFileSystem::new_isolated();
+            let p = "/flushy";
+            let mut expected = Vec::new();
+            let mode = if append {
+                // A large pre-existing file: append mode used to start from a
+                // copy of it on every flush.
+                let pre = vec![7u8; 256 * 1024];
+                expected.extend_from_slice(&pre);
+                fs.pipe_file(p, Bytes::from(pre), &WriteOptions::default())
+                    .await
+                    .unwrap();
+                WriteMode::Append
+            } else {
+                WriteMode::Overwrite
+            };
+            let wopts = WriteOptions {
+                mode,
+                ..WriteOptions::default()
+            };
+            let mut w = fs.open_write(p, &wopts).await.unwrap();
+            let mut allocations = std::collections::HashSet::new();
+            for i in 0..1000u32 {
+                let chunk = vec![(i % 251) as u8; 1024];
+                expected.extend_from_slice(&chunk);
+                w.write(Bytes::from(chunk)).await.unwrap();
+                w.flush().await.unwrap();
+                let seen = fs.cat_file(p, ByteRange::Full).await.unwrap();
+                assert_eq!(seen.len(), expected.len());
+                allocations.insert(seen.as_ptr() as usize);
+            }
+            w.close().await.unwrap();
+            let all = fs.cat_file(p, ByteRange::Full).await.unwrap();
+            assert!(
+                all[..] == expected[..],
+                "content mismatch (append={append})"
+            );
+            assert!(
+                allocations.len() <= 24,
+                "{} distinct allocations for 1000 flushes (append={append})",
+                allocations.len()
+            );
+        }
+    }
+
+    /// Every publish path (single write, flush into the append buffer,
+    /// growth, final write that fits / does not fit, compaction, abort)
+    /// keeps the content exact, and snapshots taken earlier stay unchanged.
+    #[tokio::test]
+    async fn flush_publish_paths_keep_content_exact() {
+        let fs = MemoryFileSystem::new_isolated();
+        let wopts = WriteOptions::default();
+        for (sizes, flush_each) in [
+            (vec![10usize], false),
+            (vec![10, 20, 30], false),
+            (vec![10, 20, 30], true),
+            (vec![100_000, 1, 300_000, 5], true),
+            (vec![70_000, 70_000, 1_000_000], true),
+        ] {
+            let p = "/paths";
+            let mut w = fs.open_write(p, &wopts).await.unwrap();
+            let mut expected = Vec::new();
+            let mut snapshots = Vec::new();
+            for (i, n) in sizes.iter().enumerate() {
+                let chunk: Vec<u8> = (0..*n).map(|j| (i * 31 + j) as u8).collect();
+                expected.extend_from_slice(&chunk);
+                w.write(Bytes::from(chunk)).await.unwrap();
+                if flush_each {
+                    w.flush().await.unwrap();
+                    let got = fs.cat_file(p, ByteRange::Full).await.unwrap();
+                    assert!(got[..] == expected[..]);
+                    snapshots.push((got, expected.len()));
+                }
+            }
+            w.close().await.unwrap();
+            let got = fs.cat_file(p, ByteRange::Full).await.unwrap();
+            assert!(got[..] == expected[..], "{sizes:?}");
+            for (snap, len) in snapshots {
+                assert!(snap[..] == expected[..len]);
+            }
+        }
+        // Abort after flushes restores the appended-to original.
+        let p = "/abort";
+        fs.pipe_file(p, Bytes::from_static(b"orig"), &wopts)
+            .await
+            .unwrap();
+        let mut w = fs
+            .open_write(p, &WriteOptions::default().with_mode(WriteMode::Append))
+            .await
+            .unwrap();
+        w.write(Bytes::from_static(b"++")).await.unwrap();
+        w.flush().await.unwrap();
+        w.write(Bytes::from_static(b"--")).await.unwrap();
+        w.flush().await.unwrap();
+        assert_eq!(
+            &fs.cat_file(p, ByteRange::Full).await.unwrap()[..],
+            b"orig++--"
+        );
+        w.abort().await.unwrap();
+        assert_eq!(&fs.cat_file(p, ByteRange::Full).await.unwrap()[..], b"orig");
+    }
+
     #[tokio::test]
     async fn global_instances_share_state_isolated_do_not() {
         let a = MemoryFileSystem::new();

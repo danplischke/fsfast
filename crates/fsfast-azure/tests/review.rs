@@ -536,3 +536,232 @@ async fn block_list_append_matches_adlfs_block_ids() {
     assert_eq!(dec(&got[2]), 32);
     destroy_container(&fs, &c).await;
 }
+
+/// A mock append blob (`HEAD:` at first) whose first `n_fail` Append Block
+/// requests fail with a 503; the others append.
+async fn flaky_append_blob(n_fail: usize) -> (Mock, Arc<Mutex<Vec<u8>>>) {
+    let blob: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(b"HEAD:".to_vec()));
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(n_fail));
+    let b2 = blob.clone();
+    let mock = Mock::start(move |s: &Seen| {
+        let mut blob = b2.lock();
+        match (s.method.as_str(), s.param("comp").as_deref()) {
+            ("HEAD", _) => Reply::new(200)
+                .header("content-length", &blob.len().to_string())
+                .header("x-ms-blob-type", "AppendBlob")
+                .header("etag", "\"0x1\""),
+            ("PUT", Some("appendblock")) => {
+                if failures
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Reply::azure_error(503, "ServerBusy");
+                }
+                let at: usize = s
+                    .header("x-ms-blob-condition-appendpos")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if at != blob.len() {
+                    return Reply::azure_error(412, "AppendPositionConditionNotMet");
+                }
+                blob.extend_from_slice(&s.body);
+                Reply::new(201)
+            }
+            _ => Reply::azure_error(500, "InternalError"),
+        }
+    })
+    .await;
+    (mock, blob)
+}
+
+/// An Append Block that fails (retries exhausted) loses its chunk: the
+/// handle must not append the rest of the data after the hole, neither on
+/// `close` (Python's `with` calls it after a failed `write`) nor on `flush`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_append_block_poisons_the_handle() {
+    let ap = WriteOptions::default().with_mode(WriteMode::Append);
+    let big = vec![b'A'; fsfast_azure::write::APPEND_CHUNK];
+
+    // write() pushes a full chunk, which fails; close must refuse.
+    let (mock, blob) = flaky_append_blob(1).await;
+    let fs = mock_fs(&mock, &[("max_retries", Value::Int(0))]);
+    let mut w = fs.open_write("c/log", &ap).await.unwrap();
+    w.write(Bytes::from([big.clone(), vec![b'B'; 1 << 20]].concat()))
+        .await
+        .unwrap_err();
+    assert!(
+        w.close().await.is_err(),
+        "close committed data after a hole"
+    );
+    assert!(w.close().await.is_err());
+    assert!(w.flush().await.is_err());
+    assert!(w.write(Bytes::from_static(b"x")).await.is_err());
+    assert_eq!(&blob.lock()[..], b"HEAD:");
+    w.abort().await.unwrap();
+
+    // flush() fails half-way: neither a later write+flush nor close appends.
+    let (mock, blob) = flaky_append_blob(1).await;
+    let fs = mock_fs(&mock, &[("max_retries", Value::Int(0))]);
+    let mut w = fs.open_write("c/log", &ap).await.unwrap();
+    w.write(Bytes::from_static(b"one")).await.unwrap();
+    assert!(w.flush().await.is_err());
+    assert!(w.write(Bytes::from_static(b"two")).await.is_err());
+    assert!(w.flush().await.is_err());
+    assert!(w.close().await.is_err());
+    assert_eq!(&blob.lock()[..], b"HEAD:");
+
+    // Without failures the same sequence appends everything.
+    let (mock, blob) = flaky_append_blob(0).await;
+    let fs = mock_fs(&mock, &[("max_retries", Value::Int(0))]);
+    let mut w = fs.open_write("c/log", &ap).await.unwrap();
+    w.write(Bytes::from([big.clone(), b"BB".to_vec()].concat()))
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
+    w.write(Bytes::from_static(b"CC")).await.unwrap();
+    w.close().await.unwrap();
+    w.close().await.unwrap();
+    let got = blob.lock().clone();
+    assert_eq!(got.len(), 5 + big.len() + 4);
+    assert_eq!(&got[..5], b"HEAD:");
+    assert_eq!(&got[got.len() - 4..], b"BBCC");
+}
+
+/// A `close` that failed, or whose future was dropped half-way, committed
+/// nothing: a second `close` must not report success. `close` after
+/// `abort` fails too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_after_failed_or_cancelled_close_fails() {
+    let mock = Mock::start(move |s: &Seen| match s.method.as_str() {
+        "HEAD" => Reply::new(404),
+        // A racing writer created it: the create-only commit fails.
+        "PUT" if s.header("if-none-match") == Some("*") => {
+            Reply::azure_error(409, "BlobAlreadyExists")
+        }
+        "PUT" => Reply::new(201),
+        _ => Reply::azure_error(500, "InternalError"),
+    })
+    .await;
+    let fs = mock_fs(&mock, &[("max_retries", Value::Int(0))]);
+
+    let x = WriteOptions::default().with_mode(WriteMode::CreateNew);
+    let mut w = fs.open_write("c/new", &x).await.unwrap();
+    w.write(Bytes::from_static(b"data")).await.unwrap();
+    let e = w.close().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::AlreadyExists, "{e}");
+    assert!(w.close().await.is_err(), "second close reported success");
+
+    // Cancelled close: against a server that accepts but never answers,
+    // the commit is still in flight when the future is dropped.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_url = format!("http://{}/acct", silent.local_addr().unwrap());
+    let holder = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = silent.accept().await {
+            held.push(sock);
+        }
+    });
+    let hung = AzureBlobFileSystem::from_options_with_env(
+        [
+            ("account_name", Value::Str("acct".into())),
+            ("account_key", Value::Str(DEVSTORE_ACCOUNT_KEY.into())),
+            ("account_host", Value::Str(silent_url)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect(),
+        &|_| None,
+    )
+    .unwrap();
+    let mut w = hung
+        .open_write("c/new", &WriteOptions::default())
+        .await
+        .unwrap();
+    w.write(Bytes::from_static(b"data")).await.unwrap();
+    let r = tokio::time::timeout(std::time::Duration::from_millis(300), w.close()).await;
+    assert!(r.is_err(), "close should still be in flight: {r:?}");
+    let e = w.close().await.unwrap_err();
+    assert_eq!(
+        e.kind(),
+        ErrorKind::Io,
+        "close after a cancelled close: {e}"
+    );
+    holder.abort();
+
+    // Close after abort.
+    let mut w = fs
+        .open_write("c/new", &WriteOptions::default())
+        .await
+        .unwrap();
+    w.write(Bytes::from_static(b"data")).await.unwrap();
+    w.abort().await.unwrap();
+    let e = w.close().await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidInput, "{e}");
+}
+
+/// A blob whose name is also a prefix (`d/a` next to `d/a/b`) is a file
+/// *and* a directory: `find` keeps the file (with or without directories),
+/// so `du`/`rm` over the tree see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn find_keeps_blob_shadowed_by_prefix() {
+    let (_cs, fs, c) = setup!("findshadow");
+    for (p, d) in [("d/a", "aaa"), ("d/a/b", "bbbb"), ("d/z", "zzzz")] {
+        fs.pipe_file(
+            &format!("{c}/{p}"),
+            Bytes::from(d),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let root = format!("{c}/d");
+    let files = fs.find(&root, &FindOptions::default()).await.unwrap();
+    let names: Vec<_> = files.iter().map(|i| i.name.clone()).collect();
+    assert_eq!(
+        names,
+        [format!("{c}/d/a"), format!("{c}/d/a/b"), format!("{c}/d/z")]
+    );
+    assert_eq!(files.iter().map(|i| i.size).sum::<u64>(), 11);
+    let all = fs
+        .find(
+            &root,
+            &FindOptions {
+                withdirs: true,
+                ..FindOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let got: Vec<_> = all
+        .iter()
+        .map(|i| (i.name.trim_start_matches(&c).to_owned(), i.is_dir()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("/d".to_owned(), true),
+            ("/d/a".to_owned(), true),
+            ("/d/a".to_owned(), false),
+            ("/d/a/b".to_owned(), false),
+            ("/d/z".to_owned(), false),
+        ]
+    );
+    // The same with a depth limit: `d/a` (both) is at depth 1.
+    let one = fs
+        .find(
+            &root,
+            &FindOptions {
+                withdirs: true,
+                maxdepth: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 4, "{one:?}");
+    destroy_container(&fs, &c).await;
+}

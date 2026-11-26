@@ -1167,3 +1167,142 @@ async fn touch_truncate_of_a_named_pipe_does_not_hang() {
     // Without truncation only the timestamps change.
     fs_.touch(&fifo, false).await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cat_file_reads_a_fifo_as_a_stream() {
+    use std::io::Write as _;
+    let (_d, root) = tmp();
+    let fifo = format!("{root}/pipe");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        fifo.as_str(),
+        rustix::fs::Mode::from(0o600),
+    )
+    .unwrap();
+    let fs = LocalFileSystem::from_options(Options::new()).unwrap();
+    // fsspec reads the pipe's content (its stat size is 0).
+    let payload: Vec<u8> = pattern(300_000);
+    let writer = {
+        let (fifo, payload) = (fifo.clone(), payload.clone());
+        std::thread::spawn(move || {
+            let mut f = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            f.write_all(&payload).unwrap();
+        })
+    };
+    let got = fs.cat_file(&fifo, ByteRange::Full).await.unwrap();
+    writer.join().unwrap();
+    assert_eq!(got.len(), payload.len());
+    assert_eq!(&got[..], &payload[..]);
+    // A range starting at 0 reads a prefix.
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let mut f = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            let _ = f.write_all(b"hello world");
+        })
+    };
+    let got = fs
+        .cat_file(&fifo, ByteRange::Bounded { start: 0, end: 5 })
+        .await
+        .unwrap();
+    writer.join().unwrap();
+    assert_eq!(&got[..], b"hello");
+    // Any other start would need a seek: ESPIPE, as fsspec's f.seek().
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let mut f = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            let _ = f.write_all(b"x");
+        })
+    };
+    let e = fs
+        .cat_file(&fifo, ByteRange::Bounded { start: 2, end: 5 })
+        .await
+        .unwrap_err();
+    writer.join().unwrap();
+    assert!(
+        e.details().iter().any(
+            |d| matches!(d, Detail::Errno(n) if *n == rustix::io::Errno::SPIPE.raw_os_error())
+        ),
+        "{e:?}"
+    );
+}
+
+/// fsspec's `LocalFileOpener` is an OS file object: it reads to the current
+/// end of file, so data appended after `open` is visible. Local read
+/// handles are not pinned either and report the current size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_handle_sees_data_appended_after_open() {
+    use std::io::Write as _;
+    let (_d, root) = tmp();
+    let p = format!("{root}/grows");
+    let data = pattern(3 << 20);
+    fs::write(&p, &data[..100]).unwrap();
+    let fs_ = LocalFileSystem::new().with_io_hints(small_hints());
+    let h = fs_.open_read(&p, &ReadOptions::default()).await.unwrap();
+    assert_eq!(h.size(), 100);
+    assert_eq!(&h.read_at(0, 1000).await.unwrap()[..], &data[..100]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&p)
+        .unwrap()
+        .write_all(&data[100..])
+        .unwrap();
+    assert_eq!(h.current_size().await.unwrap(), Some(data.len() as u64));
+    // Small and large (parallel) reads past the size seen at open.
+    assert_eq!(&h.read_at(50, 100).await.unwrap()[..], &data[50..150]);
+    assert_eq!(&h.read_at(0, usize::MAX >> 8).await.unwrap()[..], &data[..]);
+    assert!(h.read_at(data.len() as u64, 10).await.unwrap().is_empty());
+    let got = h
+        .read_ranges(&[0..10, 200..300, 1_000_000..2_500_000, 3_145_000..9_999_999])
+        .await
+        .unwrap();
+    assert_eq!(&got[0][..], &data[..10]);
+    assert_eq!(&got[1][..], &data[200..300]);
+    assert_eq!(&got[2][..], &data[1_000_000..2_500_000]);
+    assert_eq!(&got[3][..], &data[3_145_000..]);
+}
+
+/// A failed `pipe_file` / `cp_file` through a symlink must not delete the
+/// user's symlink (fsspec leaves it in place): only a path that is still
+/// the opened file is removed. `/dev/full` makes every write fail with
+/// ENOSPC.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_write_through_symlink_keeps_the_symlink() {
+    if !Path::new("/dev/full").exists() {
+        eprintln!("skipping: no /dev/full");
+        return;
+    }
+    let (_d, root) = tmp();
+    let link = format!("{root}/link");
+    std::os::unix::fs::symlink("/dev/full", &link).unwrap();
+    let src = format!("{root}/src");
+    fs::write(&src, pattern(1 << 20)).unwrap();
+    let fs_ = LocalFileSystem::new();
+    let enospc = |e: &Error| {
+        e.details()
+            .iter()
+            .any(|d| matches!(d, Detail::Errno(n) if *n == rustix::io::Errno::NOSPC.raw_os_error()))
+    };
+    let e = fs_
+        .pipe_file(
+            &link,
+            Bytes::from(pattern(1 << 20)),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(enospc(&e), "{e:?}");
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "pipe_file removed the symlink"
+    );
+    let e = fs_.cp_file(&src, &link).await.unwrap_err();
+    assert!(enospc(&e), "{e:?}");
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "cp_file removed the symlink"
+    );
+}

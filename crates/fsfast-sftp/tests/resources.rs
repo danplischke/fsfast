@@ -240,3 +240,31 @@ async fn close_releases_tcp_connections() {
     })
     .await;
 }
+
+/// A close() while a background pool grow is still in its SSH handshake
+/// must not leave the new connection in the (closed) pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_during_background_grow_leaves_no_connection() {
+    let Some(env) = common::env() else { return };
+    let _serial = SERIAL.lock().await;
+    let before = settled_connections_to(env.port).await;
+    for round in 0..3 {
+        let fs = env.fs(&[("connections", 2.into())]);
+        fs.info(&env.home).await.unwrap();
+        // A burst starts a background grow; join it and close at once,
+        // most likely before the extra handshake finished.
+        let infos = futures::future::join_all((0..8).map(|_| fs.info(&env.home))).await;
+        assert!(infos.iter().all(Result::is_ok));
+        fs.close().await.unwrap();
+        // Give a still-running grow time to finish its handshake.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(fs.connections(), 0, "round {round}");
+        eventually("no connection survives close() during a grow", || {
+            own_connections_to(env.port) == before
+        })
+        .await;
+        // Keep the filesystem alive until after the check (dropping it
+        // would close a leaked connection too and hide the bug).
+        drop(fs);
+    }
+}

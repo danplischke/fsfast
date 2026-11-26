@@ -193,6 +193,13 @@ impl Shared {
         }
         let id = {
             let mut p = self.pending.lock();
+            // Check again under the lock: `fail` sets `is_closed` before it
+            // drains `pending` under this lock, so a waiter inserted after
+            // that drain (the reader has exited) would never complete.
+            if self.is_closed.load(Ordering::Acquire) {
+                drop(p);
+                return Err(self.closed_error());
+            }
             let id = self.alloc_id(&p);
             p.insert(id, waiter);
             id
@@ -1091,7 +1098,7 @@ pub fn status_reply(r: RawReply, op: &str, path: &str) -> Result<()> {
 
 /// Decode a READDIR reply: entries, or `None` at the end of the directory.
 pub fn readdir_reply(r: RawReply, path: &str) -> Result<Option<Vec<NameEntry>>> {
-    match r.decode()? {
+    match r.decode().map_err(|e| e.with_path(path))? {
         Reply::Name(v) => Ok(Some(v)),
         Reply::Status(s) if s.code == status::EOF => Ok(None),
         Reply::Status(s) => Err(status_error(&s, "readdir", Some(path))),
@@ -1100,7 +1107,7 @@ pub fn readdir_reply(r: RawReply, path: &str) -> Result<Option<Vec<NameEntry>>> 
 }
 
 fn single_name(r: RawReply, op: &str, path: &str) -> Result<String> {
-    match r.decode()? {
+    match r.decode().map_err(|e| e.with_path(path))? {
         Reply::Name(v) if !v.is_empty() => {
             Ok(v.into_iter().next().map(|e| e.filename).unwrap_or_default())
         }
@@ -1175,6 +1182,45 @@ mod tests {
     use super::testing::*;
     use super::*;
     use crate::proto::{Status, Version};
+
+    /// A request submitted while the reader shuts the session down (between
+    /// submit's first `is_closed` check and its insert into `pending`) must
+    /// fail instead of leaving a waiter nobody will ever complete.
+    #[test]
+    fn submit_racing_fail_does_not_leave_a_waiter() {
+        let (out, _out_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            closed: Mutex::new(None),
+            is_closed: AtomicBool::new(false),
+            out,
+            next_id: AtomicU32::new(1),
+        });
+        // Hold the map lock so the submitter stops right after its first
+        // check, then do what `fail` does in that window.
+        let guard = shared.pending.lock();
+        let s2 = shared.clone();
+        let submitter = std::thread::spawn(move || {
+            let (tx, _rx) = oneshot::channel();
+            s2.submit(
+                &Request::Stat {
+                    path: Bytes::from_static(b"/"),
+                },
+                Waiter::Active(tx),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        *shared.closed.lock() = Some(Closed {
+            kind: ErrorKind::ConnectionFailed,
+            message: "gone".into(),
+        });
+        shared.is_closed.store(true, Ordering::Release);
+        // (`fail` drains the map here; it is empty.)
+        drop(guard);
+        let r = submitter.join().unwrap();
+        assert!(r.is_err(), "submit after the drain must fail");
+        assert!(shared.pending.lock().is_empty(), "a waiter was left behind");
+    }
 
     /// Split the client byte stream into requests.
     struct ReqReader {

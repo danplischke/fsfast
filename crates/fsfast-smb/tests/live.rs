@@ -1033,3 +1033,150 @@ async fn paths_spread_over_lazily_opened_connections() {
     common::cleanup(&fs, &root).await;
     fs.close().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cat_file_counts_wire_requests_and_bytes() {
+    let Some(env) = common::env() else { return };
+    let fs = env.fs(&[("connections", Value::Int(1))]);
+    let share = env.share.clone();
+    let root = scratch(&fs, &share, "stats").await;
+    let small = format!("{root}/small");
+    let big = format!("{root}/big");
+    fs.pipe_file(
+        &small,
+        Bytes::from_static(b"12345"),
+        &WriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    let data = Bytes::from(vec![7u8; 5 << 20]);
+    fs.pipe_file(&big, data.clone(), &WriteOptions::default())
+        .await
+        .unwrap();
+
+    fs.stats().reset();
+    assert_eq!(fs.cat_file(&small, ByteRange::Full).await.unwrap().len(), 5);
+    let s = fs.stats().snapshot();
+    assert_eq!(s.requests, 1, "inline read = one compound round trip");
+    assert_eq!(s.bytes_read, 5);
+
+    fs.stats().reset();
+    let got = fs.cat_file(&big, ByteRange::Full).await.unwrap();
+    assert_eq!(got, data);
+    let s = fs.stats().snapshot();
+    assert_eq!(s.bytes_read, data.len() as u64, "bytes are counted once");
+    let reads = s.latency(fsfast_engine::OpKind::Read).count;
+    assert!(reads > 1, "one request per READ message, got {reads}");
+    assert!(
+        s.requests >= reads + 2,
+        "probe + open + reads + close: {s:?}"
+    );
+    common::cleanup(&fs, &root).await;
+    fs.close().await.unwrap();
+}
+
+/// A whole-file `cat_file` of a file larger than the speculative inline READ
+/// keeps what that READ returned and fetches only the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cat_full_of_a_medium_file_reads_each_byte_once() {
+    let Some(env) = common::env() else { return };
+    let chunk = 256 << 10;
+    let fs = env.fs(&[
+        ("connections", Value::Int(1)),
+        ("read_chunk_size", Value::Int(chunk as i64)),
+    ]);
+    let share = env.share.clone();
+    let root = scratch(&fs, &share, "catrest").await;
+    let f = format!("{root}/medium");
+    let size = (1 << 20) + 100;
+    let data = Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    fs.pipe_file(&f, data.clone(), &WriteOptions::default())
+        .await
+        .unwrap();
+    for (range, from) in [(ByteRange::Full, 0usize), (ByteRange::From(1000), 1000)] {
+        fs.stats().reset();
+        let before = frames(&fs, &share).await;
+        let got = fs.cat_file(&f, range).await.unwrap();
+        assert_eq!(got, data.slice(from..), "{range:?}");
+        let s = fs.stats().snapshot();
+        let reads = s.latency(fsfast_engine::OpKind::Read).count;
+        // One inline compound (CREATE + READ of one chunk + CLOSE), then
+        // READs of the remainder only.
+        let rest = size - from - chunk;
+        let want = 1 + rest.div_ceil(chunk) as u64;
+        assert_eq!(reads, want, "{range:?}: {s:?}");
+        assert_eq!(s.bytes_read, (size - from) as u64, "{range:?}");
+        // compound + CREATE + remainder READs + CLOSE.
+        let sent = frames(&fs, &share).await - before;
+        assert_eq!(sent, want + 2, "{range:?}");
+    }
+    common::cleanup(&fs, &root).await;
+    fs.close().await.unwrap();
+}
+
+/// Dropping an open (or a whole-file read) mid-flight must not leave the
+/// server handle open: with the default exclusive share mode it would lock
+/// the file for the rest of the connection's life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_opens_do_not_leave_the_file_locked() {
+    let Some(env) = common::env() else { return };
+    let fs = env.fs(&[("connections", Value::Int(1))]);
+    let share = env.share.clone();
+    let root = scratch(&fs, &share, "cancelopen").await;
+    let f = format!("{root}/f");
+    let g = format!("{root}/g");
+    fs.pipe_file(&f, Bytes::from_static(b"hello"), &WriteOptions::default())
+        .await
+        .unwrap();
+    let big = Bytes::from(vec![3u8; 5 << 20]);
+    fs.pipe_file(&g, big.clone(), &WriteOptions::default())
+        .await
+        .unwrap();
+    // The file must become usable again shortly (the CLOSE of an abandoned
+    // CREATE goes out when its response arrives).
+    async fn usable(fs: &SmbFileSystem, path: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match fs.open_read(path, &ReadOptions::default()).await {
+                Ok(h) => {
+                    h.close().await.unwrap();
+                    return;
+                }
+                Err(e) if Instant::now() < deadline => {
+                    assert_eq!(nt(&e), Some(0xC000_0043), "{e}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("{path} stays locked after a cancelled open: {e}"),
+            }
+        }
+    }
+    let mut cancelled = 0;
+    for us in (0..=600).step_by(20) {
+        let r = tokio::time::timeout(
+            Duration::from_micros(us),
+            fs.open_read(&f, &ReadOptions::default()),
+        )
+        .await;
+        match r {
+            Ok(h) => h.unwrap().close().await.unwrap(),
+            Err(_) => cancelled += 1,
+        }
+        usable(&fs, &f).await;
+    }
+    for us in (250..=3000).step_by(250) {
+        let r =
+            tokio::time::timeout(Duration::from_micros(us), fs.cat_file(&g, ByteRange::Full)).await;
+        match r {
+            Ok(b) => assert_eq!(b.unwrap().len(), big.len()),
+            Err(_) => cancelled += 1,
+        }
+        usable(&fs, &g).await;
+    }
+    assert!(cancelled > 0, "no operation was cancelled");
+    // Writers and deletes work too.
+    fs.pipe_file(&f, Bytes::from_static(b"x"), &WriteOptions::default())
+        .await
+        .unwrap();
+    common::cleanup(&fs, &root).await;
+    fs.close().await.unwrap();
+}

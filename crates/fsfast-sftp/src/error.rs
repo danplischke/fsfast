@@ -19,9 +19,12 @@ pub fn kind_for(code: u32) -> ErrorKind {
     match code {
         status::NO_SUCH_FILE | status::NO_SUCH_PATH => ErrorKind::NotFound,
         status::PERMISSION_DENIED | status::WRITE_PROTECT => ErrorKind::PermissionDenied,
-        status::BAD_MESSAGE | status::INVALID_FILENAME | status::INVALID_HANDLE => {
-            ErrorKind::InvalidInput
-        }
+        // OpenSSH sends BAD_MESSAGE for the server's EINVAL/ENAMETOOLONG,
+        // and INVALID_FILENAME is likewise the server rejecting a name:
+        // OS errors, which paramiko (and Python for local files) raise as
+        // a plain OSError, not ValueError. A bad handle is a client bug.
+        status::BAD_MESSAGE | status::INVALID_FILENAME => ErrorKind::Io,
+        status::INVALID_HANDLE => ErrorKind::InvalidInput,
         status::NO_CONNECTION | status::CONNECTION_LOST => ErrorKind::ConnectionFailed,
         status::OP_UNSUPPORTED => ErrorKind::Unsupported,
         status::FILE_ALREADY_EXISTS => ErrorKind::AlreadyExists,
@@ -85,6 +88,11 @@ mod tests {
             ErrorKind::DirectoryNotEmpty
         );
         assert_eq!(kind_for(999), ErrorKind::Io);
+        // Server-side EINVAL/ENAMETOOLONG must surface as OSError, not
+        // ValueError (paramiko raises IOError for them).
+        assert_eq!(kind_for(status::BAD_MESSAGE), ErrorKind::Io);
+        assert_eq!(kind_for(status::INVALID_FILENAME), ErrorKind::Io);
+        assert_eq!(kind_for(status::INVALID_HANDLE), ErrorKind::InvalidInput);
         let empty = Status {
             code: status::FAILURE,
             message: String::new(),

@@ -527,7 +527,7 @@ impl WorkloadResult {
 /// The full benchmark report.
 #[derive(Debug, Clone)]
 pub struct BenchReport {
-    /// Target URL as given.
+    /// Target URL as given, with any URL password redacted.
     pub url: String,
     /// Canonical protocol.
     pub protocol: &'static str,
@@ -631,6 +631,9 @@ struct Begin {
 
 impl Recorder {
     fn new(stats: Option<Arc<Stats>>, dest_stats: Option<Arc<Stats>>, warmup: usize) -> Self {
+        // A destination served by the same filesystem instance shares its
+        // counters: reporting them twice would count every request twice.
+        let dest_stats = dest_stats.filter(|d| !stats.as_ref().is_some_and(|s| Arc::ptr_eq(s, d)));
         Recorder {
             counters: stats.as_ref().map(|_| Counters::default()),
             dest_counters: dest_stats.as_ref().map(|_| Counters::default()),
@@ -1166,7 +1169,12 @@ impl Ctx<'_> {
         let (dfs, dstats, dbackend, dbase, method) = match &self.dest {
             Some(d) => (
                 d.target.built.fs.clone(),
-                d.target.built.stats.clone(),
+                // Same instance: its requests are already in `stats`.
+                if self.target.same_fs(&d.target) {
+                    None
+                } else {
+                    d.target.built.stats.clone()
+                },
                 d.target.loc.backend,
                 d.base.clone(),
                 ops::copy_method(&self.target, &d.target),
@@ -1213,7 +1221,7 @@ impl Ctx<'_> {
         let params = serde_json::json!({
             "count": self.cfg.count, "file_size": fsize, "concurrency": self.cfg.concurrency,
             "method": format!("{method:?}"),
-            "dest": self.dest.as_ref().map(|d| d.target.loc.url.clone()),
+            "dest": self.dest.as_ref().map(|d| d.target.loc.display_url()),
         });
         Ok(vec![rec.finish(
             Workload::W7,
@@ -1319,6 +1327,25 @@ async fn remove_settled(fs: &dyn FileSystem, path: &str) -> Result<ops::Removed>
     }
 }
 
+/// The topmost missing path among `path` and its ancestors (`path` itself
+/// when its parent exists): what `mkdir(path, create_parents=true)` is
+/// about to create. Stops below the filesystem root, so on object stores it
+/// is at most the bucket/container. An ancestor that cannot be checked
+/// (permission denied) counts as existing: cleanup then stays narrow.
+async fn topmost_missing(fs: &dyn FileSystem, path: &str) -> String {
+    let mut top = fsfast_core::path::normalize(path);
+    loop {
+        let parent = fsfast_core::path::parent(&top);
+        if parent.trim_matches('/').is_empty() || parent == top {
+            return top;
+        }
+        match fs.info(&parent).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => top = parent,
+            _ => return top,
+        }
+    }
+}
+
 /// A unique benchmark directory name.
 pub fn unique_name() -> String {
     let ms = SystemTime::now()
@@ -1356,24 +1383,30 @@ pub async fn run_bench(
     let caps = fs.capabilities();
     if !caps.hierarchical && target.path().trim_matches('/').is_empty() {
         return Err(Error::invalid_input(format!(
-            "{url}: give a bucket/container (e.g. {}://bucket/prefix)",
+            "{}: give a bucket/container (e.g. {}://bucket/prefix)",
+            target.loc.display_url(),
             target.loc.backend.name()
         )));
     }
 
     // The target directory must exist (or be created with --create).
-    let mut created_root = false;
+    // `created_root` is the topmost path --create made (missing parents and
+    // the bucket/container included), removed again at cleanup.
+    let mut created_root = None;
     match fs.info(target.path()).await {
         Ok(i) if i.is_dir() => {}
         Ok(_) => {
-            return Err(Error::not_a_directory(target.path()).with_path(url.to_owned()));
+            return Err(Error::not_a_directory(target.path()).with_path(target.loc.display_url()));
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             if cfg.create {
+                let top = topmost_missing(fs.as_ref(), target.path()).await;
                 ops::mkdir_p(fs.as_ref(), target.path()).await?;
-                created_root = true;
+                created_root = Some(top);
             } else {
-                return Err(e.with_path(url.to_owned()).with_kind(ErrorKind::NotFound));
+                return Err(e
+                    .with_path(target.loc.display_url())
+                    .with_kind(ErrorKind::NotFound));
             }
         }
         Err(e) => return Err(e),
@@ -1381,12 +1414,18 @@ pub async fn run_bench(
 
     let name = unique_name();
     let base = child_path(target.loc.backend, target.path(), &name);
+    // `dest_cleanup`: what to remove on the destination, the topmost
+    // directory `makedirs` created (so missing parents go too).
+    let mut dest_cleanup = None;
     let dest = match dest_target {
         Some(t) => {
             let dbase = child_path(t.loc.backend, t.path(), &name);
+            let mut top = dbase.clone();
             if t.built.fs.capabilities().hierarchical {
+                top = topmost_missing(t.built.fs.as_ref(), &dbase).await;
                 t.built.fs.makedirs(&dbase, true).await?;
             }
+            dest_cleanup = Some(top);
             Some(Dest {
                 target: t,
                 base: dbase,
@@ -1442,8 +1481,8 @@ pub async fn run_bench(
         progress("cleanup: removing the benchmark prefix");
         cleanup.ran = true;
         let mut targets: Vec<(Arc<dyn FileSystem>, String)> = vec![(fs.clone(), base.clone())];
-        if let Some(d) = &ctx.dest {
-            targets.push((d.target.built.fs.clone(), d.base.clone()));
+        if let (Some(d), Some(top)) = (&ctx.dest, &dest_cleanup) {
+            targets.push((d.target.built.fs.clone(), top.clone()));
         }
         for (f, p) in targets {
             match remove_settled(f.as_ref(), &p).await {
@@ -1454,18 +1493,18 @@ pub async fn run_bench(
                 Err(e) => cleanup.errors.push(format!("{p}: {e}")),
             }
         }
-        if created_root {
-            match remove_settled(fs.as_ref(), target.path()).await {
+        if let Some(top) = &created_root {
+            match remove_settled(fs.as_ref(), top).await {
                 Ok(r) => {
                     cleanup.files += r.files;
                     cleanup.dirs += r.dirs;
                 }
-                Err(e) => cleanup.errors.push(format!("{}: {e}", target.path())),
+                Err(e) => cleanup.errors.push(format!("{top}: {e}")),
             }
         }
     }
     Ok(BenchReport {
-        url: url.to_owned(),
+        url: target.loc.display_url(),
         protocol: target.loc.backend.name(),
         prefix: base,
         started,

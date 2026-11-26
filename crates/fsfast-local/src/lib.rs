@@ -242,6 +242,28 @@ enum Opened {
     },
 }
 
+/// Read a non-seekable file (FIFO, character device) sequentially. Only
+/// ranges starting at 0 can be served: fsspec's `cat_file` seeks for any
+/// other start, which fails on a pipe with `ESPIPE`.
+fn read_stream(file: std::fs::File, range: ByteRange) -> std::io::Result<Bytes> {
+    use std::io::Read as _;
+    let limit = match range {
+        ByteRange::Full | ByteRange::From(0) => None,
+        ByteRange::Bounded { start: 0, end } => Some(end),
+        _ => {
+            return Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::SPIPE.raw_os_error(),
+            ));
+        }
+    };
+    let mut buf = Vec::new();
+    match limit {
+        None => (&file).read_to_end(&mut buf)?,
+        Some(n) => file.take(n).read_to_end(&mut buf)?,
+    };
+    Ok(Bytes::from(buf))
+}
+
 /// Open `os` for reading and return the file with its metadata, mapping a
 /// directory to `IsADirectory` on every platform.
 fn open_file(os: &Path, name: &str) -> Result<(std::fs::File, std::fs::Metadata)> {
@@ -455,6 +477,14 @@ impl FileSystem for LocalFileSystem {
         let name = p.clone();
         let opened = blocking_open(os.clone(), move || {
             let (file, meta) = open_file(&os, &name)?;
+            if !meta.is_file() {
+                // A FIFO, character device or socket: its size (0) says
+                // nothing about its content, so read it as a stream, as
+                // fsspec's `open(path, "rb").read()` does.
+                return read_stream(file, range)
+                    .map(Opened::Data)
+                    .map_err(|e| io_err(e, &name));
+            }
             let r = range.resolve(meta.len());
             let len = (r.end - r.start) as usize;
             if len == 0 {
@@ -516,10 +546,7 @@ impl FileSystem for LocalFileSystem {
             if let Err(e) = file.write_all(&data) {
                 let undo = match mode {
                     WriteMode::Append => file.set_len(original_len),
-                    WriteMode::Overwrite | WriteMode::CreateNew => {
-                        drop(file);
-                        std::fs::remove_file(&os)
-                    }
+                    WriteMode::Overwrite | WriteMode::CreateNew => ops::remove_written(file, &os),
                 };
                 if let Err(u) = undo {
                     tracing::warn!(path = %p, "cleaning up after a failed write failed: {u}");

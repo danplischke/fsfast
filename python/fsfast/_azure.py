@@ -718,4 +718,4 @@ class AzureBlobFileSystem(ObjectStoreFileSystem):
             for lp, rp in self._put_pairs(lpath, rpath, recursive, maxdepth):
                 self._put_streamed(lp, rp, mode, extra)
         finally:
-            self._invalidate_paths(rpath)
+            self._invalidate_paths(rpath, tree=True)

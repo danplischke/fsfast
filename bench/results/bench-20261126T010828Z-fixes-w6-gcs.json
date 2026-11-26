@@ -1,0 +1,374 @@
+{
+ "meta": {
+  "created_at": "20261126T010828Z",
+  "label": "fixes-w6-gcs",
+  "profile": "default",
+  "impls": [
+   "fsfast",
+   "reference",
+   "fsf"
+  ],
+  "workloads": [
+   "W6"
+  ],
+  "fsf": "fsf 0.1.0",
+  "fsf_path": "/home/user/fsfast/target/release/fsf",
+  "git": {
+   "sha": "59560c44f7a757de97f799299b54da3b3ee207e2",
+   "dirty": true
+  },
+  "machine": {
+   "host": "vm",
+   "platform": "Linux-6.18.44-fc-v880-x86_64-with-glibc2.39",
+   "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+   "cpus": 4,
+   "mem_gib": 15.7,
+   "python": "3.13.18",
+   "loadavg_start": [
+    1.96630859375,
+    1.40380859375,
+    1.892578125
+   ]
+  },
+  "python_packages": {
+   "fsfast": "0.1.0",
+   "fsspec": "2026.9.0",
+   "s3fs": "2026.9.0",
+   "gcsfs": "2026.8.2",
+   "adlfs": "2026.8.0",
+   "smbprotocol": "1.17.0",
+   "paramiko": "5.1.0",
+   "sshfs": "2026.11.0",
+   "asyncssh": "2.24.1",
+   "aiohttp": "3.14.5",
+   "aiobotocore": "3.10.0",
+   "botocore": "1.43.117",
+   "azure-storage-blob": "12.31.1",
+   "cryptography": "50.0.2"
+  },
+  "services": {
+   "s3 (RustFS)": {
+    "container": "fsfast-s3",
+    "image": "rustfs/rustfs:latest",
+    "image_id": "sha256:ee717072290b",
+    "created": "2026-11-25T16:26:33.009209222Z",
+    "labels": {
+     "version": "v1.0.6"
+    },
+    "version": "rustfs 1.0.6"
+   },
+   "gcs (fake-gcs-server)": {
+    "container": "fsfast-gcs",
+    "image": "fsouza/fake-gcs-server:latest",
+    "image_id": "sha256:797ce226d62f",
+    "created": "2026-11-25T16:26:52.101191537Z",
+    "labels": {
+     "org.opencontainers.image.version": "1.56.1"
+    }
+   },
+   "azure (Azurite)": {
+    "container": "fsfast-azure",
+    "image": "mcr.microsoft.com/azure-storage/azurite:latest",
+    "image_id": "sha256:c26024d62bf4",
+    "created": "2026-11-25T16:27:12.60802538Z",
+    "version": "3.38.0"
+   },
+   "smb (Samba smbd)": "Version 4.19.5-Ubuntu",
+   "sftp (OpenSSH sshd)": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+   "http (nginx)": "nginx version: nginx/1.24.0 (Ubuntu)",
+   "smbclient": "Version 4.19.5-Ubuntu",
+   "ssh client": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+   "curl": "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3 brotli/1.1.0 zstd/1.5.5 libidn2/2.3.7 libpsl/0.21.2 (+libidn2/2.3.7) libssh/0.10.6/openssl/zlib nghttp2/1.59.0 librtmp/2.3 OpenLDAP/2.6.10"
+  },
+  "fsf_extra_args": [],
+  "local_dir": "/tmp",
+  "loadavg_end": [
+   1.640625,
+   1.3974609375,
+   1.87060546875
+  ]
+ },
+ "params": {
+  "size": 268435456,
+  "chunk": 8388608,
+  "small_count": 1000,
+  "small_size": 4096,
+  "info_count": 1000,
+  "ls_entries": 10000,
+  "ranges": 500,
+  "range_size": 65536,
+  "copy_count": 64,
+  "copy_size": 4194304,
+  "delete_count": 5000,
+  "repeat": 3,
+  "warmup": 1,
+  "concurrency": 32,
+  "seed": 24301
+ },
+ "runs": [
+  {
+   "impl": "fsfast",
+   "target": "gcs",
+   "root": "fsbench-20261126t010828z-8354-fsfast",
+   "results": [
+    {
+     "workload": "W6",
+     "name": "random-read",
+     "description": "cat_ranges() of `ranges` random range_size ranges of the large object",
+     "impl": "fsfast",
+     "params": {
+      "size": 268435456,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.067841,
+      0.074746,
+      0.071197
+     ],
+     "best_s": 0.067841,
+     "median_s": 0.071197,
+     "bytes_per_iter": 32768000,
+     "ops_per_iter": 500,
+     "mb_per_s": {
+      "best": 483.0107085792038,
+      "median": 460.24667776071294
+     },
+     "ops_per_s": {
+      "best": 7370.1585171387305,
+      "median": 7022.806972667128
+     },
+     "cpu_s": {
+      "best": 0.064954,
+      "median": 0.069953
+     },
+     "stats_last_iter": {
+      "requests": 325,
+      "errors": 0,
+      "bytes_read": 45380337,
+      "bytes_written": 0,
+      "retries": 0,
+      "throttles": 0,
+      "ops": {
+       "info": {
+        "count": 1,
+        "mean_us": 963.0,
+        "p50_us": 963.0,
+        "p90_us": 963.0,
+        "p99_us": 963.0,
+        "max_us": 963.0
+       },
+       "read": {
+        "count": 324,
+        "mean_us": 2441.0,
+        "p50_us": 1991.0000000000002,
+        "p90_us": 4698.0,
+        "p99_us": 7936.0,
+        "max_us": 8627.0
+       }
+      },
+      "source": "wire",
+      "calls": {
+       "requests": 1,
+       "errors": 0,
+       "bytes_read": 32768000,
+       "bytes_written": 0,
+       "retries": 0,
+       "throttles": 0,
+       "ops": {
+        "read": {
+         "count": 1,
+         "mean_us": 65675.0,
+         "p50_us": 65675.0,
+         "p90_us": 65675.0,
+         "p99_us": 65675.0,
+         "max_us": 65675.0
+        }
+       }
+      }
+     }
+    }
+   ],
+   "class": "fsfast._gcs.GCSFileSystem",
+   "wall_s": 10.856,
+   "max_rss_mib": 132.2,
+   "exit_code": 0,
+   "loadavg_before": [
+    2.04931640625,
+    1.4306640625,
+    1.89892578125
+   ],
+   "loadavg_after": [
+    1.88720703125,
+    1.416015625,
+    1.88916015625
+   ],
+   "description": "fsfast.GCSFileSystem"
+  },
+  {
+   "impl": "reference",
+   "target": "gcs",
+   "root": "fsbench-20261126t010828z-8354-reference",
+   "results": [
+    {
+     "workload": "W6",
+     "name": "random-read",
+     "description": "cat_ranges() of `ranges` random range_size ranges of the large object",
+     "impl": "reference",
+     "params": {
+      "size": 268435456,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301
+     },
+     "warmup": 1,
+     "iterations": 3,
+     "times_s": [
+      0.287669,
+      0.282845,
+      0.284198
+     ],
+     "best_s": 0.282845,
+     "median_s": 0.284198,
+     "bytes_per_iter": 32768000,
+     "ops_per_iter": 500,
+     "mb_per_s": {
+      "best": 115.85139178242378,
+      "median": 115.29976794333491
+     },
+     "ops_per_s": {
+      "best": 1767.7519498050503,
+      "median": 1759.3348380025468
+     },
+     "cpu_s": {
+      "best": 0.286364,
+      "median": 0.289797
+     }
+    }
+   ],
+   "class": "gcsfs.core.GCSFileSystem",
+   "wall_s": 15.397,
+   "max_rss_mib": 136.0,
+   "exit_code": 0,
+   "loadavg_before": [
+    1.88720703125,
+    1.416015625,
+    1.88916015625
+   ],
+   "loadavg_after": [
+    1.7578125,
+    1.4111328125,
+    1.88037109375
+   ],
+   "description": "gcsfs.GCSFileSystem"
+  },
+  {
+   "impl": "fsf",
+   "target": "gcs",
+   "results": [
+    {
+     "best_s": 0.067795484,
+     "bytes_per_iter": 32768000,
+     "description": "--ranges random reads of --range-size from one --size file",
+     "iterations": 3,
+     "latency_ms": {
+      "count": 1500,
+      "kind": "op",
+      "max": 19.027149,
+      "mean": 4.719505850000005,
+      "min": 0.529467,
+      "p50": 3.997433,
+      "p90": 9.285079,
+      "p99": 14.240485
+     },
+     "mb_per_s": {
+      "best": 483.3360286947726,
+      "median": 394.55928656051816
+     },
+     "median_s": 0.083049623,
+     "name": "random-read",
+     "ops_per_iter": 500,
+     "ops_per_s": {
+      "best": 7375.122508159982,
+      "median": 6020.4969262774375
+     },
+     "params": {
+      "concurrency": 32,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301,
+      "size": 268435456
+     },
+     "stats": {
+      "bytes_read": 98306745,
+      "bytes_written": 0,
+      "errors": 0,
+      "requests": 1503,
+      "requests_by_op": {
+       "info": 3,
+       "read": 1500
+      },
+      "retries": 0,
+      "throttles": 0
+     },
+     "times_s": [
+      0.067795484,
+      0.088348668,
+      0.083049623
+     ],
+     "warmup": 1,
+     "workload": "W6",
+     "impl": "fsf",
+     "fsf_group": "big"
+    }
+   ],
+   "groups": [
+    {
+     "group": "big",
+     "url": "gs://fsbench-20261126t010828z-8354-fsf-big",
+     "config": {
+      "block_size": null,
+      "concurrency": 32,
+      "count": 256,
+      "dest": null,
+      "dirs": null,
+      "file_size": 16384,
+      "io_concurrency": null,
+      "iterations": 3,
+      "range_size": 65536,
+      "ranges": 500,
+      "seed": 24301,
+      "size": 268435456,
+      "warmup": 1,
+      "workloads": [
+       "W6"
+      ]
+     },
+     "cleanup": {
+      "errors": [],
+      "ran": true,
+      "removed_dirs": 1,
+      "removed_files": 1
+     },
+     "error": null,
+     "exit_code": 0
+    }
+   ],
+   "version": "0.1.0",
+   "wall_s": 9.885,
+   "loadavg_before": [
+    1.7578125,
+    1.4111328125,
+    1.88037109375
+   ],
+   "loadavg_after": [
+    1.640625,
+    1.3974609375,
+    1.87060546875
+   ]
+  }
+ ]
+}

@@ -3,20 +3,66 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 import os
 import re
+from collections.abc import Callable
 from typing import Any
 
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.spec import AbstractFileSystem
 from fsspec.utils import glob_translate, tokenize
 
+from . import _core
 from ._base import FsfastFileSystem
 
 __all__ = ["HTTPFileSystem"]
 
 #: fsspec http: "?" is not a glob character in URLs.
 _MAGIC = re.compile("([*[])")
+
+#: Per-call keywords that fsspec's http merges into every request
+#: (``kw = self.kwargs.copy(); kw.update(kwargs)``) and the Rust client
+#: understands as request options (``apply_request_kwargs``).
+_REQUEST_KWARGS = frozenset(
+    {
+        "headers",
+        "auth",
+        "timeout",
+        "ssl",
+        "verify_ssl",
+        "proxy",
+        "proxy_auth",
+        "allow_redirects",
+        "max_redirects",
+        "cookies",
+        "params",
+    }
+)
+
+#: Clients built for distinct per-call request options kept per instance.
+_MAX_REQUEST_CLIENTS = 16
+
+
+def _per_request(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Apply per-call request keywords (``headers=``, ``auth=``, ...) to
+    every request ``method`` makes, as fsspec's http does: the method runs
+    on a view of the filesystem whose Rust client has the instance's
+    options updated with them."""
+    if inspect.iscoroutinefunction(method):
+
+        @functools.wraps(method)
+        async def awrapper(self: HTTPFileSystem, *args: Any, **kwargs: Any) -> Any:
+            return await method(self._for_request(kwargs), *args, **kwargs)
+
+        return awrapper
+
+    @functools.wraps(method)
+    def wrapper(self: HTTPFileSystem, *args: Any, **kwargs: Any) -> Any:
+        return method(self._for_request(kwargs), *args, **kwargs)
+
+    return wrapper
 
 
 def _has_magic(s: str) -> bool:
@@ -49,6 +95,8 @@ class HTTPFileSystem(FsfastFileSystem):
     _pipe_defers_in_transaction = False
     # No directories to create: put() skips local directories.
     _implicit_dirs = True
+    # fsspec's http is an AsyncFileSystem.
+    _fsspec_batches = True
 
     def __init__(
         self,
@@ -100,6 +148,45 @@ class HTTPFileSystem(FsfastFileSystem):
         opts = {k: v for k, v in opts.items() if v is not None}
         super().__init__(asynchronous=asynchronous, loop=loop, **opts)
 
+    def _rust_options(self, storage_options: dict[str, Any]) -> dict[str, Any]:
+        opts = super()._rust_options(storage_options)
+        # Kept to build clients for per-call request options.
+        self._base_rust_options = dict(opts)
+        return opts
+
+    def _request_rfs(self, request: dict[str, Any]) -> Any:
+        """The Rust filesystem for per-call request options: the instance's
+        options updated with ``request`` (one client per distinct set,
+        reused; a few are kept)."""
+        clients: dict[str, Any] = self.__dict__.setdefault("_request_clients", {})
+        key = tokenize(request)
+        rfs = clients.get(key)
+        if rfs is None:
+            opts = dict(self._base_rust_options)
+            opts.update(request)
+            rfs = _core.make_filesystem(self._rust_protocol, opts)
+            while len(clients) >= _MAX_REQUEST_CLIENTS:
+                clients.pop(next(iter(clients))).close()
+            clients[key] = rfs
+        return rfs
+
+    def _for_request(self, kwargs: dict[str, Any]) -> HTTPFileSystem:
+        """Remove the request keywords from ``kwargs``; with any, return a
+        view of this filesystem (same state, dircache shared) whose requests
+        carry them, else ``self``."""
+        request = {k: kwargs.pop(k) for k in [k for k in kwargs if k in _REQUEST_KWARGS]}
+        if not request:
+            return self
+        view = object.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        view._rfs = self._request_rfs(request)
+        return view
+
+    def close(self) -> None:
+        super().close()
+        for rfs in list(self.__dict__.get("_request_clients", {}).values()):
+            rfs.close()
+
     @property
     def fsid(self) -> str:
         return "http"
@@ -123,6 +210,7 @@ class HTTPFileSystem(FsfastFileSystem):
     # ------------------------------------------------------------------
     # listings (cached in dircache, like fsspec)
 
+    @_per_request
     def ls(self, url: Any, detail: bool = True, **kwargs: Any) -> list[Any]:
         if self.use_listings_cache and url in self.dircache:
             out = self.dircache[url]
@@ -131,6 +219,7 @@ class HTTPFileSystem(FsfastFileSystem):
             self.dircache[url] = out
         return out
 
+    @_per_request
     async def _ls(self, url: Any, detail: bool = True, **kwargs: Any) -> list[Any]:
         if self.use_listings_cache and url in self.dircache:
             out = self.dircache[url]
@@ -157,6 +246,7 @@ class HTTPFileSystem(FsfastFileSystem):
     async def _isfile(self, path: Any, **kwargs: Any) -> bool:
         return await self._exists(path, **kwargs)
 
+    @_per_request
     def exists(self, path: Any, strict: bool = False, **kwargs: Any) -> bool:
         try:
             return self._rfs.exists(path)
@@ -167,6 +257,7 @@ class HTTPFileSystem(FsfastFileSystem):
                 raise
             return False
 
+    @_per_request
     async def _exists(self, path: Any, strict: bool = False, **kwargs: Any) -> bool:
         try:
             return await self._rfs.exists_async(path)
@@ -177,6 +268,7 @@ class HTTPFileSystem(FsfastFileSystem):
                 raise
             return False
 
+    @_per_request
     def du(self, path: Any, total: bool = True, maxdepth: int | None = None, withdirs: bool = False, **kwargs: Any) -> Any:
         # Listings carry no sizes: fsspec's (async) du asks info() for each
         # file; fsfast does that as one concurrent batch.
@@ -185,6 +277,7 @@ class HTTPFileSystem(FsfastFileSystem):
         sizes = {i["name"]: i["size"] for i in infos}
         return sum(sizes.values()) if total else sizes
 
+    @_per_request
     async def _du(self, path: Any, total: bool = True, maxdepth: int | None = None, **kwargs: Any) -> Any:
         names = await self._find(path, maxdepth=maxdepth, **kwargs)
         infos = await self._rfs.info_many_async(names, on_error="raise")
@@ -231,6 +324,7 @@ class HTTPFileSystem(FsfastFileSystem):
         }
         return out if detail else list(out)
 
+    @_per_request
     def glob(self, path: Any, maxdepth: int | None = None, **kwargs: Any) -> Any:
         if maxdepth is not None and maxdepth < 1:
             raise ValueError("maxdepth must be at least 1")
@@ -243,6 +337,7 @@ class HTTPFileSystem(FsfastFileSystem):
         allpaths = self.find(root, maxdepth=depth, withdirs=True, detail=True)
         return self._glob_filter(allpaths, pattern, append_slash, detail)
 
+    @_per_request
     async def _glob(self, path: Any, maxdepth: int | None = None, **kwargs: Any) -> Any:
         if maxdepth is not None and maxdepth < 1:
             raise ValueError("maxdepth must be at least 1")
@@ -307,8 +402,12 @@ class HTTPFileSystem(FsfastFileSystem):
     ) -> Any:
         from ._file import FsfastFile
 
+        rust_fs = None
         if mode == "rb":
             block_size = block_size if block_size is not None else self.block_size
+            # Request options apply to every request of the file (the
+            # metadata request at open and the ranged reads).
+            rust_fs = self._for_request(kwargs)._rfs
         return FsfastFile(
             self,
             path,
@@ -318,4 +417,21 @@ class HTTPFileSystem(FsfastFileSystem):
             cache_type=cache_type or "readahead",
             cache_options=cache_options or self.cache_options,
             extra=kwargs or None,
+            rust_fs=rust_fs,
         )
+
+    # Inherited methods that make requests take per-call request options
+    # too (fsspec's http passes ``**kwargs`` to every request).
+    info = _per_request(FsfastFileSystem.info)
+    _info = _per_request(FsfastFileSystem._info)
+    cat_file = _per_request(FsfastFileSystem.cat_file)
+    _cat_file = _per_request(FsfastFileSystem._cat_file)
+    cat = _per_request(FsfastFileSystem.cat)
+    _cat = _per_request(FsfastFileSystem._cat)
+    cat_ranges = _per_request(FsfastFileSystem.cat_ranges)
+    _cat_ranges = _per_request(FsfastFileSystem._cat_ranges)
+    find = _per_request(FsfastFileSystem.find)
+    _find = _per_request(FsfastFileSystem._find)
+    get_file = _per_request(FsfastFileSystem.get_file)
+    _get_file = _per_request(FsfastFileSystem._get_file)
+    get = _per_request(FsfastFileSystem.get)

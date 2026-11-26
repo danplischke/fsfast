@@ -37,6 +37,7 @@ struct FsSlot {
     generation: u64,
     fs: DynFileSystem,
     any: AnyFs,
+    wire: Option<Arc<Stats>>,
 }
 
 /// Shared state of a `RustFileSystem`.
@@ -62,6 +63,7 @@ impl FsInner {
                 generation: crate::runtime::fork_generation(),
                 fs: built.fs,
                 any: built.any,
+                wire: built.wire,
             }),
             stats: Arc::new(Stats::new()),
         })
@@ -80,6 +82,12 @@ impl FsInner {
         Ok(self.slot()?.any.clone())
     }
 
+    /// The backend's wire-request counters (`None` for in-process
+    /// backends, whose "requests" are the calls counted in `stats`).
+    pub(crate) fn wire_stats(&self) -> Option<Arc<Stats>> {
+        self.slot().ok().and_then(|s| s.wire.clone())
+    }
+
     fn slot(&self) -> Result<Arc<FsSlot>> {
         let slot = self.slot.load_full();
         let generation = crate::runtime::fork_generation();
@@ -91,6 +99,7 @@ impl FsInner {
             generation,
             fs: built.fs,
             any: built.any,
+            wire: built.wire,
         });
         self.slot.store(fresh.clone());
         Ok(fresh)
@@ -468,6 +477,184 @@ pub(crate) async fn cat_file(
     Ok(PyOut::Bytes(data))
 }
 
+/// Results of at least this size are read straight into the Python `bytes`
+/// object by the sync `cat_file` (see [`cat_file_start`]) instead of being
+/// assembled in a Rust buffer and copied. It is also the size of the first
+/// read, so a smaller file is still one backend `cat_file` call (one
+/// request on object stores), exactly as before.
+pub(crate) const DIRECT_CAT_MIN: usize = 16 << 20;
+
+/// First phase of the sync `cat_file`.
+pub(crate) enum CatStart {
+    /// The result is complete (small file, or a range that needs no
+    /// direct read).
+    Done(Bytes),
+    /// A large result: the caller allocates the `bytes` object and fills
+    /// it with [`DirectCat::fill`].
+    Direct(DirectCat),
+}
+
+/// A large `cat_file` result still to be read into its final buffer.
+pub(crate) struct DirectCat {
+    fs: Arc<FsInner>,
+    handle: Arc<dyn fsfast_core::ReadHandle>,
+    /// File offset of the result's first byte.
+    offset: u64,
+    /// Length of the result (from the handle's size).
+    pub len: usize,
+    /// Data already read at `offset` (copied in instead of read again).
+    pub head: Bytes,
+    part: usize,
+    conc: usize,
+}
+
+impl DirectCat {
+    /// Fill `dst` (exactly `len` bytes): copy `head`, read the rest with
+    /// parallel ranged reads through the handle, close it. Returns the
+    /// number of bytes filled (less than `len` if the file shrank).
+    pub(crate) async fn fill(self, dst: &mut [u8]) -> Result<usize> {
+        let h = self.head.len().min(dst.len());
+        dst[..h].copy_from_slice(&self.head[..h]);
+        let fs = self.fs.clone();
+        let read = async {
+            fsfast_engine::read_parallel_into(
+                &self.handle,
+                self.offset + h as u64,
+                &mut dst[h..],
+                self.part,
+                self.conc,
+                None,
+            )
+            .await
+        };
+        let got = fs.stats.measure(OpKind::Read, read).await;
+        let closed = self.handle.close().await;
+        let got = got?;
+        closed?;
+        let total = h + got;
+        fs.stats.add_bytes_read(total as u64);
+        Ok(total)
+    }
+}
+
+/// First phase of the sync `cat_file(path, start, end)`.
+///
+/// Small results come back complete. For a result of at least
+/// [`DIRECT_CAT_MIN`] bytes, the first `DIRECT_CAT_MIN` bytes are read
+/// with the backend's `cat_file` (which also tells a small file from a
+/// large one without a metadata request), then a read handle is opened and
+/// the caller reads the rest straight into the final Python `bytes`
+/// object: no second full-size buffer and no copy of it.
+///
+/// Backends whose handles pin reads to the version seen at open time
+/// (object stores, http) read the first part again through the handle, so
+/// the result is one consistent version, as their own `cat_file` is; the
+/// cost is `DIRECT_CAT_MIN` bytes more per large read.
+pub(crate) async fn cat_file_start(
+    fs: Arc<FsInner>,
+    path: String,
+    start: Option<i64>,
+    end: Option<i64>,
+    seek_read: bool,
+) -> Result<CatStart> {
+    let b = fs.fs()?;
+    let small = |fs: Arc<FsInner>, b: DynFileSystem, path: String| async move {
+        cat_one(&fs, &b, &path, start, end, seek_read)
+            .await
+            .map(CatStart::Done)
+    };
+    if range_needs_size(start, end, seek_read) {
+        return small(fs, b, path).await;
+    }
+    let (s, e) = match resolve_range(start, end, None, seek_read) {
+        Ok(ByteRange::Full) => (0, None),
+        Ok(ByteRange::From(s)) => (s, None),
+        Ok(ByteRange::Bounded { start, end })
+            if end.saturating_sub(start) >= DIRECT_CAT_MIN as u64 =>
+        {
+            (start, Some(end))
+        }
+        _ => return small(fs, b, path).await,
+    };
+    if fs.backend.name() == "memory" {
+        // The memory store's `cat_file` is a zero-copy slice, so the plain
+        // path already makes one (parallel) copy into the result.
+        return small(fs, b, path).await;
+    }
+    if fs.wire_stats().is_none() {
+        // In-process backends (local, memory): a metadata lookup costs a
+        // `stat` or a map lookup, so look before reading instead of
+        // probing. Anything but a large regular file (a FIFO's content is
+        // not its size) takes the plain path, which also raises its errors.
+        match fs.stats.measure(OpKind::Info, b.info(&path)).await {
+            Ok(i) if i.is_file() && i.size.saturating_sub(s) >= DIRECT_CAT_MIN as u64 => {}
+            _ => return small(fs, b, path).await,
+        }
+        let handle = fs
+            .stats
+            .measure(OpKind::Open, b.open_read(&path, &ReadOptions::default()))
+            .await?;
+        let size = handle.size();
+        let want_end = e.unwrap_or(size).min(size);
+        let len = usize::try_from(want_end.saturating_sub(s))
+            .map_err(|_| Error::new(ErrorKind::Io, "file too large for memory").with_path(&path))?;
+        let hints = b.io_hints();
+        return Ok(CatStart::Direct(DirectCat {
+            fs: fs.clone(),
+            handle,
+            offset: s,
+            len,
+            head: Bytes::new(),
+            part: hints.request_size.max(256 << 10),
+            conc: hints.max_concurrency.max(1),
+        }));
+    }
+    let probe_end = s.saturating_add(DIRECT_CAT_MIN as u64);
+    let head = fs
+        .stats
+        .measure(
+            OpKind::Read,
+            b.cat_file(
+                &path,
+                ByteRange::Bounded {
+                    start: s,
+                    end: probe_end,
+                },
+            ),
+        )
+        .await?;
+    if head.len() < DIRECT_CAT_MIN || e == Some(probe_end) {
+        fs.stats.add_bytes_read(head.len() as u64);
+        return Ok(CatStart::Done(head));
+    }
+    let handle = fs
+        .stats
+        .measure(OpKind::Open, b.open_read(&path, &ReadOptions::default()))
+        .await?;
+    let size = handle.size();
+    let want_end = e.unwrap_or(size).min(size);
+    let reuse_head = !b.capabilities().pinned_reads;
+    if reuse_head && want_end <= s + head.len() as u64 {
+        // The file shrank between the two calls: what was read is all.
+        let _ = handle.close().await;
+        let n = want_end.saturating_sub(s) as usize;
+        fs.stats.add_bytes_read(n as u64);
+        return Ok(CatStart::Done(head.slice(..n)));
+    }
+    let len = usize::try_from(want_end.saturating_sub(s))
+        .map_err(|_| Error::new(ErrorKind::Io, "file too large for memory").with_path(&path))?;
+    let hints = b.io_hints();
+    Ok(CatStart::Direct(DirectCat {
+        fs: fs.clone(),
+        handle,
+        offset: s,
+        len,
+        head: if reuse_head { head } else { Bytes::new() },
+        part: hints.request_size.max(256 << 10),
+        conc: hints.max_concurrency.max(1),
+    }))
+}
+
 /// Whole contents of many files.
 pub(crate) async fn cat_many(
     fs: Arc<FsInner>,
@@ -536,7 +723,7 @@ async fn read_group(
     }
     let mut data = fs
         .stats
-        .measure(OpKind::Read, b.cat_ranges(path, &ranges))
+        .measure(OpKind::Read, read_ranges_guarded(b, path, &ranges))
         .await?
         .into_iter();
     if data.len() != ranges.len() {
@@ -558,6 +745,118 @@ async fn read_group(
         })
         .collect();
     fs.stats.add_bytes_read(total);
+    Ok(out)
+}
+
+/// Gaps up to this size are always bridged when merging ranges (within
+/// the backend's own `coalesce_gap`): below it, a separate request costs
+/// more than the bytes.
+const MIN_BRIDGED_GAP: u64 = 64 << 10;
+
+/// Alignment of the requests [`read_ranges_guarded`] sends.
+const PAGE: u64 = 4096;
+
+/// Group `ranges` like [`fsfast_core::coalesce_ranges`] with the backend's
+/// `coalesce_gap`/`max_coalesced` (PLAN §4.5), plus a read-amplification
+/// guard: a gap is bridged only if it is no larger than the requested
+/// bytes it joins (or at most [`MIN_BRIDGED_GAP`]). Dense ranges merge
+/// exactly as before; small isolated ranges stay separate requests instead
+/// of being chained into one huge read (500 random 64 KiB reads of a
+/// 256 MiB object fetched 163 MiB for 31 MiB with a plain 1 MiB gap).
+/// Every group stays within the plain rule's groups, so the plan only ever
+/// splits them. Empty ranges are not grouped.
+pub(crate) fn plan_ranges(
+    ranges: &[Range<u64>],
+    gap: u64,
+    max_len: u64,
+) -> Vec<(Range<u64>, Vec<usize>)> {
+    let mut order: Vec<usize> = (0..ranges.len())
+        .filter(|&i| ranges[i].end > ranges[i].start)
+        .collect();
+    order.sort_by_key(|&i| (ranges[i].start, ranges[i].end));
+    let max_len = max_len.max(1);
+    // (range, members, requested bytes)
+    let mut out: Vec<(Range<u64>, Vec<usize>, u64)> = Vec::new();
+    for i in order {
+        let r = &ranges[i];
+        let want = r.end - r.start;
+        if let Some((g, members, useful)) = out.last_mut() {
+            let hole = r.start.saturating_sub(g.end);
+            let new_end = g.end.max(r.end);
+            let bridged = hole <= gap && hole <= (*useful + want).max(MIN_BRIDGED_GAP.min(gap));
+            if bridged && new_end - g.start <= max_len {
+                g.end = new_end;
+                members.push(i);
+                *useful += want;
+                continue;
+            }
+        }
+        out.push((r.clone(), vec![i], want));
+    }
+    out.into_iter().map(|(r, m, _)| (r, m)).collect()
+}
+
+/// Read `ranges` of one file. When the backend's own coalescing would
+/// merge ranges that [`plan_ranges`] keeps apart, the planned groups are
+/// read through one handle (its `read_at`, concurrently); otherwise the
+/// backend's `cat_ranges` runs unchanged (it may save a metadata request
+/// or batch on the wire).
+async fn read_ranges_guarded(
+    b: &DynFileSystem,
+    path: &str,
+    ranges: &[Range<u64>],
+) -> Result<Vec<Bytes>> {
+    let hints = b.io_hints();
+    let open_ended = ranges.iter().any(|r| r.end == u64::MAX);
+    let plain =
+        fsfast_core::coalesce_ranges(ranges, hints.coalesce_gap, hints.max_coalesced.max(1))
+            .iter()
+            .filter(|g| g.range.end > g.range.start)
+            .count();
+    let plan = plan_ranges(ranges, hints.coalesce_gap, hints.max_coalesced);
+    if open_ended || plan.len() <= plain {
+        return b.cat_ranges(path, ranges).await;
+    }
+    tracing::debug!(
+        path,
+        ranges = ranges.len(),
+        plain,
+        planned = plan.len(),
+        "cat_ranges: amplification guard split merged reads"
+    );
+    let h = b.open_read(path, &ReadOptions::default()).await?;
+    let fetched: Vec<Result<(Vec<usize>, u64, Bytes)>> =
+        stream::iter(plan.into_iter().map(|(g, members)| {
+            let h = &h;
+            async move {
+                // Requests start and end on 4 KiB boundaries (at most 8 KiB
+                // more per request): servers read whole pages anyway, and
+                // nginx's sendfile responses for ranges starting mid-page
+                // were seen to stall ~40 ms each (delayed ACK) with the HTTP
+                // client, which aligned ranges never did.
+                let start = g.start & !(PAGE - 1);
+                let end = g.end.div_ceil(PAGE).saturating_mul(PAGE);
+                let data = h.read_at(start, (end - start) as usize).await?;
+                Ok((members, start, data))
+            }
+        }))
+        .buffer_unordered(hints.max_concurrency.max(1))
+        .collect()
+        .await;
+    let closed = h.close().await;
+    let mut out = vec![Bytes::new(); ranges.len()];
+    for item in fetched {
+        let (members, base, data) = item?;
+        for i in members {
+            let r = &ranges[i];
+            let s = ((r.start - base) as usize).min(data.len());
+            let e = ((r.end - base) as usize).min(data.len());
+            if s < e {
+                out[i] = data.slice(s..e);
+            }
+        }
+    }
+    closed?;
     Ok(out)
 }
 
@@ -1133,6 +1432,65 @@ mod tests {
         assert!(range_needs_size(None, Some(-3), true));
         assert!(!range_needs_size(Some(1), Some(3), true));
         assert!(!range_needs_size(Some(-1), None, true));
+    }
+
+    #[test]
+    fn range_plan_bounds_read_amplification() {
+        const MIB: u64 = 1 << 20;
+        let (gap, max) = (MIB, 32 * MIB);
+        let fetched = |plan: &[(Range<u64>, Vec<usize>)]| -> u64 {
+            plan.iter().map(|(r, _)| r.end - r.start).sum()
+        };
+        // Dense ranges (column chunks with small holes) merge as the plain
+        // rule merges them.
+        let dense: Vec<Range<u64>> = (0..20)
+            .map(|i| i * 2 * MIB..i * 2 * MIB + 3 * MIB / 2)
+            .collect();
+        let plan = plan_ranges(&dense, gap, max);
+        let plain = fsfast_core::coalesce_ranges(&dense, gap, max);
+        assert_eq!(plan.len(), plain.len());
+        assert_eq!(plan[0].0, plain[0].range);
+        // Small isolated reads (W6: 500 x 64 KiB over 256 MiB) stay apart.
+        let mut x: u64 = 42;
+        let sparse: Vec<Range<u64>> = (0..500)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let off = (x >> 16) % (256 * MIB - 65536);
+                off..off + 65536
+            })
+            .collect();
+        let want: u64 = 500 * 65536;
+        let plain = fsfast_core::coalesce_ranges(&sparse, gap, max);
+        let plain_bytes: u64 = plain.iter().map(|g| g.range.end - g.range.start).sum();
+        assert!(
+            plain_bytes > 3 * want,
+            "the plain rule amplifies: {plain_bytes}"
+        );
+        let plan = plan_ranges(&sparse, gap, max);
+        assert!(
+            fetched(&plan) <= 2 * want + 64 * 1024 * 500,
+            "{}",
+            fetched(&plan)
+        );
+        assert!(plan.len() > plain.len());
+        // Every range is covered by its group exactly once.
+        let mut seen = vec![0; sparse.len()];
+        for (g, members) in &plan {
+            for &i in members {
+                assert!(g.start <= sparse[i].start && sparse[i].end <= g.end);
+                seen[i] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1));
+        // Small holes are always bridged; overlaps merge; max_len holds.
+        let small = [0..10, 20..30, 25..40];
+        assert_eq!(plan_ranges(&small, gap, max).len(), 1);
+        assert_eq!(plan_ranges(&small, 0, max).len(), 2);
+        assert_eq!(plan_ranges(&[0..10, 10..20], gap, 15).len(), 2);
+        let empty: Vec<Range<u64>> = vec![5..5, 9..9];
+        assert!(plan_ranges(&empty, gap, max).is_empty());
     }
 
     #[test]

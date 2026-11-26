@@ -507,6 +507,54 @@ async fn adc_file_from_the_environment() {
     assert_eq!(fs.auth_method(), "auto");
 }
 
+/// An ADC file of a credential type fsfast does not implement (workload
+/// identity federation, impersonation) is reported for `token=None` too,
+/// instead of silently falling back to anonymous access: gcsfs would
+/// authenticate with it.
+#[test]
+fn unsupported_adc_type_is_not_silently_anonymous() {
+    let dir = tempfile::tempdir().unwrap();
+    for t in [
+        "external_account",
+        "external_account_authorized_user",
+        "impersonated_service_account",
+    ] {
+        let path = dir.path().join(format!("{t}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"type": t, "audience": "//iam.googleapis.com/x"})).unwrap(),
+        )
+        .unwrap();
+        let env = GcsEnv::from_pairs([
+            ("GOOGLE_APPLICATION_CREDENTIALS", path.to_str().unwrap()),
+            ("NO_GCE_CHECK", "true"),
+        ]);
+        for token in [None, Some("google_default")] {
+            let pairs: Vec<(&str, Value)> = token
+                .map(|v| ("token", Value::from(v)))
+                .into_iter()
+                .collect();
+            let e = GCSFileSystem::from_options_with_env(
+                opts("http://127.0.0.1:9", &pairs),
+                env.clone(),
+            )
+            .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Unsupported, "{t} {token:?}: {e}");
+            assert!(e.to_string().contains(t), "{e}");
+        }
+    }
+    // A broken ADC file still falls through for token=None (gcsfs tries
+    // the next method).
+    let path = dir.path().join("broken.json");
+    std::fs::write(&path, b"{\"type\": \"nonsense\"}").unwrap();
+    let env = GcsEnv::from_pairs([
+        ("GOOGLE_APPLICATION_CREDENTIALS", path.to_str().unwrap()),
+        ("NO_GCE_CHECK", "true"),
+    ]);
+    let fs = fs_with("http://127.0.0.1:9", &[], env);
+    assert_eq!(fs.auth_method(), "auto");
+}
+
 #[tokio::test]
 async fn requester_pays_bills_the_user_project() {
     let mock = Mock::start(|s| {

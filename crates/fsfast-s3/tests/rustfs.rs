@@ -351,3 +351,42 @@ async fn reads_writes_and_copies() {
     assert_eq!(resp.bytes().await.unwrap().len(), big.len() + 4);
     destroy_bucket(&fs, &b).await;
 }
+
+/// The copied part of an append is pinned to the version `open` saw: an
+/// overwrite before `close` fails the append instead of appending to the
+/// new content (RustFS enforces `x-amz-copy-source-if-match`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_parts_are_pinned_to_the_source_version() {
+    let Some(env) = s3_env() else {
+        return skip("copy_parts_are_pinned_to_the_source_version");
+    };
+    let fs = filesystem(&env, &[]);
+    let b = unique_bucket("pin");
+    fs.mkdir(&b, true).await.unwrap();
+    let p = format!("{b}/obj");
+    let w = WriteOptions::default();
+    fs.pipe_file(&p, Bytes::from(vec![b'A'; 6 << 20]), &w)
+        .await
+        .unwrap();
+    let opts = WriteOptions {
+        mode: WriteMode::Append,
+        ..WriteOptions::default()
+    };
+    // Unchanged source: the append works.
+    let mut h = fs.open_write(&p, &opts).await.unwrap();
+    h.write(Bytes::from_static(b"tail")).await.unwrap();
+    h.close().await.unwrap();
+    assert_eq!(fs.info(&p).await.unwrap().size, (6 << 20) + 4);
+    // Overwritten between open and close: PreconditionFailed.
+    let mut h = fs.open_write(&p, &opts).await.unwrap();
+    h.write(Bytes::from_static(b"tail")).await.unwrap();
+    fs.pipe_file(&p, Bytes::from(vec![b'B'; 6 << 20]), &w)
+        .await
+        .unwrap();
+    let res = h.close().await;
+    let data = fs.cat_file(&p, ByteRange::Full).await.unwrap();
+    destroy_bucket(&fs, &b).await;
+    let err = res.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "{err}");
+    assert_eq!(data, Bytes::from(vec![b'B'; 6 << 20]));
+}

@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import errno
 import functools
+import inspect
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from glob import has_magic
 from typing import Any
 
@@ -28,28 +29,52 @@ from ._base import FsfastFileSystem, _is_exc
 __all__ = ["ObjectStoreFileSystem"]
 
 
-def _invalidating(method: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap a sync mutating method: invalidate the paths it touched."""
+def _touched(method: Callable[..., Any], names: tuple[str, ...]) -> Callable[..., list[Any]]:
+    """A function returning the arguments named ``names`` of a call to
+    ``method``, however they were passed (positionally or by keyword)."""
+    sig = inspect.signature(method)
+
+    def touched(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
+        try:
+            bound = sig.bind_partial(self, *args, **kwargs).arguments
+        except TypeError:
+            return []
+        return [bound[n] for n in names if n in bound]
+
+    return touched
+
+
+def _first_param(method: Callable[..., Any]) -> tuple[str, ...]:
+    return (list(inspect.signature(method).parameters)[1],)
+
+
+def _invalidating(method: Callable[..., Any], *names: str) -> Callable[..., Any]:
+    """Wrap a sync mutating method: invalidate the paths it touched, the
+    arguments ``names`` (default: the first after ``self``). The wrapper
+    keeps the method's signature, so the paths may be passed by keyword
+    (``cp_file(path1=..., path2=...)``, as the references allow)."""
+    touched = _touched(method, names or _first_param(method))
 
     @functools.wraps(method)
-    def wrapper(self: ObjectStoreFileSystem, path: Any, *args: Any, **kwargs: Any) -> Any:
+    def wrapper(self: ObjectStoreFileSystem, *args: Any, **kwargs: Any) -> Any:
         try:
-            return method(self, path, *args, **kwargs)
+            return method(self, *args, **kwargs)
         finally:
-            self._invalidate_paths(path, args)
+            self._invalidate_paths(touched(self, args, kwargs))
 
     return wrapper
 
 
-def _ainvalidating(method: Callable[..., Any]) -> Callable[..., Any]:
+def _ainvalidating(method: Callable[..., Any], *names: str) -> Callable[..., Any]:
     """Async twin of :func:`_invalidating`."""
+    touched = _touched(method, names or _first_param(method))
 
     @functools.wraps(method)
-    async def wrapper(self: ObjectStoreFileSystem, path: Any, *args: Any, **kwargs: Any) -> Any:
+    async def wrapper(self: ObjectStoreFileSystem, *args: Any, **kwargs: Any) -> Any:
         try:
-            return await method(self, path, *args, **kwargs)
+            return await method(self, *args, **kwargs)
         finally:
-            self._invalidate_paths(path, args)
+            self._invalidate_paths(touched(self, args, kwargs))
 
     return wrapper
 
@@ -67,6 +92,8 @@ class ObjectStoreFileSystem(FsfastFileSystem):
     # The reference uploads pipe_file directly, even in a transaction.
     _pipe_defers_in_transaction = False
     _implicit_dirs = True
+    # s3fs, gcsfs and adlfs are fsspec AsyncFileSystems.
+    _fsspec_batches = True
     #: ``rm(dir)`` without ``recursive`` leaves a non-empty directory in
     #: place instead of raising (adlfs: it deletes only the blob named
     #: ``dir``, which does not exist; s3fs/gcsfs never reach a directory
@@ -124,13 +151,26 @@ class ObjectStoreFileSystem(FsfastFileSystem):
                 return o
         return self._dir_entry(path)
 
-    def _invalidate_paths(self, path: Any, args: Iterable[Any] = ()) -> None:
-        """Invalidate ``path`` and any further path arguments (``cp``/``mv``
-        destinations) with their ancestors."""
-        for p in [path, *[a for a in args if isinstance(a, (str, list))][:1]]:
-            for q in p if isinstance(p, list) else [p]:
-                if isinstance(q, str):
-                    self.invalidate_cache(q)
+    def _invalidate_paths(self, paths: Any, tree: bool = False) -> None:
+        """Invalidate each path (a string, or a list of them, or a list of
+        such items) with its ancestors; with ``tree`` also every cached
+        listing below it (the destination of a recursive ``copy``/``put``/
+        ``mv``, whose subdirectories' cached listings would otherwise hide
+        the files just written)."""
+        for q in paths if isinstance(paths, list) else [paths]:
+            if isinstance(q, list):
+                self._invalidate_paths(q, tree)
+            elif isinstance(q, str):
+                self.invalidate_cache(q)
+                if tree:
+                    self._invalidate_below(q)
+
+    def _invalidate_below(self, path: str) -> None:
+        """Drop the cached listings of everything below ``path``."""
+        key = self._listing_key(path)
+        prefix = key + "/" if key else ""
+        for k in [k for k in self.dircache if k.startswith(prefix) and k != key]:
+            self.dircache.pop(k, None)
 
     def invalidate_cache(self, path: Any = None) -> None:
         """Drop cached listings: everything, or ``path`` and its ancestors."""
@@ -389,11 +429,11 @@ class ObjectStoreFileSystem(FsfastFileSystem):
     _rmdir = _ainvalidating(FsfastFileSystem._rmdir)
     rm_file = _invalidating(FsfastFileSystem.rm_file)
     _rm_file = _ainvalidating(FsfastFileSystem._rm_file)
-    cp_file = _invalidating(FsfastFileSystem.cp_file)
-    _cp_file = _ainvalidating(FsfastFileSystem._cp_file)
-    _mv_file = _ainvalidating(FsfastFileSystem._mv_file)
-    put_file = _invalidating(FsfastFileSystem.put_file)
-    _put_file = _ainvalidating(FsfastFileSystem._put_file)
+    cp_file = _invalidating(FsfastFileSystem.cp_file, "path2")
+    _cp_file = _ainvalidating(FsfastFileSystem._cp_file, "path2")
+    _mv_file = _ainvalidating(FsfastFileSystem._mv_file, "path1", "path2")
+    put_file = _invalidating(FsfastFileSystem.put_file, "rpath")
+    _put_file = _ainvalidating(FsfastFileSystem._put_file, "rpath")
 
     def pipe(self, path: Any, value: Any = None, **kwargs: Any) -> None:
         try:
@@ -408,9 +448,9 @@ class ObjectStoreFileSystem(FsfastFileSystem):
             self._invalidate_paths(list(path) if isinstance(path, dict) else path)
 
     def rm(self, path: Any, recursive: bool = False, maxdepth: int | None = None) -> Any:
-        paths = self.expand_path(path, recursive=recursive, maxdepth=maxdepth)
+        paths, known = self._expand_kinds(path, recursive=recursive, maxdepth=maxdepth)
         try:
-            return self._rm_expanded(paths)
+            return self._rm_expanded(paths, known)
         finally:
             for p in paths:
                 self.invalidate_cache(p)
@@ -440,35 +480,34 @@ class ObjectStoreFileSystem(FsfastFileSystem):
                     continue
                 raise r
 
-    def _rm_expanded(self, paths: list[str]) -> Any:
-        for step, items in self._rm_plan(paths, self._kinds(paths)):
-            if step == "files":
-                self._rfs.rm_files(items, on_error="raise")
-            else:
-                self._rm_dir_results(self._rfs.rmdir_many(items, on_error="return", ignore_missing=True))
+    def _rm_dirs(self, items: list[str]) -> None:
+        self._rm_dir_results(self._rfs.rmdir_many(items, on_error="return", ignore_missing=True))
+
+    async def _rm_dirs_async(self, items: list[str]) -> None:
+        self._rm_dir_results(
+            await self._rfs.rmdir_many_async(items, on_error="return", ignore_missing=True)
+        )
+
+    def _rm_expanded(self, paths: list[str], known: dict[str, str] | None = None) -> Any:
+        # Paths not seen in a listing are deleted as objects first; only
+        # failures (a prefix "directory" has no object: 404) are looked up.
+        self._rm_run(paths, known or {})
 
     async def _rm_expanded_async(self, paths: list[str]) -> Any:
-        kinds = await self._kinds_async(paths)
-        for step, items in self._rm_plan(paths, kinds):
-            if step == "files":
-                await self._rfs.rm_files_async(items, on_error="raise")
-            else:
-                self._rm_dir_results(
-                    await self._rfs.rmdir_many_async(items, on_error="return", ignore_missing=True)
-                )
+        await self._rm_run_async(paths, {})
 
     def copy(self, path1: Any, path2: Any, recursive: bool = False, maxdepth: int | None = None, on_error: str | None = None, **kwargs: Any) -> None:
         try:
             super().copy(path1, path2, recursive=recursive, maxdepth=maxdepth, on_error=on_error, **kwargs)
         finally:
-            self._invalidate_paths(path2)
+            # The batch copy bypasses the per-file invalidating cp_file.
+            self._invalidate_paths(path2, tree=True)
 
     def mv(self, path1: Any, path2: Any, recursive: bool = False, maxdepth: int | None = None, **kwargs: Any) -> None:
         try:
             super().mv(path1, path2, recursive=recursive, maxdepth=maxdepth, **kwargs)
         finally:
-            self._invalidate_paths(path1)
-            self._invalidate_paths(path2)
+            self._invalidate_paths([path1, path2], tree=True)
 
     def put(self, lpath: Any, rpath: Any, recursive: bool = False, callback: Any = None, maxdepth: int | None = None, **kwargs: Any) -> None:
         from fsspec.callbacks import DEFAULT_CALLBACK
@@ -491,4 +530,5 @@ class ObjectStoreFileSystem(FsfastFileSystem):
         try:
             super().put(lpath, rpath, recursive=recursive, callback=callback or DEFAULT_CALLBACK, maxdepth=maxdepth, **kwargs)
         finally:
-            self._invalidate_paths(rpath)
+            # The batch upload bypasses the per-file invalidating put_file.
+            self._invalidate_paths(rpath, tree=True)

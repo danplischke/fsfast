@@ -149,7 +149,7 @@ pub async fn rm(
             .await
             .map_err(|e| {
                 if e.path().is_none() {
-                    e.with_path(r.loc.url.clone())
+                    e.with_path(r.loc.display_url())
                 } else {
                     e
                 }
@@ -158,7 +158,9 @@ pub async fn rm(
             writeln!(
                 err,
                 "removed {}: {} file(s), {} director(y/ies)",
-                r.loc.url, removed.files, removed.dirs
+                r.loc.display_url(),
+                removed.files,
+                removed.dirs
             )
             .map_err(out_err)?;
         }
@@ -187,10 +189,15 @@ pub struct CopyPlan {
     pub dirs: Vec<String>,
 }
 
-/// Work out what `cp src dst` copies, following `cp`/fsspec rules: when the
-/// destination is an existing directory (or is written with a trailing
-/// `/`), the source is copied *into* it under its base name; otherwise the
-/// destination is the copy. Directories need `recursive`.
+/// Work out what `cp src dst` copies, following fsspec's `copy` rules: when
+/// the destination is an existing directory (or is written with a trailing
+/// `/`), the source is copied *into* it under its base name, unless the
+/// source directory is written with a trailing `/` (`cp -r src/ dst/`
+/// copies the *contents* of `src`, fsspec's `not trailing_sep(path1)`);
+/// otherwise the destination is the copy. Directories need `recursive`.
+/// Missing destination parent directories are created (fsspec `get`/`put`
+/// do), and object-store folder markers (`dir/` keys) are not copied as
+/// files.
 pub async fn plan_copy(src: &Resolved, dst: &Resolved, recursive: bool) -> Result<CopyPlan> {
     let sfs = &src.built.fs;
     let dfs = &dst.built.fs;
@@ -213,7 +220,7 @@ pub async fn plan_copy(src: &Resolved, dst: &Resolved, recursive: bool) -> Resul
         };
         if hierarchical {
             let parent = fspath::parent(&target);
-            if dst_is_dir && !parent.is_empty() && parent != "/" {
+            if !parent.is_empty() && parent != "/" {
                 plan.dirs.push(parent);
             }
         }
@@ -226,10 +233,10 @@ pub async fn plan_copy(src: &Resolved, dst: &Resolved, recursive: bool) -> Resul
     }
     if !recursive {
         return Err(Error::is_a_directory(src.path())
-            .with_path(src.loc.url.clone())
+            .with_path(src.loc.display_url())
             .with_kind(ErrorKind::IsADirectory));
     }
-    let dst_root = if dst_is_dir {
+    let dst_root = if dst_is_dir && !src.loc.trailing_slash {
         into(&base_name)
     } else {
         dst.path().to_owned()
@@ -258,7 +265,11 @@ pub async fn plan_copy(src: &Resolved, dst: &Resolved, recursive: bool) -> Resul
             continue;
         }
         let target = child_path(dst.loc.backend, &dst_root, rel);
-        if e.is_dir() {
+        // A folder marker (`dir/` key, listed as a 0-byte file) is a
+        // directory, not a file named `dir`: copying it fails (404 on the
+        // `dir` key, or "is a directory" on hierarchical targets). s3fs
+        // skips it too.
+        if e.is_dir() || e.name.ends_with('/') {
             if hierarchical {
                 dirs.insert(target);
             }
@@ -315,8 +326,9 @@ pub async fn run_copy(
                 .await
                 .map(|_| ())
                 .map_err(|e| {
+                    // The failing side is unknown here: name both.
                     if e.path().is_none() {
-                        e.with_path(job.src.clone())
+                        e.with_path(format!("{} -> {}", job.src, job.dst))
                     } else {
                         e
                     }

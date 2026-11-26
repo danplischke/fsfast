@@ -1147,3 +1147,140 @@ proptest! {
         run_ops(size, mode, request, 4, request * 8, budget_bytes, ops)?;
     }
 }
+
+/// A handle over a file that grows (or shrinks) while open, like a local
+/// file being appended to: reads go to the current end of file and
+/// [`ReadHandle::current_size`] reports the current size.
+#[derive(Debug)]
+struct GrowingHandle {
+    info: fsfast_core::FileInfo,
+    data: parking_lot::Mutex<Bytes>,
+    size_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl GrowingHandle {
+    fn new(data: &[u8]) -> Arc<Self> {
+        Arc::new(GrowingHandle {
+            info: fsfast_core::FileInfo::file("/growing", data.len() as u64),
+            data: parking_lot::Mutex::new(Bytes::copy_from_slice(data)),
+            size_calls: Default::default(),
+        })
+    }
+
+    fn set(&self, data: &[u8]) {
+        *self.data.lock() = Bytes::copy_from_slice(data);
+    }
+}
+
+#[fsfast_core::async_trait]
+impl ReadHandle for GrowingHandle {
+    fn info(&self) -> &fsfast_core::FileInfo {
+        &self.info
+    }
+
+    fn io_hints(&self) -> IoHints {
+        IoHints {
+            request_size: 1000,
+            max_concurrency: 4,
+            ..IoHints::default()
+        }
+    }
+
+    async fn read_at(&self, offset: u64, len: usize) -> fsfast_core::Result<Bytes> {
+        let d = self.data.lock().clone();
+        let s = (offset as usize).min(d.len());
+        let e = s.saturating_add(len).min(d.len());
+        Ok(d.slice(s..e))
+    }
+
+    async fn current_size(&self) -> fsfast_core::Result<Option<u64>> {
+        self.size_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(self.data.lock().len() as u64))
+    }
+}
+
+/// A reader over a handle whose size is not pinned sees data appended after
+/// open (fsspec's local files are OS file objects that read to the current
+/// end of file), in every cache mode, and follows a file that shrank.
+#[tokio::test]
+async fn unpinned_handle_reads_data_appended_after_open() {
+    for mode in ALL_MODES {
+        let budget = MemoryBudget::new(1 << 20);
+        let first = pattern(5_000);
+        let h = GrowingHandle::new(&first);
+        let dynh: Arc<dyn ReadHandle> = h.clone();
+        let mut r = FileReader::new(
+            dynh,
+            ReaderConfig {
+                cache: mode,
+                request_size: Some(1000),
+                concurrency: Some(4),
+                min_readahead: 100,
+                max_readahead: Some(8000),
+                budget: Some(budget.clone()),
+            },
+        );
+        assert_eq!(r.read(None).await.unwrap(), first, "{mode:?}");
+        let more = pattern(12_000);
+        h.set(&more);
+        // `read()` at EOF sees the appended bytes.
+        assert_eq!(r.read(None).await.unwrap(), more.slice(5_000..), "{mode:?}");
+        assert_eq!(r.size(), 12_000, "{mode:?}");
+        // `seek(0); read()` sees all of it.
+        r.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(r.read(None).await.unwrap(), more, "{mode:?}");
+        // read(n) and readinto past the old end.
+        let grown = pattern(20_000);
+        h.set(&grown);
+        r.seek(SeekFrom::Start(11_000)).unwrap();
+        assert_eq!(
+            r.read(Some(3_000)).await.unwrap(),
+            grown.slice(11_000..14_000),
+            "{mode:?}"
+        );
+        let mut buf = vec![0u8; 10_000];
+        assert_eq!(r.read_into(&mut buf).await.unwrap(), 6_000, "{mode:?}");
+        assert_eq!(&buf[..6_000], &grown[14_000..], "{mode:?}");
+        // SEEK_END after an explicit refresh.
+        let longer = pattern(21_000);
+        h.set(&longer);
+        assert_eq!(r.refresh_size().await.unwrap(), 21_000);
+        assert_eq!(r.seek(SeekFrom::End(-10)).unwrap(), 20_990);
+        assert_eq!(r.read(None).await.unwrap(), longer.slice(20_990..));
+        // A file that shrank: reads near the end follow it instead of
+        // failing on a short read.
+        let shrunk = pattern(4_000);
+        h.set(&shrunk);
+        r.seek(SeekFrom::Start(3_000)).unwrap();
+        assert_eq!(
+            r.read(None).await.unwrap(),
+            shrunk.slice(3_000..),
+            "{mode:?}"
+        );
+        assert_eq!(r.size(), 4_000);
+    }
+}
+
+/// Reads that stay below the known size never ask for the current size,
+/// and handles with a pinned size are asked once at most.
+#[tokio::test]
+async fn size_is_only_refreshed_at_the_end_of_file() {
+    let h = GrowingHandle::new(&pattern(10_000));
+    let dynh: Arc<dyn ReadHandle> = h.clone();
+    let mut r = FileReader::new(dynh, ReaderConfig::with_cache(CacheMode::None));
+    for _ in 0..9 {
+        r.read(Some(1_000)).await.unwrap();
+    }
+    assert_eq!(h.size_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    r.read(Some(1_000)).await.unwrap();
+    r.read(Some(1_000)).await.unwrap();
+    assert_eq!(h.size_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    let budget = MemoryBudget::new(1 << 20);
+    let m = mem(1_000, 0, 0);
+    let mut r = reader(&m, CacheMode::None, &budget);
+    assert_eq!(r.read(None).await.unwrap().len(), 1_000);
+    assert!(r.read(None).await.unwrap().is_empty());
+    assert_eq!(r.refresh_size().await.unwrap(), 1_000);
+}

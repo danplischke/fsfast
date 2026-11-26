@@ -47,15 +47,19 @@ pub const INITIAL_WINDOW: usize = 8;
 struct ReadFut {
     off: u64,
     len: u32,
+    /// Issued past the expected end (see [`ReadPipeline::hint`]).
+    probe: bool,
     call: PendingCall,
 }
 
 impl Future for ReadFut {
-    type Output = (u64, u32, Result<RawReply>);
+    type Output = (u64, u32, bool, Result<RawReply>);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (off, len) = (self.off, self.len);
-        Pin::new(&mut self.call).poll(cx).map(|r| (off, len, r))
+        let (off, len, probe) = (self.off, self.len, self.probe);
+        Pin::new(&mut self.call)
+            .poll(cx)
+            .map(|r| (off, len, probe, r))
     }
 }
 
@@ -70,6 +74,14 @@ pub struct ReadPipeline<'a> {
     max_window: usize,
     next: u64,
     end: u64,
+    /// Where the data is expected to end (the size seen at open time).
+    /// Requests up to it are pipelined freely; past it, at most one
+    /// "probe" READ is in flight at a time, so reading to EOF costs no
+    /// extra round trip for a file of the expected size (the probe goes
+    /// out with the other requests and comes back EOF) and only a few
+    /// wasted requests for a file that grew or reports size 0 (/proc).
+    hint: u64,
+    probes: usize,
     emit: u64,
     eof: Option<u64>,
     redo: VecDeque<(u64, u32)>,
@@ -98,6 +110,8 @@ impl<'a> ReadPipeline<'a> {
             max_window: max_window.max(1),
             next: start,
             end,
+            hint: end,
+            probes: 0,
             emit: start,
             eof: None,
             redo: VecDeque::new(),
@@ -106,17 +120,32 @@ impl<'a> ReadPipeline<'a> {
         }
     }
 
+    /// Read until the server reports EOF (up to `end`), expecting the data
+    /// to end at `hint`; see the `hint` field.
+    pub fn until_eof(mut self, hint: u64) -> Self {
+        self.hint = hint.clamp(self.next, self.end);
+        self
+    }
+
     fn limit(&self) -> u64 {
         self.eof.map_or(self.end, |e| e.min(self.end))
     }
 
-    fn issue(&mut self, off: u64, len: u32) -> Result<()> {
+    fn issue(&mut self, off: u64, len: u32, probe: bool) -> Result<()> {
         let call = self.session.start_call(&Request::Read {
             handle: self.handle.clone(),
             offset: off,
             len,
         })?;
-        self.inflight.push(ReadFut { off, len, call });
+        if probe {
+            self.probes += 1;
+        }
+        self.inflight.push(ReadFut {
+            off,
+            len,
+            probe,
+            call,
+        });
         Ok(())
     }
 
@@ -128,7 +157,7 @@ impl<'a> ReadPipeline<'a> {
         while self.inflight.len() < window {
             if let Some((off, len)) = self.redo.pop_front() {
                 if off < self.limit() {
-                    self.issue(off, len)?;
+                    self.issue(off, len, false)?;
                 }
                 continue;
             }
@@ -136,10 +165,14 @@ impl<'a> ReadPipeline<'a> {
             if self.next >= limit {
                 break;
             }
+            let probe = self.next >= self.hint;
+            if probe && self.probes > 0 {
+                break;
+            }
             let len = (limit - self.next).min(self.chunk as u64) as u32;
             let off = self.next;
             self.next += u64::from(len);
-            self.issue(off, len)?;
+            self.issue(off, len, probe)?;
         }
         Ok(())
     }
@@ -162,7 +195,7 @@ impl<'a> ReadPipeline<'a> {
                     .map_err(|_| Error::timeout(format!("SFTP READ timed out after {d:?}")))?,
                 None => self.inflight.next().await,
             };
-            let Some((off, len, reply)) = next else {
+            let Some((off, len, probe, reply)) = next else {
                 // Nothing in flight and nothing to emit: the range ended
                 // (EOF) or the bookkeeping lost track, which must not hang.
                 if self.emit >= self.limit() {
@@ -173,6 +206,9 @@ impl<'a> ReadPipeline<'a> {
                     self.path, self.emit
                 )));
             };
+            if probe {
+                self.probes -= 1;
+            }
             match read_reply(reply?, self.path)? {
                 ReadReply::Data(mut p) => {
                     let n = p.len();
@@ -195,6 +231,13 @@ impl<'a> ReadPipeline<'a> {
                         if w < self.max_window {
                             self.window.store(w + 1, Ordering::Relaxed);
                         }
+                        if probe {
+                            // The file is larger than expected (it grew, or
+                            // reports a wrong size): pipeline a window's
+                            // worth past this point again.
+                            let more = (self.chunk as u64).saturating_mul(w.max(1) as u64);
+                            self.hint = self.next.saturating_add(more).min(self.end);
+                        }
                     }
                     if off >= self.emit {
                         self.done.insert(off, p);
@@ -210,15 +253,19 @@ impl<'a> ReadPipeline<'a> {
     /// Read the whole range into one buffer (zero-copy when a single reply
     /// covers it).
     pub async fn collect(mut self) -> Result<Bytes> {
-        let want = (self.end - self.emit) as usize;
+        // Capacity from the expected size (`end` may be unbounded).
+        let want = self.hint.saturating_sub(self.emit) as usize;
         let Some(first) = self.next_chunk().await? else {
             return Ok(Bytes::new());
         };
-        if first.len() >= want {
+        // When `first` covers the expected range this returns at once
+        // (bounded) or after the probe READ that went out with it.
+        let Some(second) = self.next_chunk().await? else {
             return Ok(first.into_bytes());
-        }
-        let mut buf = BytesMut::with_capacity(want);
+        };
+        let mut buf = BytesMut::with_capacity(want.max(first.len() + second.len()));
         first.copy_to(&mut buf);
+        second.copy_to(&mut buf);
         while let Some(c) = self.next_chunk().await? {
             c.copy_to(&mut buf);
         }
@@ -274,6 +321,24 @@ impl SftpReadHandle {
     /// The server's handle.
     pub fn raw_handle(&self) -> &Bytes {
         &self.handle
+    }
+
+    /// A pipeline from `start` up to `end` (`None`: no limit) that reads
+    /// until the server reports EOF instead of stopping at the size seen
+    /// at open time, as paramiko does: files that report size 0 (`/proc`,
+    /// `/sys`, some FUSE mounts), grew or shrank since open read correctly.
+    pub fn pipeline_to_eof(&self, start: u64, end: Option<u64>) -> ReadPipeline<'_> {
+        let end = end.unwrap_or(u64::MAX);
+        ReadPipeline::new(
+            &self.lease,
+            &self.handle,
+            &self.info.name,
+            start.min(end),
+            end,
+            &self.window,
+            self.max_inflight,
+        )
+        .until_eof(self.info.size.min(end))
     }
 
     /// A pipeline over `[start, end)` (clamped to the size at open time).
@@ -579,8 +644,19 @@ impl WriteHandle for SftpWriteHandle {
                 handle: self.handle.clone(),
             })
             .map_err(|e| self.record(e))?;
-        // From here on the server handle is (being) released.
-        self.state = WState::Closed;
+        // From here on the server handle is (being) released. Until every
+        // reply is checked the handle counts as failed with a "close
+        // interrupted" error: if this future is dropped (cancelled) at one
+        // of the awaits below, a later close() must not report success
+        // for WRITEs whose statuses were never seen, and abort() must
+        // still undo the partial file.
+        self.state = WState::Failed;
+        self.error = Some((
+            ErrorKind::Cancelled,
+            "close was interrupted before the server confirmed every write; \
+             the file may be incomplete"
+                .to_owned(),
+        ));
         let mut first_err = None;
         while !self.inflight.is_empty() {
             if let Err(e) = self.reap_one().await {
@@ -605,14 +681,17 @@ impl WriteHandle for SftpWriteHandle {
         if let Err(e) = r {
             first_err.get_or_insert(e);
         }
+        self.error = None;
         match first_err {
-            None => Ok(()),
+            None => {
+                self.state = WState::Closed;
+                Ok(())
+            }
             Some(e) => {
                 // A failed close cannot be retried (the handle is gone):
-                // later close() calls report the same error.
-                let e = self.record(e);
-                self.state = WState::Failed;
-                Err(e)
+                // later close() calls report the same error (the state
+                // stays Failed).
+                Err(self.record(e))
             }
         }
     }
@@ -810,6 +889,76 @@ mod tests {
         server.abort();
     }
 
+    /// A close cancelled after CLOSE was queued (while it waits for a WRITE
+    /// status) must not make a later close() report success, and abort()
+    /// must still undo the file.
+    #[tokio::test]
+    async fn cancelled_close_does_not_report_success_later() {
+        let (tx, rx, mut srx, stx) = pair();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<&'static str>();
+        let server = tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            next_req(&mut srx, &mut buf).await.unwrap();
+            stx.send(
+                Version {
+                    version: 3,
+                    extensions: vec![],
+                }
+                .encode(),
+            )
+            .unwrap();
+            let mut release = Some(release_rx);
+            while let Some(p) = next_req(&mut srx, &mut buf).await {
+                let (id, r) = Request::decode(p).unwrap();
+                let code = match r {
+                    Request::Write { .. } => {
+                        // Hold the WRITE reply until the client gave up on
+                        // close, then fail it (ENOSPC-like).
+                        if let Some(r) = release.take() {
+                            let _ = r.await;
+                        }
+                        status::FAILURE
+                    }
+                    Request::Remove { .. } => {
+                        let _ = seen_tx.send("remove");
+                        status::OK
+                    }
+                    _ => status::OK,
+                };
+                stx.send(Reply::Status(Status::new(code)).encode(id))
+                    .unwrap();
+            }
+        });
+        let s = Session::start(tx, rx, SessionOptions::default(), "t".into(), None)
+            .await
+            .unwrap();
+        let mut w = SftpWriteHandle::new(
+            Lease::new(s),
+            Bytes::from_static(b"H"),
+            "/f".into(),
+            0,
+            Undo::Remove,
+            4,
+            false,
+            Arc::new(Stats::new()),
+        );
+        w.write(Bytes::from_static(b"data")).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_millis(50), w.close()).await;
+        assert!(r.is_err(), "close should have been waiting for the WRITE");
+        release_tx.send(()).unwrap();
+        let e = w
+            .close()
+            .await
+            .expect_err("a re-close after a cancelled close reported success");
+        assert_eq!(e.kind(), ErrorKind::Cancelled, "{e}");
+        // abort() still undoes the partial file.
+        w.abort().await.unwrap();
+        assert_eq!(seen_rx.recv().await, Some("remove"));
+        drop(w);
+        server.abort();
+    }
+
     /// A quirky server: answers each batch of READs in reverse order, returns
     /// short reads, over-long DATA and empty DATA mid-file and stops at a
     /// real length shorter than the size announced at open time (the file
@@ -937,6 +1086,19 @@ mod tests {
         if !allow_empty {
             assert_eq!(mid.len(), 3000.min(lim.saturating_sub(1500)), "seed {seed}");
         }
+        // Reading to EOF ignores the size seen at open time: the whole real
+        // content (it grew, shrank or reports size 0), as paramiko reads.
+        let all = h.pipeline_to_eof(0, None).collect().await.unwrap();
+        assert_eq!(&all[..], &expect[..all.len()], "seed {seed}");
+        if !allow_empty {
+            assert_eq!(all.len(), real, "seed {seed}");
+            let tail = h.pipeline_to_eof(700, Some(5_000)).collect().await.unwrap();
+            assert_eq!(
+                &tail[..],
+                &expect[700.min(real)..5_000.min(real)],
+                "seed {seed}"
+            );
+        }
         drop(h);
         server.abort();
     }
@@ -948,6 +1110,11 @@ mod tests {
             // File exactly as announced, and a file read past its end.
             quirky_reads(9_000, 9_000, seed, false).await;
             quirky_reads(1_200, 1_000, seed, false).await;
+            // A file that grew a lot since open, and one that reports size 0
+            // (/proc): reading to EOF still returns all of it.
+            quirky_reads(50_000, 1_000, seed, false).await;
+            quirky_reads(3_000, 0, seed, false).await;
+            quirky_reads(0, 0, seed, false).await;
         }
     }
 }

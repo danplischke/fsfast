@@ -22,7 +22,9 @@
 # Needs the extension built (maturin develop --release) and, for the
 # network suites, eval "$(scripts/test-services.sh env)" (done here when
 # the services script is present). Exit status: 0 when every selected
-# fsfast run had no failures/errors.
+# fsfast run had no failures/errors; a run whose pytest wrote no report
+# (usage error, missing plugin, failed shim import) or exited with an
+# internal/usage error is a failure, never judged from an older report.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,7 +52,13 @@ if [[ -z "${FSFAST_TEST_S3_ENDPOINT:-}" && -x "$ROOT/scripts/test-services.sh" ]
 fi
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" no_proxy="${no_proxy:-127.0.0.1,localhost}"
 
-"$HERE/upstream/fetch.sh" >/dev/null || { echo "fetch failed" >&2; exit 2; }
+# Only the upstream suites need the fetched sources.
+for s in "${SUITES[@]}"; do
+  if [[ $s != abstract ]]; then
+    "$HERE/upstream/fetch.sh" >/dev/null || { echo "fetch failed" >&2; exit 2; }
+    break
+  fi
+done
 V_FSSPEC=$("$PY" -c "import fsspec; print(fsspec.__version__)")
 V_S3FS=$("$PY" -c "import importlib.metadata as m; print(m.version('s3fs'))")
 V_GCSFS=$("$PY" -c "import importlib.metadata as m; print(m.version('gcsfs'))")
@@ -59,27 +67,47 @@ V_ADLFS=$("$PY" -c "import importlib.metadata as m; print(m.version('adlfs'))")
 STATUS=0
 RAN=()
 
+# judge XML IMPL RC: account for one finished pytest run. The report was
+# deleted before the run, so a missing one means pytest never got to write
+# it; exit codes above 1 (interrupted, internal error, usage error, no tests
+# collected) are failures even when a report exists.
+judge() {
+  local xml=$1 impl=$2 rc=$3
+  if [[ ! -s $xml ]]; then
+    echo "!! $(basename "$xml"): pytest wrote no report (exit $rc)" >&2
+    STATUS=1
+    return
+  fi
+  RAN+=("$xml")
+  if (( rc > 1 )); then
+    echo "!! $(basename "$xml"): pytest exited with $rc" >&2
+    STATUS=1
+  elif [[ $impl == fsfast ]] && ! "$PY" "$HERE/summarize.py" --clean "$xml" >/dev/null; then
+    STATUS=1
+  fi
+}
+
 # upstream SHIM IMPL NAME DIR PYTEST-ARGS...: run an upstream suite from DIR.
 upstream() {
   local shim=$1 impl=$2 name=$3 dir=$4; shift 4
   local xml="$REPORTS/$name.xml"
   echo "== $name ($impl) in $dir"
+  rm -f "$xml"
   (cd "$dir" && env FSFAST_SHIM="$shim" FSFAST_SHIM_IMPL="$impl" \
       PYTHONPATH="$HERE/upstream${PYTHONPATH:+:$PYTHONPATH}" \
       "$PY" -m pytest -c "$HERE/upstream/ini/$shim.ini" --rootdir "$dir" \
       -p fsfast_shim -p no:cacheprovider -q -W ignore --timeout "$TIMEOUT" \
       -rfEX --junitxml="$xml" "$@") 2>&1 | tail -n 25
-  RAN+=("$xml")
-  if [[ $impl == fsfast ]] && ! "$PY" "$HERE/summarize.py" --clean "$xml" >/dev/null; then STATUS=1; fi
+  judge "$xml" "$impl" "${PIPESTATUS[0]}"
 }
 
 abstract() {
   local impl=$1 name=$2 xml="$REPORTS/$2.xml"
   echo "== $name ($impl)"
+  rm -f "$xml"
   (cd "$ROOT" && FSFAST_COMPLIANCE_IMPL="$impl" "$PY" -m pytest tests/compliance/abstract \
       -p no:cacheprovider -q -W ignore --timeout "$TIMEOUT" -rfEX --junitxml="$xml") 2>&1 | tail -n 25
-  RAN+=("$xml")
-  if [[ $impl == fsfast ]] && ! "$PY" "$HERE/summarize.py" --clean "$xml" >/dev/null; then STATUS=1; fi
+  judge "$xml" "$impl" "${PIPESTATUS[0]}"
 }
 
 gen_fsspec_net() {

@@ -50,11 +50,50 @@ pub fn scheme(s: &str) -> Option<&str> {
         }
     }
     for local in ["file:", "local:"] {
-        if s.len() > local.len() && s[..local.len()].eq_ignore_ascii_case(local) {
+        // `get` (not `s[..n]`): byte n may fall inside a multi-byte
+        // character of a local name such as `Grüße` or `日本語`.
+        if s.len() > local.len()
+            && s.get(..local.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(local))
+        {
             return Some(&s[..local.len() - 1]);
         }
     }
     None
+}
+
+/// `url` with the password of its `user:password@` userinfo replaced by
+/// `***`, for anything printed or stored (reports, progress, errors).
+/// Strings without userinfo are returned unchanged.
+pub fn redact_url(url: &str) -> String {
+    let Some(i) = url.find("://") else {
+        return url.to_owned();
+    };
+    let auth_start = i + 3;
+    let auth_end = url[auth_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |j| auth_start + j);
+    let authority = &url[auth_start..auth_end];
+    let Some(at) = authority.rfind('@') else {
+        return url.to_owned();
+    };
+    let userinfo = &authority[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_owned();
+    };
+    format!(
+        "{}{}:***{}",
+        &url[..auth_start],
+        &userinfo[..colon],
+        &url[auth_start + at..]
+    )
+}
+
+impl Location {
+    /// The original argument with any URL password redacted.
+    pub fn display_url(&self) -> String {
+        redact_url(&self.url)
+    }
 }
 
 /// Parse a command-line location.
@@ -222,6 +261,11 @@ mod tests {
         assert_eq!(scheme("local:x"), Some("local"));
         assert_eq!(scheme("://x"), None);
         assert_eq!(scheme("1x://y"), None);
+        // Multi-byte characters around the `file:`/`local:` prefix length.
+        assert_eq!(scheme("Grüße"), None);
+        assert_eq!(scheme("日本語"), None);
+        assert_eq!(scheme("loca\u{e9}l:x"), None);
+        assert_eq!(scheme("fil\u{e9}:x"), None);
     }
 
     #[test]
@@ -322,6 +366,19 @@ mod tests {
         let l = parse_location("https://example.com/a/b?x=1").unwrap();
         assert_eq!(l.backend.name(), "http");
         assert_eq!(l.path, "https://example.com/a/b?x=1");
+    }
+
+    #[test]
+    fn redaction() {
+        assert_eq!(
+            redact_url("smb://user:secret@host/share/d"),
+            "smb://user:***@host/share/d"
+        );
+        assert_eq!(redact_url("sftp://u:p@w@h:22"), "sftp://u:***@h:22");
+        assert_eq!(redact_url("sftp://me@host/x"), "sftp://me@host/x");
+        assert_eq!(redact_url("s3://b/k@x:y"), "s3://b/k@x:y");
+        assert_eq!(redact_url("/tmp/a:b@c"), "/tmp/a:b@c");
+        assert_eq!(redact_url("https://h/p?u=a:b@c"), "https://h/p?u=a:b@c");
     }
 
     #[test]

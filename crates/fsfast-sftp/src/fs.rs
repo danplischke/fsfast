@@ -627,9 +627,21 @@ impl FileSystem for SftpFileSystem {
             let p = p.clone();
             async move {
                 let h = self.open_read_on(s, &p, &ReadOptions::default()).await?;
-                let r = range.resolve(h.size());
-                let out = if r.end > r.start {
-                    h.pipeline(r.start, r.end).collect().await?
+                // Read to the server's EOF, not to the size STAT reported
+                // (paramiko does): /proc-style files report size 0, and the
+                // file may grow or shrink after the STAT. Only a suffix
+                // range needs the size to know where to start.
+                let (start, end) = match range {
+                    ByteRange::Full => (0, None),
+                    ByteRange::From(s) => (s, None),
+                    ByteRange::Bounded { start, end } => (start, Some(end.max(start))),
+                    ByteRange::Suffix(_) => {
+                        let r = range.resolve(h.size());
+                        (r.start, None)
+                    }
+                };
+                let out = if end.is_none_or(|e| e > start) {
+                    h.pipeline_to_eof(start, end).collect().await?
                 } else {
                     Bytes::new()
                 };
@@ -1005,7 +1017,6 @@ impl FileSystem for SftpFileSystem {
             }
             Err(e) => return Err(e),
         };
-        let size = h.size();
         let lp = local.to_path_buf();
         // Disk writes run on a blocking thread fed through a bounded queue,
         // so network reads and disk writes overlap; the received chunks are
@@ -1022,7 +1033,8 @@ impl FileSystem for SftpFileSystem {
         });
         let start = Instant::now();
         let read = async {
-            let mut p = h.pipeline(0, size);
+            // To the server's EOF, not the STAT size (see cat_file).
+            let mut p = h.pipeline_to_eof(0, None);
             while let Some(c) = p.next_chunk().await? {
                 self.inner.stats.add_bytes_read(c.len() as u64);
                 if tx.send(c.chunks().to_vec()).await.is_err() {

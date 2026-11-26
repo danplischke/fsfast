@@ -165,7 +165,8 @@ async fn host_key_policies() {
         Some("HostKeyUnknown")
     );
 
-    // HostKeyAlias from ssh_config: the key is looked up under the alias.
+    // HostKeyAlias from ssh_config: the key is looked up under the alias,
+    // verbatim (OpenSSH adds no `[alias]:port`, whatever the port).
     let cfg = dir.path().join("config");
     std::fs::write(
         &cfg,
@@ -175,19 +176,33 @@ async fn host_key_policies() {
         ),
     )
     .unwrap();
-    let alias_name = if env.port == 22 {
-        "fsfast-alias".to_owned()
-    } else {
-        format!("[fsfast-alias]:{}", env.port)
-    };
     write(format!(
-        "{alias_name} {ktype} {key}\n{name} {ktype} {OTHER_ED25519}\n"
+        "fsfast-alias {ktype} {key}\n{name} {ktype} {OTHER_ED25519}\n"
     ));
     let fs = env.fs(&[
         ("ssh_config", Value::Str(cfg.display().to_string())),
         ("host_key_policy", "reject".into()),
     ]);
     fs.info(&env.home).await.unwrap();
+    // A wrong key pinned under the alias is a mismatch, even under
+    // auto_add (it used to be looked up as `[alias]:port`, missed, and
+    // auto-accepted).
+    forget_learned_keys();
+    let wrong = if ktype == "ssh-ed25519" {
+        format!("ssh-ed25519 {OTHER_ED25519}")
+    } else {
+        format!("ecdsa-sha2-nistp256 {OTHER_ECDSA}")
+    };
+    write(format!("fsfast-alias {wrong}\n{name} {ktype} {key}\n"));
+    let fs = env.fs(&[
+        ("ssh_config", Value::Str(cfg.display().to_string())),
+        ("host_key_policy", "auto_add".into()),
+    ]);
+    assert_eq!(
+        code(&fs.info(&env.home).await.unwrap_err()).as_deref(),
+        Some("HostKeyMismatch")
+    );
+    forget_learned_keys();
     // StrictHostKeyChecking=yes in ssh_config means reject when the option
     // is not given.
     std::fs::write(

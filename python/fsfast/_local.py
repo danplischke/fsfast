@@ -6,6 +6,8 @@ import datetime
 import os
 import os.path as osp
 import shutil
+import tempfile
+import uuid
 from typing import Any
 
 from fsspec.implementations import local as _ref
@@ -30,6 +32,7 @@ class LocalFileSystem(FsfastFileSystem, _ref.LocalFileSystem):
     """
 
     root_marker = "/"
+    _cheap_info = True
     protocol = ("file", "local")
     local_file = True
     _rust_protocol = "file"
@@ -190,6 +193,17 @@ class LocalFileSystem(FsfastFileSystem, _ref.LocalFileSystem):
 
     # ------------------------------------------------------------------
     # files
+
+    def _transaction_temp_path(self, path: str) -> str:
+        """A deferred write goes to a temporary file outside the target
+        directory, moved into place at commit (renamed, or copied across
+        filesystems like ``shutil.move``), as fsspec's ``LocalFileOpener``
+        does with ``tempfile.mkstemp``: nothing appears in the target
+        directory before the commit."""
+        if self.auto_mkdir:
+            self.makedirs(self._parent(path), exist_ok=True)
+        name = os.path.join(tempfile.gettempdir(), f"fsfast-{uuid.uuid4().hex}.tmp")
+        return self._strip(name)
 
     def _open(
         self,

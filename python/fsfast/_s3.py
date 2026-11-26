@@ -440,7 +440,7 @@ class S3FileSystem(ObjectStoreFileSystem):
             if not exist_ok:
                 raise
 
-    def _rm_expanded(self, paths: list[str]) -> list[str]:
+    def _rm_expanded(self, paths: list[str], known: dict[str, str] | None = None) -> list[str]:
         # s3fs: every path with a key goes to DeleteObjects (missing keys
         # and pseudo-directories are fine), then buckets are removed; the
         # deleted keys are returned.
@@ -525,7 +525,7 @@ class S3FileSystem(ObjectStoreFileSystem):
 
     @staticmethod
     def _put_params(kwargs: dict[str, Any]) -> dict[str, Any]:
-        for k in ("chunksize", "max_concurrency", "mode", "callback"):
+        for k in ("chunksize", "max_concurrency", "mode", "callback", "batch_size"):
             kwargs.pop(k, None)
         return kwargs
 
@@ -557,7 +557,7 @@ class S3FileSystem(ObjectStoreFileSystem):
             for lp, rp in pairs:
                 self._put_one_with_params(lp, rp, mode, params)
         finally:
-            self._invalidate_paths(rpath)
+            self._invalidate_paths(rpath, tree=True)
 
     def pipe_file(self, path: Any, value: Any, mode: str = "overwrite", **kwargs: Any) -> None:
         kwargs.pop("chunksize", None)
@@ -715,6 +715,7 @@ class S3FileSystem(ObjectStoreFileSystem):
         return self._rfs.call("object_versions", {"path": self._strip(path)})
 
     def is_bucket_versioned(self, bucket: str) -> bool:
+        """Whether versioning is enabled on ``bucket`` (s3fs's method)."""
         return self._rfs.call("is_bucket_versioned", {"bucket": bucket})
 
     def make_bucket_versioned(self, bucket: str, versioned: bool = True) -> None:
@@ -730,13 +731,17 @@ class S3FileSystem(ObjectStoreFileSystem):
         self.invalidate_region_cache()
 
     def merge(self, path: Any, filelist: list[Any], **kwargs: Any) -> None:
+        """Not implemented (s3fs merges with a multipart copy); raises ``NotImplementedError``."""
         raise NotImplementedError("fsfast.S3FileSystem does not implement merge (multipart copy)")
 
     def get_delegated_s3pars(self, exp: int = 3600) -> dict[str, Any]:
+        """Not implemented (s3fs asks STS for temporary credentials); raises ``NotImplementedError``."""
         raise NotImplementedError("fsfast.S3FileSystem does not implement get_delegated_s3pars")
 
     def clear_multipart_uploads(self, bucket: str) -> None:
+        """Not implemented (s3fs aborts the bucket's pending multipart uploads); raises ``NotImplementedError``."""
         raise NotImplementedError("fsfast.S3FileSystem does not implement clear_multipart_uploads")
 
     def list_multipart_uploads(self, bucket: str) -> list[Any]:
+        """Not implemented (s3fs lists the bucket's pending multipart uploads); raises ``NotImplementedError``."""
         raise NotImplementedError("fsfast.S3FileSystem does not implement list_multipart_uploads")

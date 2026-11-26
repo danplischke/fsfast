@@ -21,7 +21,7 @@
 //! prefetches and resets the window.
 //!
 //! In every mode, a read of at least twice the request size that is not
-//! already buffered is fetched with [`read_parallel`]
+//! already buffered is fetched with [`read_parallel`](crate::read_parallel)
 //! straight into the destination.
 //!
 //! Prefetched and cached data is accounted against a [`MemoryBudget`]:
@@ -48,7 +48,7 @@ use futures::future::{BoxFuture, Shared};
 
 use crate::budget::{BudgetGuard, MemoryBudget};
 use crate::concurrency::{AbortOnDrop, join_error};
-use crate::parallel::{check_len, read_parallel, read_parallel_into};
+use crate::parallel::{check_len, read_parallel_into_within, read_parallel_within};
 
 use blocks::Blocks;
 use readahead::Readahead;
@@ -203,9 +203,10 @@ impl Ctx {
         budget: Option<&MemoryBudget>,
     ) -> Result<Bytes> {
         if self.is_large(len) {
-            let b = read_parallel(
+            let b = read_parallel_within(
                 &self.handle,
                 off..off + len as u64,
+                self.size,
                 self.request_size,
                 self.concurrency,
                 budget,
@@ -223,10 +224,11 @@ impl Ctx {
     /// Fill `dst` from `off` (in bounds), in parallel when large.
     async fn fetch_into(&self, off: u64, dst: &mut [u8]) -> Result<()> {
         if self.is_large(dst.len()) {
-            let n = read_parallel_into(
+            let n = read_parallel_into_within(
                 &self.handle,
                 off,
                 dst,
+                self.size,
                 self.request_size,
                 self.concurrency,
                 Some(&self.budget),
@@ -273,9 +275,9 @@ impl Fetch {
             // Large blocks (fsspec users often pass block_size=50 MiB) are
             // fetched as parallel parts. No extra budget: the caller's guard
             // already accounts for every byte of the block.
-            let (part, conc) = (ctx.request_size, ctx.concurrency);
+            let (part, conc, size) = (ctx.request_size, ctx.concurrency, ctx.size);
             AbortOnDrop::spawn(async move {
-                read_parallel(&h, start..start + len as u64, part, conc, None).await
+                read_parallel_within(&h, start..start + len as u64, size, part, conc, None).await
             })
         } else {
             AbortOnDrop::spawn(async move { h.read_at(start, len).await })
@@ -437,6 +439,9 @@ pub struct FileReader {
     pos: u64,
     state: State,
     closed: bool,
+    /// Whether the handle may report a size other than the one at open
+    /// ([`ReadHandle::current_size`]); cleared the first time it says no.
+    size_may_change: bool,
 }
 
 impl std::fmt::Debug for FileReader {
@@ -486,6 +491,7 @@ impl FileReader {
             pos: 0,
             state,
             closed: false,
+            size_may_change: true,
         }
     }
 
@@ -494,9 +500,49 @@ impl FileReader {
         &self.ctx.handle
     }
 
-    /// File size (as observed when the handle was opened).
+    /// File size: as observed when the handle was opened, or as last
+    /// refreshed for a handle whose size is not pinned (see
+    /// [`FileReader::refresh_size`]).
     pub fn size(&self) -> u64 {
         self.ctx.size
+    }
+
+    /// Re-read the file's size from a handle whose reads are not pinned to
+    /// the version opened ([`ReadHandle::current_size`]); returns the size.
+    /// If it changed, cached and prefetched data is dropped (it may be
+    /// stale, and blocks at the old end of file are short).
+    ///
+    /// Reads call this themselves when they reach the known end of file, so
+    /// a reader of a file that is being appended to sees the new data (as a
+    /// Python file object does). Call it before `seek(SeekFrom::End(_))` to
+    /// seek relative to the current end. A no-op for pinned handles.
+    pub async fn refresh_size(&mut self) -> Result<u64> {
+        self.check_open()?;
+        if self.size_may_change {
+            match self.ctx.handle.current_size().await? {
+                None => self.size_may_change = false,
+                Some(size) if size != self.ctx.size => {
+                    self.clear_cache();
+                    self.ctx.size = size;
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(self.ctx.size)
+    }
+
+    /// Refresh the size if a read of `want` bytes (`None`: to the end) from
+    /// the current position reaches the known end of file. Reads that stay
+    /// inside the file cost nothing extra.
+    async fn refresh_at_eof(&mut self, want: Option<usize>) -> Result<()> {
+        let reaches_end = match want {
+            None => true,
+            Some(n) => self.pos.saturating_add(n as u64) > self.ctx.size,
+        };
+        if reaches_end && self.size_may_change {
+            self.refresh_size().await?;
+        }
+        Ok(())
     }
 
     /// Current position.
@@ -554,9 +600,12 @@ impl FileReader {
 
     /// Read `n` bytes (`None`: to the end of the file) from the current
     /// position. Returns exactly `min(n, size - pos)` bytes (fsspec
-    /// semantics: short only at EOF) and advances the position.
+    /// semantics: short only at EOF) and advances the position. A read that
+    /// reaches the known end first refreshes the size of an unpinned handle
+    /// ([`FileReader::refresh_size`]).
     pub async fn read(&mut self, n: Option<usize>) -> Result<Bytes> {
         self.check_open()?;
+        self.refresh_at_eof(n).await?;
         let avail = self.ctx.size.saturating_sub(self.pos);
         let n = n.map_or(avail, |n| (n as u64).min(avail));
         let n =
@@ -581,9 +630,11 @@ impl FileReader {
     }
 
     /// Fill `buf` from the current position (Python `readinto`). Returns
-    /// `min(buf.len(), size - pos)` and advances the position.
+    /// `min(buf.len(), size - pos)` and advances the position (refreshing the
+    /// size at the end of file like [`FileReader::read`]).
     pub async fn read_into(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.check_open()?;
+        self.refresh_at_eof(Some(buf.len())).await?;
         let avail = self.ctx.size.saturating_sub(self.pos);
         let n = (buf.len() as u64).min(avail) as usize;
         if n == 0 {

@@ -24,13 +24,14 @@ working unchanged.
 
 from __future__ import annotations
 
+import bisect
 import os
 import uuid
 from collections.abc import Iterable, Sequence
 from glob import has_magic
 from typing import Any, ClassVar
 
-from fsspec.asyn import AsyncFileSystem, get_loop
+from fsspec.asyn import AsyncFileSystem, _get_batch_size, get_loop
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.implementations.local import make_path_posix, trailing_sep
 from fsspec.spec import AbstractFileSystem
@@ -115,6 +116,15 @@ class FsfastFileSystem(AsyncFileSystem):
     #: reference's file is positioned at the end of the stored data, as in
     #: fsspec's memory filesystem) instead of the bytes this handle wrote.
     _append_tell_from_end: ClassVar[bool] = False
+    #: A file's ``readlines(hint)`` stops once the lines read reach
+    #: ``hint`` bytes, like ``BytesIO`` (fsspec's memory files), instead of
+    #: once they exceed it (``io.IOBase``: CPython files, fsspec's local
+    #: files).
+    _readlines_bytesio: ClassVar[bool] = False
+    #: A file's ``seek(offset, 1 or 2)`` to before the start clamps to 0,
+    #: like ``BytesIO`` (fsspec's memory files), instead of raising
+    #: ``ValueError`` like ``AbstractBufferedFile``.
+    _seek_clamps_negative: ClassVar[bool] = False
     #: ``pipe``/``pipe_file`` inside a transaction are deferred to commit:
     #: the references using fsspec's generic ``pipe_file`` (which writes
     #: through ``open``) do this; object stores and http, whose references
@@ -134,6 +144,20 @@ class FsfastFileSystem(AsyncFileSystem):
     #: targets first (fsspec's generic ``put_file`` does, for real
     #: directories; SMB and SFTP inherit it).
     _put_makes_parents: ClassVar[bool] = False
+
+    #: The reference implementation is an fsspec ``AsyncFileSystem`` (s3fs,
+    #: gcsfs, adlfs, http): batch calls without ``batch_size`` run as many
+    #: operations at a time as fsspec's ``_run_coros_in_chunks`` would
+    #: (``fsspec.asyn._get_batch_size``: conf ``gather_batch_size`` /
+    #: ``nofiles_gather_batch_size``, else 1280 for remote-only operations
+    #: and ``RLIMIT_NOFILE // 8`` for transfers with local files). Classes
+    #: whose reference is synchronous (one call at a time: local, memory,
+    #: smb, sftp) use the backend's tuned concurrency instead.
+    _fsspec_batches: ClassVar[bool] = False
+    #: Metadata lookups are a syscall or a map lookup (local, memory), so
+    #: batch operations may look every path up front; network classes look
+    #: up only the paths whose operation failed (see ``_expand_kinds``).
+    _cheap_info: ClassVar[bool] = False
 
     async_impl = True
     mirror_sync_methods = True
@@ -191,8 +215,17 @@ class FsfastFileSystem(AsyncFileSystem):
         strip = self._strip_protocol
         return [strip(p) for p in paths]
 
-    def _batch_size(self, batch_size: int | None = None) -> int | None:
-        return batch_size if batch_size is not None else self.batch_size
+    def _batch_size(self, batch_size: int | None = None, nofiles: bool = True) -> int | None:
+        """Operations in flight for a batch call: the call's ``batch_size``,
+        else the instance's, else fsspec's default (``_fsspec_batches``) or
+        ``None`` (the backend's tuned concurrency). ``-1`` means all at
+        once, as in fsspec. ``nofiles`` is fsspec's flag: the operation
+        involves no local files."""
+        # fsspec: ``batch_size = batch_size or self.batch_size``.
+        bs = batch_size or self.batch_size
+        if bs is None and self._fsspec_batches:
+            bs = _get_batch_size(nofiles=nofiles)
+        return bs
 
     def _kinds(self, paths: list[str]) -> list[str | None]:
         """``info()["type"]`` of each path (``None`` if it does not exist),
@@ -203,6 +236,83 @@ class FsfastFileSystem(AsyncFileSystem):
     async def _kinds_async(self, paths: list[str]) -> list[str | None]:
         infos = await self._rfs.info_many_async(paths, on_error="return")
         return [None if _is_exc(i) else i["type"] for i in infos]
+
+    def _expand_kinds(
+        self,
+        path: Any,
+        recursive: bool = False,
+        maxdepth: int | None = None,
+        assume_literal: bool = False,
+        **kwargs: Any,
+    ) -> tuple[list[str], dict[str, str]]:
+        """fsspec's ``expand_path`` (same rules and results), also
+        returning the ``type`` of every path the expansion already saw in a
+        listing (``find``/``glob`` with ``detail=True``). Paths given
+        literally without ``recursive`` are not looked up (fsspec does not
+        either); callers try them and look up only failures."""
+        if "expand_path" in self.__dict__ or type(self).expand_path is not FsfastFileSystem.expand_path:
+            # ``expand_path`` is overridden (a subclass, or a test patching
+            # the instance): honour it; kinds are then unknown.
+            return self.expand_path(
+                path, recursive=recursive, maxdepth=maxdepth, assume_literal=assume_literal, **kwargs
+            ), {}
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+        kinds: dict[str, str] = {}
+        if isinstance(path, (str, os.PathLike)):
+            return self._expand_kinds([path], recursive, maxdepth, **kwargs)
+        out: set[str] = set()
+
+        def note(found: Any) -> set[str]:
+            if isinstance(found, dict):
+                for k, v in found.items():
+                    if isinstance(v, dict) and "type" in v:
+                        kinds[k] = v["type"]
+            return set(found)
+
+        for p in [self._strip_protocol(p) for p in path]:
+            if not assume_literal and has_magic(p):
+                bit = note(self.glob(p, maxdepth=maxdepth, detail=True, **kwargs))
+                out |= bit
+                if recursive:
+                    if maxdepth is not None and maxdepth <= 1:
+                        continue
+                    sub, subkinds = self._expand_kinds(
+                        list(bit),
+                        recursive=recursive,
+                        maxdepth=maxdepth - 1 if maxdepth is not None else None,
+                        assume_literal=True,
+                        **kwargs,
+                    )
+                    out |= set(sub)
+                    kinds.update(subkinds)
+                continue
+            elif recursive:
+                out |= note(self.find(p, maxdepth=maxdepth, withdirs=True, detail=True, **kwargs))
+            if p not in out and (recursive is False or self.exists(p)):
+                out.add(p)
+        if not out:
+            raise FileNotFoundError(path)
+        return sorted(out), kinds
+
+    def _fill_kinds(self, paths: list[str], known: dict[str, str]) -> list[str | None]:
+        """The kind of each path: from ``known``, looking the rest up in
+        one batch when lookups are cheap (``_cheap_info``); otherwise unknown
+        kinds stay ``None`` (tried as files, failures looked up)."""
+        kinds: list[str | None] = [known.get(p) for p in paths]
+        if self._cheap_info:
+            missing = [i for i, k in enumerate(kinds) if k is None]
+            if missing:
+                for i, k in zip(missing, self._kinds([paths[i] for i in missing])):
+                    kinds[i] = k
+        return kinds
+
+    def _directories_among(self, failed: list[str]) -> set[str]:
+        """Which of the paths whose file operation failed are directories
+        (one batched lookup of the failures only)."""
+        if not failed:
+            return set()
+        return {p for p, k in zip(failed, self._kinds(failed)) if k == "directory"}
 
     def _payload(self, value: Any) -> Any:
         """Data for ``pipe``/``pipe_file`` (see ``_pipe_none_is_empty``)."""
@@ -282,13 +392,15 @@ class FsfastFileSystem(AsyncFileSystem):
     async def _size(self, path: Any) -> int | None:
         return (await self._info(path)).get("size", None)
 
-    def sizes(self, paths: Iterable[Any]) -> list[int | None]:
-        infos = self._rfs.info_many(self._strip_all(paths), on_error="raise")
+    def sizes(self, paths: Iterable[Any], batch_size: int | None = None) -> list[int | None]:
+        infos = self._rfs.info_many(
+            self._strip_all(paths), on_error="raise", batch_size=self._batch_size(batch_size, nofiles=False)
+        )
         return [i.get("size", None) for i in infos]
 
     async def _sizes(self, paths: Iterable[Any], batch_size: int | None = None) -> list[int | None]:
         infos = await self._rfs.info_many_async(
-            self._strip_all(paths), on_error="raise", batch_size=self._batch_size(batch_size)
+            self._strip_all(paths), on_error="raise", batch_size=self._batch_size(batch_size, nofiles=False)
         )
         return [i.get("size", None) for i in infos]
 
@@ -452,17 +564,19 @@ class FsfastFileSystem(AsyncFileSystem):
         ends: Any,
         max_gap: int | None = None,
         on_error: str = "return",
+        batch_size: int | None = None,
         **kwargs: Any,
     ) -> list[Any]:
-        # ``max_gap`` is accepted and ignored: ranges are always coalesced
-        # with the backend's tuned gap.
+        # ``max_gap`` is accepted and ignored: ranges are coalesced with the
+        # backend's tuned gap (with an amplification guard, see the
+        # bindings' ``plan_ranges``).
         starts, ends = self._range_lists(paths, starts, ends, sync=True)
         return self._rfs.cat_ranges(
             self._strip_all(paths),
             starts,
             ends,
             on_error="return" if on_error == "return" else "raise",
-            batch_size=self.batch_size,
+            batch_size=self._batch_size(batch_size),
             seek_read=self._seek_read_ranges,
         )
 
@@ -495,19 +609,27 @@ class FsfastFileSystem(AsyncFileSystem):
             raise out[0]
         return out[0]
 
-    def cat(self, path: Any, recursive: bool = False, on_error: str = "raise", **kwargs: Any) -> Any:
+    def cat(
+        self,
+        path: Any,
+        recursive: bool = False,
+        on_error: str = "raise",
+        batch_size: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         start, end = kwargs.pop("start", None), kwargs.pop("end", None)
         paths = self.expand_path(path, recursive=recursive, **kwargs)
         mode = "raise" if on_error == "raise" else "return"
+        bs = self._batch_size(batch_size)
         if start is None and end is None:
-            out = self._rfs.cat_many(paths, on_error=mode, batch_size=self.batch_size)
+            out = self._rfs.cat_many(paths, on_error=mode, batch_size=bs)
         else:
             out = self._rfs.cat_ranges(
                 paths,
                 [start] * len(paths),
                 [end] * len(paths),
                 on_error=mode,
-                batch_size=self.batch_size,
+                batch_size=bs,
                 seek_read=self._seek_read_ranges,
             )
         return self._cat_result(path, paths, out, on_error)
@@ -577,7 +699,7 @@ class FsfastFileSystem(AsyncFileSystem):
     def write_bytes(self, path: Any, value: Any, **kwargs: Any) -> None:
         self.pipe_file(path, value, **kwargs)
 
-    def pipe(self, path: Any, value: Any = None, **kwargs: Any) -> None:
+    def pipe(self, path: Any, value: Any = None, batch_size: int | None = None, **kwargs: Any) -> None:
         """Write bytes: ``pipe(path, value)`` for one file, or
         ``pipe({path: value, ...})`` for many (uploaded concurrently)."""
         if isinstance(path, str):
@@ -593,7 +715,7 @@ class FsfastFileSystem(AsyncFileSystem):
                 [self._payload(v) for v in path.values()],
                 mode=mode,
                 on_error="raise",
-                batch_size=self.batch_size,
+                batch_size=self._batch_size(batch_size),
             )
         else:
             raise ValueError("path must be str or dict")
@@ -675,13 +797,84 @@ class FsfastFileSystem(AsyncFileSystem):
                 steps.append(("files", [p]))
         return steps
 
-    def rm(self, path: Any, recursive: bool = False, maxdepth: int | None = None) -> None:
-        paths = self.expand_path(path, recursive=recursive, maxdepth=maxdepth)
-        for step, items in self._rm_plan(paths, self._kinds(paths)):
+    def _rm_dirs(self, items: list[str]) -> None:
+        """Directory step of ``rm`` (deepest first)."""
+        self._rfs.rmdir_many(items, on_error="raise", ignore_missing=True)
+
+    async def _rm_dirs_async(self, items: list[str]) -> None:
+        await self._rfs.rmdir_many_async(items, on_error="raise", ignore_missing=True)
+
+    @staticmethod
+    def _has_children(p: str, paths: list[str]) -> bool:
+        """Whether sorted ``paths`` holds an entry below ``p``."""
+        prefix = p.rstrip("/") + "/"
+        i = bisect.bisect_left(paths, prefix)
+        return i < len(paths) and paths[i].startswith(prefix)
+
+    def _rm_failed_dirs(self, failed: list[tuple[str, Any]], paths: list[str]) -> set[str]:
+        """Which failed file deletions were directories: those with entries
+        below them in the expansion (an implicit directory of an object
+        store is gone once they are deleted, so a lookup would not find
+        it), else by one batched lookup of the remaining failures."""
+        dirs = {p for p, _ in failed if self._has_children(p, paths)}
+        rest = [p for p, _ in failed if p not in dirs]
+        return dirs | self._directories_among(rest)
+
+    def _rm_files_step(self, items: list[str], paths: list[str]) -> None:
+        """Files step of ``rm``: one batch delete of paths known (or
+        assumed) not to be directories. Only the paths that fail are looked
+        up: a directory among them (a path given literally, which fsspec's
+        ``rm_file`` would ``stat`` first) gets the directory step, after the
+        rest of the batch (its children) is gone; any other failure is
+        raised, the first in order."""
+        results = self._rfs.rm_files(items, on_error="return")
+        failed = [(p, r) for p, r in zip(items, results) if _is_exc(r)]
+        if not failed:
+            return
+        dirs = self._rm_failed_dirs(failed, paths)
+        for p, r in failed:
+            if p not in dirs:
+                raise r
+        # ``items`` run deepest first, so the directories do too.
+        self._rm_dirs([p for p, _ in failed])
+
+    async def _rm_files_step_async(self, items: list[str], paths: list[str]) -> None:
+        results = await self._rfs.rm_files_async(items, on_error="return")
+        failed = [(p, r) for p, r in zip(items, results) if _is_exc(r)]
+        if not failed:
+            return
+        dirs = {p for p, _ in failed if self._has_children(p, paths)}
+        rest = [p for p, _ in failed if p not in dirs]
+        if rest:
+            kinds = await self._kinds_async(rest)
+            dirs |= {p for p, k in zip(rest, kinds) if k == "directory"}
+        for p, r in failed:
+            if p not in dirs:
+                raise r
+        await self._rm_dirs_async([p for p, _ in failed])
+
+    def _rm_run(self, paths: list[str], known: dict[str, str]) -> None:
+        """Delete expanded (sorted) ``paths`` (``known``: kinds seen while
+        expanding; see ``_rm_plan``)."""
+        for step, items in self._rm_plan(paths, [known.get(p) for p in paths]):
             if step == "files":
-                self._rfs.rm_files(items, on_error="raise")
+                self._rm_files_step(items, paths)
             else:
-                self._rfs.rmdir_many(items, on_error="raise", ignore_missing=True)
+                self._rm_dirs(items)
+
+    async def _rm_run_async(self, paths: list[str], known: dict[str, str]) -> None:
+        for step, items in self._rm_plan(paths, [known.get(p) for p in paths]):
+            if step == "files":
+                await self._rm_files_step_async(items, paths)
+            else:
+                await self._rm_dirs_async(items)
+
+    def rm(self, path: Any, recursive: bool = False, maxdepth: int | None = None) -> None:
+        # No per-path lookup: kinds come from the expansion's listings, and
+        # anything else is deleted as a file first (fsspec's rm_file stats
+        # every path; that would cost one round trip per path).
+        paths, known = self._expand_kinds(path, recursive=recursive, maxdepth=maxdepth)
+        self._rm_run(paths, known)
 
     async def _rm(
         self,
@@ -692,12 +885,7 @@ class FsfastFileSystem(AsyncFileSystem):
         **kwargs: Any,
     ) -> None:
         paths = await self._expand_path(path, recursive=recursive, maxdepth=maxdepth)
-        kinds = await self._kinds_async(paths)
-        for step, items in self._rm_plan(paths, kinds):
-            if step == "files":
-                await self._rfs.rm_files_async(items, on_error="raise")
-            else:
-                await self._rfs.rmdir_many_async(items, on_error="raise", ignore_missing=True)
+        await self._rm_run_async(paths, {})
 
     def delete(self, path: Any, recursive: bool = False, maxdepth: int | None = None) -> None:
         self.rm(path, recursive=recursive, maxdepth=maxdepth)
@@ -716,19 +904,24 @@ class FsfastFileSystem(AsyncFileSystem):
 
     def _copy_pairs(
         self, path1: Any, path2: Any, recursive: bool, maxdepth: int | None, **kwargs: Any
-    ) -> tuple[list[str], list[str]] | None:
+    ) -> tuple[list[str], list[str], dict[str, str]] | None:
         """fsspec's ``AbstractFileSystem.copy`` path expansion (same rules
-        for globs, trailing slashes, ``recursive`` and ``maxdepth``), with the
-        directory test batched. ``None`` means nothing to copy."""
+        for globs, trailing slashes, ``recursive`` and ``maxdepth``), also
+        returning the source kinds seen while expanding. ``None`` means
+        nothing to copy."""
         if isinstance(path1, list) and isinstance(path2, list):
-            return self._strip_all(path1), self._strip_all(path2)
+            return self._strip_all(path1), self._strip_all(path2), {}
         source_is_str = isinstance(path1, str)
-        paths1 = self.expand_path(path1, recursive=recursive, maxdepth=maxdepth, **kwargs)
+        paths1, known = self._expand_kinds(path1, recursive=recursive, maxdepth=maxdepth, **kwargs)
         if source_is_str and (not recursive or maxdepth is not None):
-            # Non-recursive glob does not copy directories
-            kinds = self._kinds(paths1)
+            # Non-recursive glob does not copy directories (fsspec asks
+            # isdir() for each path; only paths not seen in a listing are
+            # looked up here).
+            unknown = [p for p in paths1 if p not in known and not trailing_sep(p)]
+            if unknown:
+                known = {**known, **{p: k for p, k in zip(unknown, self._kinds(unknown)) if k}}
             paths1 = [
-                p for p, k in zip(paths1, kinds) if not (trailing_sep(p) or k == "directory")
+                p for p in paths1 if not (trailing_sep(p) or known.get(p) == "directory")
             ]
             if not paths1:
                 return None
@@ -739,7 +932,7 @@ class FsfastFileSystem(AsyncFileSystem):
             or (not has_magic(path1) and dest_is_dir and not trailing_sep(path1))
         )
         paths2 = other_paths(paths1, path2, exists=exists, flatten=not source_is_str)
-        return paths1, self._strip_all(paths2)
+        return paths1, self._strip_all(paths2), known
 
     def _run_pairs(
         self,
@@ -763,6 +956,12 @@ class FsfastFileSystem(AsyncFileSystem):
                 results[i] = r
         return results
 
+    def _copy_dirs(self, dsts: list[str]) -> None:
+        """Create the targets of copied directories (backends with real
+        directories, see ``_put_makes_parents``)."""
+        if dsts and self._put_makes_parents:
+            self._rfs.makedirs_many(dsts, exist_ok=True, on_error="raise")
+
     def copy(
         self,
         path1: Any,
@@ -770,6 +969,7 @@ class FsfastFileSystem(AsyncFileSystem):
         recursive: bool = False,
         maxdepth: int | None = None,
         on_error: str | None = None,
+        batch_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         if on_error is None and recursive:
@@ -779,29 +979,41 @@ class FsfastFileSystem(AsyncFileSystem):
         pairs = self._copy_pairs(path1, path2, recursive, maxdepth, **kwargs)
         if pairs is None:
             return
-        srcs, dsts = pairs
-        kinds = self._kinds(srcs)
+        srcs, dsts, known = pairs
+        if self._implicit_dirs or self._put_makes_parents:
+            # Sources not seen in a listing are copied as files; the few
+            # that fail are looked up below.
+            kinds = [known.get(p) for p in srcs]
+        else:
+            kinds = self._fill_kinds(srcs, known) if self._cheap_info else self._kinds(srcs)
         if self._implicit_dirs or self._put_makes_parents:
             keep = [i for i, k in enumerate(kinds) if k != "directory"]
             dirs = [d for d, k in zip(dsts, kinds) if k == "directory"]
             srcs, dsts, kinds = [srcs[i] for i in keep], [dsts[i] for i in keep], [kinds[i] for i in keep]
+            # Real directories: create the target directories, then copy the
+            # files server-side...
+            self._copy_dirs(dirs)
             if self._put_makes_parents:
-                # Real directories: create the target directories, then copy
-                # the files server-side.
-                if dirs:
-                    self._rfs.makedirs_many(dirs, exist_ok=True, on_error="raise")
                 # ...and the parents of file targets (a file copied into a
                 # new directory, as ``put`` does).
                 self._make_parents(dsts)
+        bs = self._batch_size(batch_size)
         results = self._run_pairs(
-            lambda s, d, on_error: self._rfs.cp_files(
-                s, d, on_error=on_error, batch_size=self.batch_size
-            ),
+            lambda s, d, on_error: self._rfs.cp_files(s, d, on_error=on_error, batch_size=bs),
             srcs,
             dsts,
             kinds,
             on_error="return",
         )
+        failed = [i for i, r in enumerate(results) if _is_exc(r) and kinds[i] is None]
+        if failed:
+            # Sources of unknown kind that failed: a directory gets the
+            # directory treatment instead of an error.
+            dirs = self._directories_among([srcs[i] for i in failed])
+            fixed = [i for i in failed if srcs[i] in dirs]
+            self._copy_dirs([dsts[i] for i in fixed])
+            for i in fixed:
+                results[i] = None
         for r in results:
             if _is_exc(r):
                 if on_error == "ignore" and isinstance(r, FileNotFoundError):
@@ -865,6 +1077,7 @@ class FsfastFileSystem(AsyncFileSystem):
         recursive: bool = False,
         callback: Any = DEFAULT_CALLBACK,
         maxdepth: int | None = None,
+        batch_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         if isinstance(lpath, list) and isinstance(rpath, list):
@@ -914,7 +1127,7 @@ class FsfastFileSystem(AsyncFileSystem):
             self._make_parents(rpaths)
         results = self._run_pairs(
             lambda s, d, on_error: self._rfs.put_files(
-                s, d, mode=mode, on_error=on_error, batch_size=self.batch_size
+                s, d, mode=mode, on_error=on_error, batch_size=self._batch_size(batch_size, nofiles=False)
             ),
             lpaths,
             rpaths,
@@ -968,23 +1181,24 @@ class FsfastFileSystem(AsyncFileSystem):
         recursive: bool = False,
         callback: Any = DEFAULT_CALLBACK,
         maxdepth: int | None = None,
+        batch_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         if isinstance(lpath, list) and isinstance(rpath, list):
             rpaths, lpaths = self._strip_all(rpath), [os.fspath(p) for p in lpath]
-            kinds = self._kinds(rpaths)
+            known: dict[str, str] = {}
         else:
             source_is_str = isinstance(rpath, str)
-            rpaths = self.expand_path(rpath, recursive=recursive, maxdepth=maxdepth, **kwargs)
-            kinds = self._kinds(rpaths)
+            rpaths, known = self._expand_kinds(rpath, recursive=recursive, maxdepth=maxdepth, **kwargs)
             if source_is_str and (not recursive or maxdepth is not None):
-                # Non-recursive glob does not copy directories
-                keep = [
-                    i
-                    for i, p in enumerate(rpaths)
-                    if not (trailing_sep(p) or kinds[i] == "directory")
+                # Non-recursive glob does not copy directories (fsspec asks
+                # isdir(); only paths not seen in a listing are looked up).
+                unknown = [p for p in rpaths if p not in known and not trailing_sep(p)]
+                if unknown:
+                    known = {**known, **{p: k for p, k in zip(unknown, self._kinds(unknown)) if k}}
+                rpaths = [
+                    p for p in rpaths if not (trailing_sep(p) or known.get(p) == "directory")
                 ]
-                rpaths, kinds = [rpaths[i] for i in keep], [kinds[i] for i in keep]
                 if not rpaths:
                     return
             if isinstance(lpath, str):
@@ -1000,6 +1214,9 @@ class FsfastFileSystem(AsyncFileSystem):
             lpaths = other_paths(rpaths, lpath, exists=exists, flatten=not source_is_str)
             if isinstance(lpath, str):
                 check_contained(lpath, lpaths)
+        # Paths not seen in a listing are downloaded as files; the ones that
+        # fail are looked up below (a directory is created locally instead).
+        kinds = self._fill_kinds(rpaths, known)
         callback.set_size(len(lpaths))
         # Directories are created locally, as fsspec's get_file does; only
         # files go to the backend (object stores have no directory object
@@ -1011,14 +1228,20 @@ class FsfastFileSystem(AsyncFileSystem):
         # fsspec (get_file, and AsyncFileSystem._get) creates the local
         # parent directory of every target; one makedirs per distinct parent.
         _make_local_parents([lpaths[i] for i in files])
-        results = self._run_pairs(
-            lambda s, d, on_error: self._rfs.get_files(
-                s, d, on_error=on_error, batch_size=self.batch_size
-            ),
+        bs = self._batch_size(batch_size, nofiles=False)
+        results = self._rfs.get_files(
             [rpaths[i] for i in files],
             [lpaths[i] for i in files],
-            [kinds[i] for i in files],
+            on_error="return",
+            batch_size=bs,
         )
+        failed = [j for j, r in enumerate(results) if _is_exc(r) and kinds[files[j]] is None]
+        if failed:
+            dirs = self._directories_among([rpaths[files[j]] for j in failed])
+            for j in failed:
+                if rpaths[files[j]] in dirs:
+                    os.makedirs(lpaths[files[j]], exist_ok=True)
+                    results[j] = None
         callback.relative_update(len(lpaths))
         self._raise_first(results)
 

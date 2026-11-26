@@ -10,7 +10,14 @@ license = { text = "Apache-2.0 OR MIT" }
 requires-python = ">=3.10"
 dependencies = ["fsspec>=2024.6.0"]
 dynamic = ["version"]
+keywords = ["fsspec", "filesystem", "s3", "gcs", "azure", "smb", "sftp", "http", "rust"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -18,12 +25,15 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.23"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-timeout", "hypothesis"]
 # Reference implementations for the live parity tests (tests/python/test_net_*.py).
 parity = ["s3fs", "gcsfs", "adlfs", "smbprotocol", "paramiko", "aiohttp", "hypothesis"]
 
 [project.urls]
 Repository = "https://github.com/danplischke/fsfast"
+Documentation = "https://github.com/danplischke/fsfast/blob/main/README.md"
+Benchmarks = "https://github.com/danplischke/fsfast/blob/main/docs/BENCHMARKS.md"
+Status = "https://github.com/danplischke/fsfast/blob/main/docs/STATUS.md"
 
 [tool.maturin]
 python-source = "python"

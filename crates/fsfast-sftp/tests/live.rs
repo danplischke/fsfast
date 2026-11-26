@@ -341,6 +341,13 @@ async fn error_mapping() {
         ErrorKind::IsADirectory
     );
     assert!(!fs.exists(&s.p("copy")).await.unwrap());
+    // ENAMETOOLONG comes back as BAD_MESSAGE: an OS error (OSError in
+    // Python, like paramiko's IOError), not InvalidInput (ValueError).
+    let long = s.p(&"a".repeat(300));
+    let e = fs.info(&long).await.unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Io, "{e}");
+    assert_eq!(sftp_code(&e), Some(5), "{e}");
+    assert_eq!(kind(fs.rm_file(&long).await), ErrorKind::Io);
     s.cleanup().await;
 }
 
@@ -750,4 +757,96 @@ async fn ssh_config_alias() {
         fs.info("/").await.unwrap_err().kind(),
         ErrorKind::Unsupported
     );
+}
+
+/// Reads go to the server's EOF, not to the size STAT reported at open
+/// (paramiko reads to EOF): `/proc` files report size 0. The SFTP server
+/// runs on this machine, so its `/proc/version` matches ours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reads_go_to_eof_not_to_the_stat_size() {
+    let Some(env) = common::env() else { return };
+    let fs = env.fs(&[]);
+    let local = std::fs::read("/proc/version").unwrap_or_default();
+    match fs.info("/proc/version").await {
+        Ok(i) if i.size == 0 && !local.is_empty() => {
+            let got = fs.cat_file("/proc/version", ByteRange::Full).await.unwrap();
+            assert_eq!(got, local, "cat_file of a size-0 /proc file");
+            let part = fs
+                .cat_file("/proc/version", ByteRange::Bounded { start: 2, end: 9 })
+                .await
+                .unwrap();
+            assert_eq!(&part[..], &local[2..9]);
+            let dir = tempfile::tempdir().unwrap();
+            let lp = dir.path().join("version");
+            fs.get_file("/proc/version", &lp).await.unwrap();
+            assert_eq!(std::fs::read(&lp).unwrap(), local, "get_file");
+        }
+        other => eprintln!("skipping /proc check: {other:?}"),
+    }
+    // Ordinary files: whole, ranged, past the end, empty.
+    let s = Scratch::new(&env, &fs, "eof").await;
+    let data = pattern(7, 300_000);
+    put(&fs, &s.p("f"), data.clone()).await;
+    put(&fs, &s.p("empty"), Bytes::new()).await;
+    assert_eq!(fs.cat_file(&s.p("f"), ByteRange::Full).await.unwrap(), data);
+    assert_eq!(
+        fs.cat_file(&s.p("f"), ByteRange::From(299_990))
+            .await
+            .unwrap(),
+        data.slice(299_990..)
+    );
+    assert_eq!(
+        fs.cat_file(&s.p("f"), ByteRange::Suffix(10)).await.unwrap(),
+        data.slice(299_990..)
+    );
+    assert_eq!(
+        fs.cat_file(
+            &s.p("f"),
+            ByteRange::Bounded {
+                start: 299_000,
+                end: 400_000
+            }
+        )
+        .await
+        .unwrap(),
+        data.slice(299_000..)
+    );
+    assert!(
+        fs.cat_file(&s.p("f"), ByteRange::From(400_000))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fs.cat_file(&s.p("empty"), ByteRange::Full)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    s.cleanup().await;
+}
+
+/// A non-UTF-8 file name must not be listed under a lossy name that
+/// belongs to (or aliases) another file: listing fails, as with paramiko.
+/// Needs the server's home directory to be visible locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_utf8_names_are_not_aliased() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(env) = common::env() else { return };
+    let fs = env.fs(&[]);
+    let s = Scratch::new(&env, &fs, "names").await;
+    let local = std::path::Path::new(&s.dir);
+    if !local.is_dir() {
+        eprintln!("skipping non-UTF-8 name test: {} is not local", s.dir);
+        s.cleanup().await;
+        return;
+    }
+    put(&fs, &s.p("bad\u{fffd}"), &b"replacement"[..]).await;
+    let bad = local.join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+    std::fs::write(&bad, b"ff").unwrap();
+    let e = fs.ls(&s.dir).await.unwrap_err();
+    assert!(e.to_string().contains("not valid UTF-8"), "{e}");
+    std::fs::remove_file(&bad).unwrap();
+    assert_eq!(fs.ls(&s.dir).await.unwrap().len(), 1);
+    s.cleanup().await;
 }

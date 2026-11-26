@@ -351,24 +351,26 @@ impl AzureBlobFileSystem {
             None => true,
             Some(m) => fpath::depth_below(&root, name) <= m,
         };
-        let mut out: BTreeMap<String, FileInfo> =
-            files.into_iter().filter(|(n, _)| depth_ok(n)).collect();
+        // A blob may share its name with a directory (`d/a` next to
+        // `d/a/b`, legal in the flat namespace): both are returned, the
+        // directory first. (adlfs keys its result by name and lets the
+        // directory win with `withdirs`, the file without; fsfast's Python
+        // layer always asks for directories and filters them itself, so
+        // dropping the file here would lose it from `find`/`du`/`rm`. Name
+        // -keyed consumers that keep the last entry keep the file.)
+        let mut out: Vec<FileInfo> = files.into_values().filter(|i| depth_ok(&i.name)).collect();
         if opts.withdirs {
-            for (n, d) in dirs {
-                if depth_ok(&n) {
-                    // adlfs: `files.update(dirs)`.
-                    out.insert(n, d);
-                }
-            }
+            out.extend(dirs.into_values().filter(|d| depth_ok(&d.name)));
             if root_exists {
                 let root_info = match head {
                     Some(h) => h.to_info(p.container, va),
                     None => prefix_dir(root.clone()),
                 };
-                out.insert(root.clone(), root_info);
+                out.push(root_info);
             }
         }
-        Ok(out.into_values().collect())
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.is_file().cmp(&b.is_file())));
+        Ok(out)
     }
 
     /// `find("")`: every container.

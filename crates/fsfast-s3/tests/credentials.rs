@@ -698,3 +698,52 @@ async fn concurrent_expired_token_rejections_share_one_refresh() {
         "one initial load and exactly one refresh"
     );
 }
+
+/// botocore raises ProfileNotFound for a missing profile whether it was
+/// named by the `profile` option or by AWS_PROFILE / AWS_DEFAULT_PROFILE;
+/// silently falling through to other credentials would run with an
+/// identity the user did not select.
+#[tokio::test]
+async fn missing_profile_from_the_environment_is_an_error() {
+    let fake = serve(Arc::new(|_s: &Seen| {
+        (
+            200,
+            vec![("content-length", "3".into()), ("etag", "\"p\"".into())],
+            String::new(),
+        )
+    }))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config");
+    std::fs::write(&cfg, "[profile p]\nregion = ap-south-1\n").unwrap();
+    let keys = [("key", Value::from("AK")), ("secret", Value::from("SK"))];
+    for var in ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"] {
+        let e = env(&[
+            ("AWS_CONFIG_FILE", cfg.to_str().unwrap()),
+            ("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            (var, "missing"),
+        ]);
+        let fs = fs_for(&fake.base, &keys, e);
+        let err = fs.info("bucket/k").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{var}: {err}");
+        assert!(
+            err.message()
+                .contains("The config profile (missing) could not be found"),
+            "{var}: {err}"
+        );
+    }
+    assert!(fake.seen.lock().is_empty());
+    // An existing environment-selected profile, and no profile at all
+    // (a missing "default" is fine then), still work.
+    for extra in [Some(("AWS_PROFILE", "p")), None] {
+        let mut vars = vec![
+            ("AWS_CONFIG_FILE", cfg.to_str().unwrap()),
+            ("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ];
+        vars.extend(extra);
+        let fs = fs_for(&fake.base, &keys, env(&vars));
+        assert_eq!(fs.info("bucket/k").await.unwrap().size, 3);
+    }
+}

@@ -708,11 +708,22 @@ impl S3FileSystem {
                     source_headers = self.copy_source_sse_headers(extra.as_ref());
                     if meta.size < MIN_PART {
                         // Too small to be a part: download and rewrite it.
+                        // (With the call's parameters: an SSE-C key or
+                        // RequestPayer given per call applies to the GET
+                        // as it did to the HEAD.)
                         prefix = Some(
-                            self.cat_file_impl(&name, fsfast_core::ByteRange::Full)
+                            self.cat_file_with(&name, fsfast_core::ByteRange::Full, extra.as_ref())
                                 .await?,
                         );
                     } else {
+                        // The copied part(s) must be the version this HEAD
+                        // measured (see `cp_file`).
+                        if let Some(etag) = meta.etag.as_deref().filter(|e| !e.is_empty())
+                            && let Ok(v) = HeaderValue::from_str(etag)
+                        {
+                            source_headers
+                                .insert(HeaderName::from_static("x-amz-copy-source-if-match"), v);
+                        }
                         append = Some(AppendSource {
                             copy_source: copy_source(&sp.bucket, &sp.key, None),
                             size: meta.size,

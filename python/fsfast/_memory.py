@@ -105,9 +105,16 @@ class MemoryFileSystem(FsfastFileSystem):
 
     protocol = "memory"
     root_marker = "/"
+    _cheap_info = True
     _rust_protocol = "memory"
     _pipe_none_is_empty = True
     _append_tell_from_end = True
+    # fsspec's MemoryFile is a BytesIO.
+    _readlines_bytesio = True
+    _seek_clamps_negative = True
+    # fsspec's memory store keeps nothing of a deferred write until commit:
+    # spool it instead of writing a visible temporary file.
+    _spool_transactions = True
     # fsspec's generic touch (open(path, "wb")) is deferred in a transaction.
     _touch_defers_in_transaction = True
 

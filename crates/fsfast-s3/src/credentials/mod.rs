@@ -148,6 +148,15 @@ pub fn no_credentials() -> Error {
     )
 }
 
+/// A refresh produced credentials that had already expired.
+fn still_expired() -> Error {
+    Error::new(
+        ErrorKind::PermissionDenied,
+        "Credentials were refreshed, but the refreshed credentials are still expired \
+         (check the credential source and the system clock)",
+    )
+}
+
 /// Fixed credentials (the `key`/`secret`/`token` options).
 #[derive(Debug, Clone)]
 pub struct StaticProvider(pub Credentials);
@@ -339,6 +348,10 @@ pub struct CredentialsCache {
     /// No refresh attempt before this instant while the current
     /// credentials are still valid (see [`REFRESH_RETRY_INTERVAL`]).
     retry_after: Mutex<Option<std::time::Instant>>,
+    /// The last mandatory refresh returned credentials that had already
+    /// expired: until the cool-down ends, `get` fails without asking the
+    /// provider again.
+    refreshed_expired: Mutex<bool>,
 }
 
 impl CredentialsCache {
@@ -349,6 +362,7 @@ impl CredentialsCache {
             current: RwLock::new(None),
             refresh: tokio::sync::Mutex::new(()),
             retry_after: Mutex::new(None),
+            refreshed_expired: Mutex::new(false),
         }
     }
 
@@ -372,6 +386,11 @@ impl CredentialsCache {
                         return Ok(fresh);
                     }
                     match self.provider.provide().await {
+                        Ok(Some(n)) if n.expires_within(SystemTime::now(), Duration::ZERO) => {
+                            tracing::warn!(
+                                "refreshed credentials are already expired; keeping the current ones"
+                            );
+                        }
                         Ok(Some(n)) => {
                             self.note_refresh(&n, ADVISORY_REFRESH);
                             return Ok(self.store(n));
@@ -393,12 +412,31 @@ impl CredentialsCache {
         {
             return Ok(c.clone());
         }
+        if self.cooling_down() && *self.refreshed_expired.lock() {
+            // The provider just handed out expired credentials; asking it
+            // again on every request would not help (and would hammer
+            // STS / IMDS / a credential_process helper).
+            return Err(still_expired());
+        }
         let res = self.provider.provide().await;
         if !matches!(res, Ok(Some(_))) {
             self.start_cooldown();
         }
         match res {
+            Ok(Some(n)) if n.expires_within(now, Duration::ZERO) => {
+                // botocore raises here too. Never sign with them: keep still
+                // valid credentials if there are any, else fail; either way
+                // cool down instead of refreshing again on every request.
+                tracing::warn!("refreshed credentials are already expired");
+                self.start_cooldown();
+                *self.refreshed_expired.lock() = true;
+                match current {
+                    Some(c) if !c.expires_within(now, Duration::ZERO) => Ok(c),
+                    _ => Err(still_expired()),
+                }
+            }
             Ok(Some(n)) => {
+                *self.refreshed_expired.lock() = false;
                 if n.expires_within(now, MANDATORY_REFRESH) {
                     tracing::warn!(
                         "refreshed credentials expire within the mandatory refresh window"
@@ -669,6 +707,75 @@ mod tests {
             cache.get().await.unwrap_err().kind(),
             ErrorKind::ConnectionFailed
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct AlreadyExpired {
+        calls: AtomicUsize,
+        /// The first call yields credentials valid for this long.
+        first: Option<Duration>,
+    }
+
+    #[async_trait]
+    impl ProvideCredentials for AlreadyExpired {
+        async fn provide(&self) -> Result<Option<Credentials>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0
+                && let Some(d) = self.first
+            {
+                return Ok(Some(Credentials::new(
+                    "AKGOOD",
+                    "s",
+                    Some("t".into()),
+                    Some(SystemTime::now() + d),
+                )));
+            }
+            Ok(Some(Credentials::new(
+                "AKOLD",
+                "s",
+                Some("t".into()),
+                Some(SystemTime::now() - Duration::from_secs(3600)),
+            )))
+        }
+
+        fn name(&self) -> &'static str {
+            "already-expired"
+        }
+    }
+
+    #[tokio::test]
+    async fn already_expired_refresh_is_an_error_and_cools_down() {
+        // A provider handing out credentials that have already expired (a
+        // stale credential_process cache, a clock running far ahead): they
+        // must not be used to sign, and the provider must not be asked again
+        // on every request (botocore: "Credentials were refreshed, but the
+        // refreshed credentials are still expired").
+        let p = Arc::new(AlreadyExpired::default());
+        let cache = CredentialsCache::new(p.clone());
+        for _ in 0..20 {
+            let e = cache.get().await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::PermissionDenied, "{e}");
+            assert!(e.message().contains("still expired"), "{e}");
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        assert!(cache.current.read().is_none());
+        // Still valid credentials are kept when a refresh (advisory or
+        // mandatory) yields expired ones.
+        for lifetime in [12 * 60, 5 * 60] {
+            let p = Arc::new(AlreadyExpired {
+                first: Some(Duration::from_secs(lifetime)),
+                ..AlreadyExpired::default()
+            });
+            let cache = CredentialsCache::new(p.clone());
+            assert_eq!(cache.get().await.unwrap().access_key_id(), "AKGOOD");
+            // (Short-lived credentials start a cool-down; skip it so the
+            // next get refreshes.)
+            *cache.retry_after.lock() = None;
+            for _ in 0..20 {
+                assert_eq!(cache.get().await.unwrap().access_key_id(), "AKGOOD");
+            }
+            assert_eq!(p.calls.load(Ordering::SeqCst), 2, "{lifetime}");
+        }
     }
 
     #[tokio::test]

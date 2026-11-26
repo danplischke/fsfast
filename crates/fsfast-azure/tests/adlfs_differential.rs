@@ -7,7 +7,9 @@
 //!
 //! Known, documented differences are normalised here: fsfast's
 //! `find(withdirs=True)` includes the root (fsspec's contract; adlfs leaves
-//! it out).
+//! it out), and it keeps a blob whose name is also a directory (`f` next to
+//! `f/z`) next to that directory (adlfs keys its result by name and the
+//! directory replaces the file).
 //!
 //! Gated on `FSFAST_TEST_FSSPEC_PYTHON` (a Python with adlfs) and
 //! `FSFAST_TEST_AZURE_CONNECTION_STRING` (`eval "$(scripts/test-services.sh env)"`).
@@ -269,9 +271,13 @@ async fn matches_adlfs() {
                             return json!({"names": [path]});
                         }
                         // fsfast includes the root with withdirs; adlfs does not.
+                        // adlfs's directory replaces a blob of the same name.
+                        let shadowed = |i: &FileInfo| {
+                            i.is_file() && v.iter().any(|d| d.is_dir() && d.name == i.name)
+                        };
                         J::Array(
                             v.iter()
-                                .filter(|i| !(i.name == path && i.is_dir()))
+                                .filter(|i| !(i.name == path && i.is_dir()) && !shadowed(i))
                                 .map(info_json)
                                 .collect(),
                         )

@@ -3,12 +3,16 @@
 //! with botocore's region redirects and a refresh of rejected temporary
 //! credentials.
 //!
-//! * **Payload hashing** follows botocore: the body's SHA-256 is signed,
-//!   except for object data (`PutObject`, `UploadPart`) over HTTPS, which
-//!   is sent with `UNSIGNED-PAYLOAD` (TLS protects it in transit), unless
-//!   `payload_signing_enabled` says otherwise. Large bodies are hashed on a
-//!   blocking thread (SHA-NI makes this ~2 GB/s, but it must not stall the
-//!   runtime).
+//! * **Payload hashing**: the body's SHA-256 is signed, except for object
+//!   data (`PutObject`, `UploadPart`) over HTTPS, which is sent with
+//!   `UNSIGNED-PAYLOAD` (TLS protects it in transit), unless
+//!   `payload_signing_enabled` says otherwise. botocore skips body signing
+//!   only when a checksum header covers the body; fsfast does the same:
+//!   object data carries a `Content-MD5` (botocore sends a CRC32) unless
+//!   `request_checksum_calculation` is `"when_required"`. The checksum is
+//!   also what S3 requires for uploads to Object Lock buckets. Large bodies
+//!   are hashed on a blocking thread, MD5 and SHA-256 in one task (they
+//!   must not stall the runtime).
 //! * **Region redirects** (botocore `S3RegionRedirectorv2`): a request
 //!   answered with a redirect status, `PermanentRedirect`,
 //!   `AuthorizationHeaderMalformed` with a `Region`,
@@ -170,6 +174,17 @@ fn op_kind(op: Op) -> OpKind {
     }
 }
 
+fn is_user_metadata(name: &HeaderName) -> bool {
+    name.as_str().starts_with("x-amz-meta-")
+}
+
+fn remove_user_metadata(h: &mut HeaderMap) {
+    let names: Vec<HeaderName> = h.keys().filter(|n| is_user_metadata(n)).cloned().collect();
+    for n in names {
+        h.remove(n);
+    }
+}
+
 /// Error codes that mean "these temporary credentials are no longer valid".
 fn is_expired_credentials(err: &Error) -> bool {
     matches!(
@@ -189,6 +204,9 @@ pub(crate) struct Client {
     pub creds: Option<Arc<CredentialsCache>>,
     pub signer: Signer,
     pub payload_signing: Option<bool>,
+    /// Send `Content-MD5` with object data (`PutObject`, `UploadPart`);
+    /// botocore's `request_checksum_calculation = "when_supported"`.
+    pub request_checksum: bool,
     pub params: Params,
     /// Learned bucket regions.
     bucket_regions: RwLock<HashMap<String, String>>,
@@ -206,6 +224,7 @@ impl Client {
         region: String,
         creds: Option<Arc<CredentialsCache>>,
         payload_signing: Option<bool>,
+        request_checksum: bool,
         params: Params,
         discover: bool,
     ) -> Self {
@@ -216,6 +235,7 @@ impl Client {
             creds,
             signer: Signer::new("s3"),
             payload_signing,
+            request_checksum,
             params,
             bucket_regions: RwLock::new(HashMap::new()),
             discover,
@@ -296,25 +316,41 @@ impl Client {
         region
     }
 
-    async fn payload_hash(&self, body: &Body, op: Op, https: bool) -> Result<String> {
-        let Body::Bytes(b) = body else {
-            return Ok(EMPTY_SHA256.to_owned());
+    /// The payload hash to sign (empty for anonymous requests) and, with
+    /// `md5`, the body's base64 MD5 digest, computed in one pass over the
+    /// body (on a blocking thread for large bodies).
+    async fn body_digests(
+        &self,
+        body: &Body,
+        op: Op,
+        https: bool,
+        md5: bool,
+    ) -> Result<(String, Option<String>)> {
+        let b = match body {
+            Body::Bytes(b) => b.clone(),
+            Body::Empty => Bytes::new(),
         };
-        if b.is_empty() {
-            return Ok(EMPTY_SHA256.to_owned());
-        }
-        let sign = match self.payload_signing {
+        let signed = self.creds.is_some();
+        let sign_body = match self.payload_signing {
             Some(v) => v,
             None => !(https && matches!(op, Op::PutObject | Op::UploadPart)),
         };
-        if !sign {
-            return Ok(UNSIGNED_PAYLOAD.to_owned());
+        let compute = move |b: &[u8]| {
+            let hash = if !signed {
+                String::new()
+            } else if b.is_empty() {
+                EMPTY_SHA256.to_owned()
+            } else if sign_body {
+                sha256_hex(b)
+            } else {
+                UNSIGNED_PAYLOAD.to_owned()
+            };
+            (hash, md5.then(|| b64(&Md5::digest(b))))
+        };
+        if b.len() < HASH_INLINE_MAX || !((signed && sign_body) || md5) {
+            return Ok(compute(&b));
         }
-        if b.len() < HASH_INLINE_MAX {
-            return Ok(sha256_hex(b));
-        }
-        let b = b.clone();
-        tokio::task::spawn_blocking(move || sha256_hex(&b))
+        tokio::task::spawn_blocking(move || compute(&b))
             .await
             .map_err(|e| Error::new(ErrorKind::Other, format!("hashing task failed: {e}")))
     }
@@ -346,24 +382,57 @@ impl Client {
             retry_safe,
             content_md5,
         } = call;
-        let params = match extra {
-            Some(e) if !e.is_empty() => Cow::Owned(self.params.merged(e)),
-            _ => Cow::Borrowed(&self.params),
+        // Precedence as in s3fs (`kw = s3_additional_kwargs.copy();
+        // kw.update(kwargs)`): the filesystem's parameters, then the call's
+        // own headers and query (content type, metadata, ACL, preserved
+        // headers of an appended object, ...), then per-call extras. A
+        // layer that sets user metadata replaces the whole map.
+        let extra = extra.filter(|e| !e.is_empty());
+        let base = match extra {
+            Some(e) => Cow::Owned(self.params.without(e)),
+            None => Cow::Borrowed(&self.params),
         };
-        params.apply(op, &mut headers, &mut query);
-        if content_md5 && let Body::Bytes(b) = &body {
-            let v = HeaderValue::from_str(&b64(&Md5::digest(b))).expect("base64 is a valid header");
-            headers.insert(HeaderName::from_static("content-md5"), v);
+        let mut h = HeaderMap::new();
+        let mut q = Vec::new();
+        base.apply(op, &mut h, &mut q);
+        if headers.keys().any(is_user_metadata) {
+            remove_user_metadata(&mut h);
         }
+        for name in headers.keys() {
+            h.remove(name);
+        }
+        for (name, value) in &headers {
+            h.append(name.clone(), value.clone());
+        }
+        q.retain(|(k, _)| !query.iter().any(|(c, _)| c == k));
+        q.append(&mut query);
+        if let Some(e) = extra {
+            if e.contains("Metadata") {
+                remove_user_metadata(&mut h);
+            }
+            e.apply(op, &mut h, &mut q);
+        }
+        headers = h;
+        query = q;
         let https = match &self.endpoint.custom {
             Some(u) => u.scheme() == "https",
             None => self.endpoint.use_ssl,
         };
-        let payload_hash = if self.creds.is_some() {
-            self.payload_hash(&body, op, https).await?
-        } else {
-            String::new()
-        };
+        // Object data carries an integrity checksum, as botocore's default
+        // CRC32: S3 requires one (Content-MD5 or x-amz-checksum-*) for
+        // uploads to Object Lock buckets with a retention period and with
+        // ObjectLock* parameters. Content-MD5 because every S3-compatible
+        // server accepts it, on parts too, without declaring a checksum
+        // algorithm when the multipart upload is created. It is computed in
+        // the same pass as the payload hash.
+        let want_md5 = !headers.contains_key("content-md5")
+            && (content_md5
+                || (self.request_checksum && matches!(op, Op::PutObject | Op::UploadPart)));
+        let (payload_hash, md5) = self.body_digests(&body, op, https, want_md5).await?;
+        if let Some(m) = md5 {
+            let v = HeaderValue::from_str(&m).expect("base64 is a valid header");
+            headers.insert(HeaderName::from_static("content-md5"), v);
+        }
         let mut region = self.region_for(bucket).await;
         let mut redirected = false;
         let mut refreshed = false;

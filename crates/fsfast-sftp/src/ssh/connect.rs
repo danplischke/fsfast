@@ -52,6 +52,10 @@ pub struct Target {
     pub user: String,
     /// Name looked up in known_hosts (`HostKeyAlias` or the host).
     pub key_host: String,
+    /// Port used for the known_hosts lookup: the connection port, or 22
+    /// (meaning "no `[name]:port` form") when `key_host` comes from
+    /// `HostKeyAlias`, which OpenSSH looks up exactly as written.
+    pub key_port: u16,
     /// Known-hosts files to load.
     pub known_hosts_files: Vec<PathBuf>,
     /// Policy for unknown keys.
@@ -200,17 +204,20 @@ impl Target {
         let agent_socket = if !cfg.allow_agent {
             None
         } else {
-            match hc.identity_agent.as_deref() {
-                Some(a) if a.eq_ignore_ascii_case("none") => None,
-                Some(a) if a != "SSH_AUTH_SOCK" => Some(expand(a.trim_start_matches('$'))),
-                _ => std::env::var_os("SSH_AUTH_SOCK")
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from),
-            }
+            identity_agent_socket(hc.identity_agent.as_deref(), &expand, &|k| {
+                std::env::var_os(k)
+            })
         };
 
         Ok(Target {
             alias: cfg.host.clone(),
+            // OpenSSH looks a HostKeyAlias up verbatim (no `[alias]:port`);
+            // only the real host name gets the port (put_host_port).
+            key_port: if hc.host_key_alias.is_some() {
+                22
+            } else {
+                port
+            },
             key_host: hc
                 .host_key_alias
                 .clone()
@@ -439,6 +446,39 @@ async fn within<T>(
     }
 }
 
+/// The agent socket for ssh_config `IdentityAgent` (`None` when the
+/// keyword is absent), as OpenSSH resolves it: `none` disables the agent;
+/// `SSH_AUTH_SOCK` (or no keyword) uses that environment variable; `$NAME`
+/// reads the environment variable `NAME` (unset or empty disables the
+/// agent, an invalid name is ignored); anything else is a path with `~` and
+/// `%` tokens expanded.
+fn identity_agent_socket(
+    value: Option<&str>,
+    expand: &dyn Fn(&str) -> PathBuf,
+    getenv: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let from_env = |name: &str| getenv(name).filter(|s| !s.is_empty()).map(PathBuf::from);
+    match value {
+        None | Some("SSH_AUTH_SOCK") => from_env("SSH_AUTH_SOCK"),
+        Some(a) if a.eq_ignore_ascii_case("none") => None,
+        Some(a) => match a.strip_prefix('$') {
+            Some(name) => {
+                let valid = !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !valid {
+                    tracing::debug!(
+                        "ssh_config IdentityAgent {a:?}: invalid environment variable name"
+                    );
+                    return None;
+                }
+                from_env(name)
+            }
+            None => Some(expand(a)),
+        },
+    }
+}
+
 /// An authenticated SSH connection.
 pub struct SshConnection {
     handle: Handle<ClientHandler>,
@@ -461,7 +501,7 @@ impl SshConnection {
         // Known hosts are re-read for every connection, so edits apply
         // without recreating the filesystem.
         let known = KnownHosts::load(&t.known_hosts_files);
-        let verifier = HostKeyVerifier::new(t.policy, known, &t.key_host, t.port);
+        let verifier = HostKeyVerifier::new(t.policy, known, &t.key_host, t.key_port);
         let config = client::Config {
             client_id: SshId::Standard(Cow::Owned(format!(
                 "SSH-2.0-fsfast_{}",
@@ -598,5 +638,61 @@ impl SshConnection {
             .handle
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_agent_env_vars() {
+        let expand = |v: &str| PathBuf::from(v.replace('~', "/home/u"));
+        let getenv = |k: &str| match k {
+            "SSH_AUTH_SOCK" => Some("/run/agent.sock".into()),
+            "MY_AGENT" => Some("/run/my.sock".into()),
+            "EMPTY" => Some("".into()),
+            _ => None,
+        };
+        let r = |v| identity_agent_socket(v, &expand, &getenv);
+        assert_eq!(r(None), Some(PathBuf::from("/run/agent.sock")));
+        assert_eq!(
+            r(Some("SSH_AUTH_SOCK")),
+            Some(PathBuf::from("/run/agent.sock"))
+        );
+        assert_eq!(
+            r(Some("$SSH_AUTH_SOCK")),
+            Some(PathBuf::from("/run/agent.sock"))
+        );
+        assert_eq!(r(Some("$MY_AGENT")), Some(PathBuf::from("/run/my.sock")));
+        assert_eq!(r(Some("$UNSET_VAR")), None);
+        assert_eq!(r(Some("$EMPTY")), None);
+        assert_eq!(r(Some("$1BAD")), None);
+        assert_eq!(r(Some("none")), None);
+        assert_eq!(r(Some("~/agent")), Some(PathBuf::from("/home/u/agent")));
+    }
+
+    fn resolve_with_config(text: &str, port: u16) -> Target {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgf = dir.path().join("config");
+        std::fs::write(&cfgf, text).unwrap();
+        let mut cfg = SftpConfig::new("example.test").with_port(port);
+        cfg.username = Some("u".into());
+        cfg.ssh_config = SshConfigSource::Files(vec![cfgf]);
+        Target::resolve(&cfg).unwrap()
+    }
+
+    #[test]
+    fn host_key_alias_is_looked_up_without_port() {
+        // OpenSSH looks a HostKeyAlias up verbatim, whatever the port.
+        let t = resolve_with_config("Host *\n  HostKeyAlias myalias\n", 2222);
+        assert_eq!(t.key_host, "myalias");
+        assert_eq!(known_hosts::lookup_name(&t.key_host, t.key_port), "myalias");
+        // Without an alias, non-default ports use `[host]:port`.
+        let t = resolve_with_config("Host other\n  User x\n", 2222);
+        assert_eq!(
+            known_hosts::lookup_name(&t.key_host, t.key_port),
+            "[example.test]:2222"
+        );
     }
 }

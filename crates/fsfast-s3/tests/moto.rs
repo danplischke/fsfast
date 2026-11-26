@@ -544,3 +544,77 @@ async fn version_aware_matches_s3fs() {
         mismatches.join("\n")
     );
 }
+
+/// Uploads to an Object Lock bucket with a default retention period need a
+/// Content-MD5 or checksum (s3fs gets botocore's CRC32): single PUTs,
+/// rewrites of small appended objects and ObjectLock* parameters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_lock_bucket_uploads() {
+    let Ok(python) = std::env::var("FSFAST_TEST_FSSPEC_PYTHON") else {
+        eprintln!("skipping object_lock_bucket_uploads: set FSFAST_TEST_FSSPEC_PYTHON");
+        return;
+    };
+    let Some(m) = start_moto().await else { return };
+    let script = r#"
+import sys, boto3
+c = boto3.client("s3", endpoint_url=sys.argv[1], aws_access_key_id="testing",
+                 aws_secret_access_key="testing", region_name="us-east-1")
+c.create_bucket(Bucket="lockbkt", ObjectLockEnabledForBucket=True)
+c.put_object_lock_configuration(Bucket="lockbkt", ObjectLockConfiguration={
+    "ObjectLockEnabled": "Enabled",
+    "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 1}}})
+"#;
+    let status = Command::new(&python)
+        .args(["-c", script, &m.endpoint])
+        .status()
+        .unwrap();
+    assert!(status.success(), "creating the Object Lock bucket failed");
+    let f = fs(&m, &[]);
+    let w = WriteOptions::default();
+    f.pipe_file("lockbkt/k", Bytes::from_static(b"hello"), &w)
+        .await
+        .unwrap();
+    let a = WriteOptions {
+        mode: WriteMode::Append,
+        ..WriteOptions::default()
+    };
+    f.pipe_file("lockbkt/k", Bytes::from_static(b" world"), &a)
+        .await
+        .unwrap();
+    assert_eq!(
+        &f.cat_file("lockbkt/k", ByteRange::Full).await.unwrap()[..],
+        b"hello world"
+    );
+    // ObjectLock* parameters on a single PUT.
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert("ObjectLockLegalHoldStatus".to_owned(), Value::from("ON"));
+    let held = WriteOptions {
+        extra,
+        ..WriteOptions::default()
+    };
+    f.pipe_file("lockbkt/held", Bytes::from_static(b"x"), &held)
+        .await
+        .unwrap();
+    // Without the checksum, moto refuses (as AWS does).
+    let bare = fs(
+        &m,
+        &[(
+            "config_kwargs",
+            Value::Map(
+                [(
+                    "request_checksum_calculation".to_owned(),
+                    Value::from("when_required"),
+                )]
+                .into(),
+            ),
+        )],
+    );
+    let err = bare
+        .pipe_file("lockbkt/k2", Bytes::from_static(b"x"), &w)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Content-MD5"),
+        "expected moto's Object Lock refusal: {err}"
+    );
+}

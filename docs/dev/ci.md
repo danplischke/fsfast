@@ -18,7 +18,7 @@ Helper files:
 | `fmt` | ubuntu-latest | `cargo fmt --all --check` |
 | `clippy` | ubuntu-latest | `cargo clippy --workspace --all-targets --locked -- -D warnings`, then `fsf` with only `local,memory` (feature-gating check) |
 | `test` | ubuntu-latest | `cargo test --workspace --locked` with no `FSFAST_TEST_*` set: every service-backed test must print a skip message and pass |
-| `services` | ubuntu-latest | starts all test services in the runner, then runs `cargo test --workspace` again with the services, builds the extension (`maturin develop --release`), runs `pytest tests/python`, and runs a tiny `fsf bench` on every service (the JSON is uploaded as an artifact) |
+| `services` | ubuntu-latest | starts all test services in the runner, then runs `cargo test --workspace` again with the services, runs the SFTP public-key auth tests as root, builds the extension (`maturin develop --release`), runs `pytest tests/python`, the harness tests (`bench/test_bench.py`, `tests/compliance/test_runner.py`) and the abstract compliance suite (`tests/compliance/run.sh abstract`), and runs a tiny `fsf bench` on every service (the bench JSON and the compliance reports are uploaded as artifacts) |
 | `wheels` | see the next table | builds the abi3 wheel with `PyO3/maturin-action`, installs it in a clean environment, runs `pytest tests/python` against it, and uploads it |
 | `sdist` | ubuntu-latest | `maturin sdist` |
 

@@ -13,21 +13,25 @@ emulators.
 The table shows fsfast's median speedup over the reference implementation
 (fsfast ÷ reference, median of 3 timed iterations each, `default` profile).
 Values below 1 mean fsfast is slower. "n/a" means the reference cannot do
-the workload.
+the workload. **Bold** cells were re-measured on 2026-11-26 after the fixes
+for the findings ([before and after](#after-the-fixes-2026-11-26)); the
+others are the 2026-11-25 run. For smb, smb-enc and sftp only fsfast and
+fsf were re-run (the references are unchanged and slow), so those bold
+ratios divide the new fsfast figure by the 2026-11-25 reference figure.
 
 | workload | s3 | smb | smb-enc | sftp | http | gcs | azure | local | memory |
 |---|---|---|---|---|---|---|---|---|---|
-| W1 seq-read | 1.85x | 4.78x | 4.66x | 158.68x | 1.71x | 1.17x | 1.70x | 1.33x | 2.94x |
-| W1 seq-read-open | 2.12x | 7.04x | 5.12x | 184.70x | 3.53x | 2.08x | 1.79x | 0.90x | 0.70x |
+| W1 seq-read | **1.81x** | **7.03x** | **6.31x** | **119.56x** | **1.70x** | **1.76x** | **1.81x** | **1.80x** | **2.48x** |
+| W1 seq-read-open | **2.02x** | **7.96x** | **5.28x** | **175.31x** | **4.80x** | **1.54x** | **1.73x** | **1.09x** | **0.71x** |
 | W2 seq-write | 2.81x | 6.00x | 6.73x | 747.25x | 1.12x | 1.33x | 1.19x | 0.81x | 1.05x |
-| W3 small-read | 12.01x | 46.85x | 55.26x | 52.60x | 3.41x | 3.48x | 4.17x | 0.82x | 1.18x |
-| W4 small-write | 2.68x | 16.69x | 5.38x | 2.97x | 0.96x | 1.39x | 1.74x | 1.13x | 2.18x |
+| W3 small-read | **17.08x** | 46.85x | 55.26x | 52.60x | **6.05x** | **4.70x** | **4.92x** | 0.82x | 1.18x |
+| W4 small-write | **3.83x** | 16.69x | 5.38x | 2.97x | **3.93x** | **1.44x** | **1.62x** | 1.13x | 2.18x |
 | W5 metadata-info | 4.09x | 20.68x | 16.47x | 1.59x | 2.77x | 1.70x | 2.40x | 0.92x | 31.48x |
 | W5 metadata-ls | 2.81x | 228.70x | 216.34x | 2.37x | 0.88x | 0.94x | 3.45x | 0.89x | 0.78x |
 | W5 metadata-find | 2.56x | 207.42x | 201.83x | 2.36x | 0.98x | 0.85x | 3.56x | 1.74x | 1.23x |
-| W6 random-read | 2.91x | 33.63x | 30.55x | 85.36x | 0.72x | 1.46x | 2.18x | 0.93x | 2.17x |
-| W7 copy | 1.03x | 10.20x | 6.77x | 4752.34x | n/a | 1.00x | 1.76x | 2.93x | 0.74x |
-| W8 delete | 0.87x | 44.33x | 36.92x | 18.30x | n/a | 0.18x | 2.40x | 1.47x | 61.33x |
+| W6 random-read | **3.08x** | **36.10x** | **24.96x** | **124.43x** | **2.50x** | **3.99x** | **1.76x** | **1.16x** | **4.15x** |
+| W7 copy | **1.35x** | **8.28x** | **10.20x** | **5156.55x** | n/a | **1.09x** | **2.57x** | **3.66x** | **0.63x** |
+| W8 delete | **1.12x** | **50.00x** | **51.06x** | **43.56x** | n/a | **1.90x** | **3.87x** | **1.20x** | **76.67x** |
 
 Against sshfs (the second SFTP reference), fsfast is 3.2–4.9× faster on large reads and writes, 3–4× on metadata, 21× on small reads, 5× on small writes and 25× on deletes; sshfs cannot do W6 (its ranged reads return whole objects) or W7 at this concurrency (see [findings](#findings-and-follow-ups)). The sftp W7 ratio compares fsfast's server-side copy with the client-side copy paramiko forces (it has no `cp_file`).
 
@@ -39,17 +43,20 @@ What the numbers say:
   than fsfast, and fsspec's sftp (paramiko) 1.6–750× slower. On S3, GCS
   and Azure the gains are 1.2–12×, because s3fs, gcsfs and adlfs are
   already asynchronous. The exceptions:
-  * **GCS W8 delete is 5× slower than gcsfs** (0.18×), because fsfast
-    looks up every path before deleting (finding 3).
-  * **HTTP W6 random reads are slower** (0.72×), because coalescing reads
-    5× the requested bytes (finding 2).
+  * Before the fixes of 2026-11-26, GCS W8 delete was 5× slower than
+    gcsfs (0.18×, finding 3) and HTTP W6 random reads were slower than
+    fsspec (0.72×, finding 2); both are now faster (1.90× and 2.50×).
+  * **Azure W6 random reads lost 25%** with the coalescing guard (finding
+    2): Azurite answers 325 small requests more slowly than 61 large ones
+    on loopback; fsfast is still 1.76× adlfs.
   * **Ties, within the noise of this machine:**
-    * S3 W7 (1.03×) and W8 (0.87×): RustFS's CopyObject and DeleteObjects
-      are the limit, and `fsf` is no faster.
-    * GCS W7 (1.00×), and GCS ls/find (0.94×/0.85×): fake-gcs-server is
+    * S3 W7 (1.35×) and W8 (1.12×): RustFS's CopyObject and DeleteObjects
+      are the limit, and `fsf` is no faster. Before the 2026-11-26 fixes
+      these were 1.03× and 0.87×.
+    * GCS W7 (1.09×), and GCS ls/find (0.94×/0.85×): fake-gcs-server is
       CPU-bound, and `fsf` is no faster.
-    * HTTP W4 (0.96×) and ls/find (0.88×/0.98×): nginx and the HTML
-      parsing, respectively.
+    * HTTP ls/find (0.88×/0.98×): the HTML parsing. HTTP W4 was a tie
+      (0.96×) before the batch-size fix; it is now 3.93×.
 * **Local and memory.** The reference is a thin wrapper around the
   operating system or a Python dict. fsfast's per-call bridge (about
   2–5 µs) shows in the metadata loops, and its extra copy shows in
@@ -62,6 +69,139 @@ What the numbers say:
   * `cat_ranges` on SFTP, SMB and GCS, 0.38–0.63×: one Python `bytes` per
     range, plus the coalescing differences of finding 2;
   * `rm` of many files on SMB, SFTP, GCS and Azure (finding 3).
+
+## After the fixes (2026-11-26)
+
+The findings below were fixed in python/fsfast, crates/fsfast-py,
+crates/fsfast-smb (counters only) and crates/fsfast-local (FIFO), and the
+affected rows re-run with `bench/run.py` (same method and `default`
+profile; documents `bench/results/bench-20261126T*-fixes-*.json`, load
+average 0.5–4.6, apart from one burst to 9.7 during the GCS run; the W6
+rows come from the `fixes-w6-*` documents, memory W1/W6 from
+`fixes-w1w6-memory`). "÷ ref" columns divide by the reference measured in
+the same document, except where marked * (the 2026-11-25 reference figure).
+The last column is fsfast's `stats()["requests"]` for the last iteration,
+which now counts wire requests (finding 5).
+
+| target | workload | unit | fsfast before | fsfast after | ÷ ref before | ÷ ref after | ÷ fsf after | wire requests (last iter) |
+|---|---|---|---|---|---|---|---|---|
+| azure | W1 seq-read | MB/s | 421 | 406 | 1.70x | 1.81x | 0.50x | 34 |
+| azure | W1 seq-read-open | MB/s | 513 | 551 | 1.79x | 1.73x |  | 33 |
+| azure | W3 small-read | ops/s | 1,057 | 1,272 | 4.17x | 4.92x | 0.89x | 1000 |
+| azure | W4 small-write | ops/s | 807 | 751 | 1.74x | 1.62x | 1.25x | 1000 |
+| azure | W6 random-read | MB/s | 73.0 | 54.8 | 2.18x | 1.76x | 0.86x | 325 |
+| azure | W7 copy | MB/s | 2,722 | 4,150 | 1.76x | 2.57x | 0.88x | 64 |
+| azure | W8 delete | ops/s | 442 | 714 | 2.40x | 3.87x | 1.08x | 5000 |
+| gcs | W1 seq-read | MB/s | 608 | 1,217 | 1.17x | 1.76x | 0.82x | 35 |
+| gcs | W1 seq-read-open | MB/s | 1,713 | 1,658 | 2.08x | 1.54x |  | 33 |
+| gcs | W3 small-read | ops/s | 7,081 | 10,975 | 3.48x | 4.70x | 1.25x | 1000 |
+| gcs | W4 small-write | ops/s | 340 | 318 | 1.39x | 1.44x | 1.02x | 1000 |
+| gcs | W6 random-read | MB/s | 179 | 460 | 1.46x | 3.99x | 1.17x | 325 |
+| gcs | W7 copy | MB/s | 151 | 151 | 1.00x | 1.09x | 1.01x | 64 |
+| gcs | W8 delete | ops/s | 167 | 2,047 | 0.18x | 1.90x | 0.96x | 5000 |
+| http | W1 seq-read | MB/s | 943 | 1,581 | 1.71x | 1.70x |  | 57 |
+| http | W1 seq-read-open | MB/s | 2,473 | 3,222 | 3.53x | 4.80x |  | 53 |
+| http | W3 small-read | ops/s | 26,405 | 39,698 | 3.41x | 6.05x |  | 1000 |
+| http | W4 small-write | ops/s | 2,050 | 16,762 | 0.96x | 3.93x |  | 1000 |
+| http | W6 random-read | MB/s | 210 | 747 | 0.72x | 2.50x |  | 325 |
+| local | W1 seq-read | MB/s | 2,174 | 3,074 | 1.33x | 1.80x | 0.36x | 3 |
+| local | W1 seq-read-open | MB/s | 5,187 | 6,552 | 0.90x | 1.09x |  | 1 |
+| local | W6 random-read | MB/s | 1,428 | 1,383 | 0.93x | 1.16x | 0.45x | 1 |
+| local | W7 copy | MB/s | 7,173 | 7,266 | 2.93x | 3.66x | 1.04x | 128 |
+| local | W8 delete | ops/s | 166,555 | 173,370 | 1.47x | 1.20x | 0.46x | 1 |
+| memory | W1 seq-read | MB/s | 4,331 | 4,093 | 2.94x | 2.48x | 0.00x | 1 |
+| memory | W1 seq-read-open | MB/s | 6,492 | 6,993 | 0.70x | 0.71x |  | 1 |
+| memory | W6 random-read | MB/s | 4,939 | 6,980 | 2.17x | 4.15x | 0.02x | 1 |
+| memory | W7 copy | MB/s | 925,898 | 911,384 | 0.74x | 0.63x | 0.16x | 128 |
+| memory | W8 delete | ops/s | 167,525 | 214,643 | 61.33x | 76.67x | 0.06x | 10001 |
+| s3 | W1 seq-read | MB/s | 533 | 623 | 1.85x | 1.81x | 0.71x | 35 |
+| s3 | W1 seq-read-open | MB/s | 892 | 880 | 2.12x | 2.02x |  | 33 |
+| s3 | W3 small-read | ops/s | 5,327 | 7,295 | 12.01x | 17.08x | 1.02x | 1000 |
+| s3 | W4 small-write | ops/s | 1,610 | 2,313 | 2.68x | 3.83x | 1.18x | 1000 |
+| s3 | W6 random-read | MB/s | 140 | 135 | 2.91x | 3.08x | 1.28x | 325 |
+| s3 | W7 copy | MB/s | 370 | 497 | 1.03x | 1.35x | 1.12x | 128 |
+| s3 | W8 delete | ops/s | 824 | 868 | 0.87x | 1.12x | 0.89x | 5 |
+| sftp | W1 seq-read | MB/s | 673 | 507 | 158.68x | 119.56x* | 0.63x | 62 |
+| sftp | W1 seq-read-open | MB/s | 839 | 796 | 184.70x | 175.31x* |  | 67 |
+| sftp | W6 random-read | MB/s | 401 | 584 | 85.36x | 124.43x* | 0.63x | 334 |
+| sftp | W7 copy | MB/s | 4,160 | 4,514 | 4752.34x | 5156.55x* | 0.76x | 65 |
+| sftp | W8 delete | ops/s | 40,147 | 95,583 | 18.30x | 43.56x* | 0.79x | 1 |
+| smb | W1 seq-read | MB/s | 866 | 1,273 | 4.78x | 7.03x* | 0.75x | 133 |
+| smb | W1 seq-read-open | MB/s | 1,909 | 2,157 | 7.04x | 7.96x* |  | 130 |
+| smb | W6 random-read | MB/s | 818 | 878 | 33.63x | 36.10x* | 0.68x | 401 |
+| smb | W7 copy | MB/s | 6,170 | 5,010 | 10.20x | 8.28x* | 1.06x | 65 |
+| smb | W8 delete | ops/s | 8,365 | 9,436 | 44.33x | 50.00x* | 0.78x | 5000 |
+| smb-enc | W1 seq-read | MB/s | 821 | 1,112 | 4.66x | 6.31x* | 0.75x | 133 |
+| smb-enc | W1 seq-read-open | MB/s | 1,465 | 1,510 | 5.12x | 5.28x* |  | 130 |
+| smb-enc | W6 random-read | MB/s | 738 | 603 | 30.55x | 24.96x* | 0.58x | 401 |
+| smb-enc | W7 copy | MB/s | 4,215 | 6,350 | 6.77x | 10.20x* | 1.36x | 65 |
+| smb-enc | W8 delete | ops/s | 7,442 | 10,295 | 36.92x | 51.06x* | 0.89x | 5000 |
+
+What changed, by finding:
+
+* **1. `cat_file` copy.** The sync `cat_file` reads results of 16 MiB or
+  more straight into the final `bytes` object (`ops::cat_file_start` +
+  `DirectCat::fill`, the engine's `read_parallel_into` through a read
+  handle). Network backends first read 16 MiB with the backend's
+  `cat_file`, so smaller files remain one call (one GET on object stores);
+  local looks the size up with a `stat`. Backends whose handles pin a
+  version (S3, GCS, Azure, HTTP) read that first part again through the
+  pinned handle, so the result is one consistent object version, at the
+  cost of 16 MiB and one HEAD per large read. The memory store keeps the
+  plain path (its `cat_file` is already a zero-copy slice). W1 `cat_file`
+  went from 0.4–0.6× of `open().read()` to 0.9–1.0× on SMB and SFTP
+  (direct probe: SMB 1,229–1,416 against 1,305–1,544 MB/s; S3 716
+  against 873). The async `_cat_file` still copies (see gaps).
+* **2. Coalescing.** The backends' gap and maximum (`IoHints`) are kept,
+  plus an amplification guard in fsfast-py (`ops::plan_ranges`): a hole is
+  bridged only if it is no larger than the requested bytes it joins (or
+  64 KiB). Dense ranges merge exactly as before; when the guard splits a
+  group the backend would have merged, the planned requests go through one
+  read handle (4 KiB-aligned, `max_concurrency` in flight), otherwise the
+  backend's `cat_ranges` runs unchanged. On W6's offsets this fetches
+  about 42 MiB in about 320 requests instead of 163 MiB in 61, for 31 MiB
+  requested. Loopback results: HTTP 3.6× faster (0.72× → 2.50× of
+  fsspec), GCS 2.6× faster, S3 unchanged, Azure 25% slower (Azurite's
+  per-request cost).
+* **3. rm/copy/get.** `_expand_kinds` expands paths exactly like fsspec's
+  `expand_path` but keeps the types its `find`/`glob` listings already
+  returned; paths given literally are not looked up. Deletes, copies and
+  downloads run as files first, and only the paths that fail are looked
+  up (a directory then gets the directory step: `rmdir`, `makedirs` or a
+  local directory; anything else raises the original error). Reference
+  semantics and exceptions are unchanged: the parity tests (tests/python)
+  and every compliance suite pass as before. GCS W8: 167 → 2,047 files/s
+  (0.18× → 1.90× of gcsfs); Azure W8 442 → 714 (now 1.08× of fsf); SFTP
+  W8 40k → 96k files/s.
+* **4. Batch sizes.** Classes whose reference is an fsspec
+  `AsyncFileSystem` (S3, GCS, Azure, HTTP) now default to
+  `fsspec.asyn._get_batch_size()`, honouring `conf["gather_batch_size"]`,
+  `conf["nofiles_gather_batch_size"]`, the instance's `batch_size` and the
+  calls' `batch_size` arguments (remote-only batches: 1280; transfers with
+  local files: `RLIMIT_NOFILE // 8`). Wire concurrency stays bounded by the
+  HTTP transport's per-host connection limit (64). SMB, SFTP, local and
+  memory, whose references are synchronous, keep the backend hints. HTTP
+  W4 went from 2,050 to 16,762 files/s; S3 W3/W4 +37%/+44%.
+* **5. `stats()`.** For network backends the top-level counters are the
+  backend's wire counters (`source: "wire"`): a 256 MiB `cat_file` now
+  shows 33–35 requests on S3/GCS/Azure, 62 SFTP and 133 SMB messages;
+  `calls` keeps the per-call counters. fsfast-smb now counts the inline
+  compound read of `cat_file` (it counted nothing), every READ message of
+  a pipelined read (it counted one per call) and handle opens/closes, and
+  no longer counts the bytes of a handle read twice. Local and memory
+  report calls (`source: "calls"`).
+* **Local FIFO.** `cat_file` of a FIFO or character device reads it as a
+  stream (it returned `b""`, its stat size). Note: fsspec's own
+  `LocalFileSystem.cat_file` (2026.9.0) raises `io.UnsupportedOperation`
+  on a FIFO (it seeks to the end); fsfast deliberately returns the content.
+* **New finding: HTTP ranged reads that start mid-page stall ~44 ms.**
+  Against nginx (sendfile), a ranged GET such as `bytes=1234-66769` takes
+  44 ms with fsfast's HTTP client and 0.3 ms with urllib; ranges starting
+  on a 4 KiB boundary never stalled in the probes. It looks like a delayed
+  ACK interaction in fsfast-http-transport (reqwest/hyper); it affects any
+  small unaligned `cat_file`/`read_at` over HTTP, not only `cat_ranges`.
+  The guarded `cat_ranges` path aligns its requests, which avoids it there;
+  the transport itself was not changed (another engineer's crate).
 
 ## Method
 
@@ -111,8 +251,9 @@ How the runs are done:
   `fsf rm -r` removes whatever a crashed worker left behind.
 * **CPU.** The document also records client CPU seconds per iteration (user
   + system, all threads of the worker process) and fsfast's per-call
-  counters (`stats()`). Those counters count calls into the Rust layer,
-  not wire requests; `fsf` reports wire requests.
+  counters (`stats()`). In the 2026-11-25 documents those counters count
+  calls into the Rust layer, not wire requests; since 2026-11-26 they are
+  wire requests for network backends (finding 5), like `fsf`'s.
 * **The fsf CLI** cannot vary file sizes within one invocation, so
   `run.py` calls `fsf bench` once per group with the same parameters: W1/W2/W6;
   W3/W4; W5 info with 1000 files and `-c 1` (sequential, like the Python
@@ -321,6 +462,8 @@ hotspot was needed: every gap below is explained by what the code does.
 
 **1. `cat_file` of a large object costs one extra copy (fsfast-py).**
 
+*Status:* Fixed on 2026-11-26 for the sync `cat_file` (see [after the fixes](#after-the-fixes-2026-11-26)).
+
 * **Symptom.** W1 `cat_file` runs at 0.4–0.6× of `open().read()` on the
   same object (median MB/s, cat_file / open().read()):
 
@@ -353,6 +496,8 @@ hotspot was needed: every gap below is explained by what the code does.
 **2. Range coalescing reads 5× the requested bytes on random 64 KiB
 reads (S3, GCS, Azure, HTTP).**
 
+*Status:* addressed on 2026-11-26 with an amplification guard on top of the backend gaps (HTTP W6 0.72× → 2.50×; Azure W6 25% slower on loopback).
+
 * **Settings.** These backends merge ranges whose gap is at most 1 MiB, into
   requests of up to 32 MiB (HTTP inherits `IoHints::default()`).
 * **Effect on W6.** For the 500 random 64 KiB ranges of the 256 MiB object,
@@ -375,6 +520,8 @@ reads (S3, GCS, Azure, HTTP).**
 
 **3. `rm()` and `copy()` of many files do one `info()` per path first
 (python/fsfast).**
+
+*Status:* Fixed on 2026-11-26 (rm, copy and get).
 
 * **Where.** `FsfastFileSystem.rm` (used by SMB and SFTP) and
   `ObjectStoreFileSystem._rm_expanded` (used by GCS and Azure; S3 overrides
@@ -404,6 +551,8 @@ reads (S3, GCS, Azure, HTTP).**
 
 **4. Batch concurrency defaults to the per-transfer hint.**
 
+*Status:* Fixed on 2026-11-26: fsspec's batch sizes for the async-reference classes.
+
 * **Behaviour.** With `batch_size=None`, fsfast's many-file calls (`cat`,
   `pipe`, `copy`, `info_many`, `rm_files` on backends without a batch API)
   run `io_hints().max_concurrency` operations at a time (fsfast-py
@@ -418,6 +567,8 @@ reads (S3, GCS, Azure, HTTP).**
   needs a netem run to confirm.
 
 **5. fsfast's `stats()` counts calls, not wire requests.**
+
+*Status:* Fixed on 2026-11-26: `stats()` reports wire requests for network backends.
 
 * **Behaviour.** The Python `stats()` counters come from the bindings' own
   `Stats`. A 256 MiB `cat_file` (32 ranged GETs) counts as 1 request, and

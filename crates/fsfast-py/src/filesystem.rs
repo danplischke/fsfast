@@ -10,15 +10,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fsfast_core::{Error, Result};
-use fsfast_engine::OpKind;
+use fsfast_engine::{OpKind, StatsSnapshot};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 
-use crate::convert::{bytes_from_py, options_from_py, options_to_py};
+use crate::convert::{bytes_from_py, options_from_py, options_to_py, zeroed_bytes};
 use crate::errors::to_pyerr;
 use crate::ops::{self, FsInner, OnError, OpenReadOptions, write_mode};
 use crate::out::{Converted, PyOut, convert};
-use crate::runtime::{block_on, block_on_inline, spawn_async};
+use crate::runtime::{block_on, block_on_inline, drive, runtime, spawn_async};
 
 /// A Rust filesystem backend (local, memory, ...) created by
 /// `make_filesystem(protocol, options)`.
@@ -287,7 +287,14 @@ impl RustFileSystem {
         end: Option<i64>,
         seek_read: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.sync_one(py, ops::cat_file(self.fs(), path, start, end, seek_read))
+        let first = block_on_inline(
+            py,
+            ops::cat_file_start(self.fs(), path, start, end, seek_read),
+        )?;
+        match raise(py, first)? {
+            ops::CatStart::Done(data) => convert(py, Ok(PyOut::Bytes(data)), self.inner.backend),
+            ops::CatStart::Direct(d) => Ok(cat_direct(py, d)?.into_any()),
+        }
     }
 
     /// Awaitable `cat_file`.
@@ -1013,39 +1020,42 @@ impl RustFileSystem {
     /// Request counters and latency quantiles of this instance:
     /// `{"requests", "errors", "bytes_read", "bytes_written", "retries",
     /// "throttles", "ops": {kind: {"count", "mean_us", "p50_us", "p90_us",
-    /// "p99_us", "max_us"}}}`.
+    /// "p99_us", "max_us"}}, "source", "calls"}`.
+    ///
+    /// For network backends the top-level counters and `ops` are the
+    /// backend's **wire requests** (each HTTP request, SMB/SFTP message and
+    /// retry attempt counts; `source` is `"wire"`), so a 256 MiB `cat_file`
+    /// made of 32 ranged GETs counts 32. In-process backends (local,
+    /// memory) have no wire: their counters are the calls into the
+    /// backend (`source` `"calls"`). `calls` always holds the per-call
+    /// counters of this instance (one per backend call made by the
+    /// bindings: a batch counts one per item).
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let s = self.inner.stats.snapshot();
-        let d = PyDict::new(py);
-        d.set_item("requests", s.requests)?;
-        d.set_item("errors", s.errors)?;
-        d.set_item("bytes_read", s.bytes_read)?;
-        d.set_item("bytes_written", s.bytes_written)?;
-        d.set_item("retries", s.retries)?;
-        d.set_item("throttles", s.throttles)?;
-        let ops = PyDict::new(py);
-        let us = |x: Option<std::time::Duration>| x.map(|d| d.as_secs_f64() * 1e6);
-        for op in OpKind::ALL {
-            let h = s.latency(op);
-            if h.count == 0 {
-                continue;
+        let calls = stats_dict(py, &self.inner.stats.snapshot())?;
+        let d = match self.inner.wire_stats() {
+            Some(w) => {
+                let d = stats_dict(py, &w.snapshot())?;
+                d.set_item("source", "wire")?;
+                d
             }
-            let e = PyDict::new(py);
-            e.set_item("count", h.count)?;
-            e.set_item("mean_us", us(h.mean()))?;
-            e.set_item("p50_us", us(h.quantile(0.5)))?;
-            e.set_item("p90_us", us(h.quantile(0.9)))?;
-            e.set_item("p99_us", us(h.quantile(0.99)))?;
-            e.set_item("max_us", us(h.max()))?;
-            ops.set_item(op.as_str(), e)?;
-        }
-        d.set_item("ops", ops)?;
+            None => {
+                let d = stats_dict(py, &self.inner.stats.snapshot())?;
+                d.set_item("source", "calls")?;
+                d
+            }
+        };
+        d.set_item("calls", calls)?;
         Ok(d)
     }
 
-    /// Zero the counters returned by `stats()`.
+    /// Zero the counters returned by `stats()` (wire and call counters).
+    /// The wire counters belong to the backend instance, which fsspec's
+    /// instance cache shares between equal filesystems.
     fn reset_stats(&self) {
         self.inner.stats.reset();
+        if let Some(w) = self.inner.wire_stats() {
+            w.reset();
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -1064,6 +1074,52 @@ impl RustFileSystem {
             ),
         ))
     }
+}
+
+/// One counter set as the dict `stats()` returns.
+fn stats_dict<'py>(py: Python<'py>, s: &StatsSnapshot) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("requests", s.requests)?;
+    d.set_item("errors", s.errors)?;
+    d.set_item("bytes_read", s.bytes_read)?;
+    d.set_item("bytes_written", s.bytes_written)?;
+    d.set_item("retries", s.retries)?;
+    d.set_item("throttles", s.throttles)?;
+    let ops = PyDict::new(py);
+    let us = |x: Option<std::time::Duration>| x.map(|d| d.as_secs_f64() * 1e6);
+    for op in OpKind::ALL {
+        let h = s.latency(op);
+        if h.count == 0 {
+            continue;
+        }
+        let e = PyDict::new(py);
+        e.set_item("count", h.count)?;
+        e.set_item("mean_us", us(h.mean()))?;
+        e.set_item("p50_us", us(h.quantile(0.5)))?;
+        e.set_item("p90_us", us(h.quantile(0.9)))?;
+        e.set_item("p99_us", us(h.quantile(0.99)))?;
+        e.set_item("max_us", us(h.max()))?;
+        ops.set_item(op.as_str(), e)?;
+    }
+    d.set_item("ops", ops)?;
+    Ok(d)
+}
+
+/// Second phase of a large `cat_file` (see [`ops::cat_file_start`]): the
+/// result is read straight into a new `bytes` object, with the interpreter
+/// released; signals cancel the read as for every sync call (the object is
+/// then dropped unseen).
+fn cat_direct<'py>(py: Python<'py>, d: ops::DirectCat) -> PyResult<Bound<'py, PyBytes>> {
+    let len = d.len;
+    let (obj, mut buf) = zeroed_bytes(py, len)?;
+    let dst = buf.as_mut_slice();
+    let slot = runtime();
+    let got = raise(py, py.detach(|| drive(&slot, d.fill(dst)))?)?;
+    if got == len {
+        return Ok(obj);
+    }
+    // The file shrank while it was read: return what there is.
+    Ok(PyBytes::new(py, &buf.as_mut_slice()[..got]))
 }
 
 /// Build the Rust filesystem for `protocol` from `options` (the backend's

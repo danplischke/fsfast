@@ -332,6 +332,7 @@ impl S3FileSystem {
         version: Option<&str>,
         start: u64,
         end: Option<u64>,
+        extra: Option<&Params>,
         path: &str,
     ) -> Result<Bytes> {
         let part = self.inner.hints.request_size.max(1) as u64;
@@ -352,7 +353,7 @@ impl S3FileSystem {
                 end: first_end,
             },
             &first_pin,
-            None,
+            extra,
             path,
         )
         .await?;
@@ -368,7 +369,7 @@ impl S3FileSystem {
                 Some(e) => ByteRange::Bounded { start, end: e },
                 None => ByteRange::From(start),
             };
-            return Ok(get_range(st, bucket, key, window, &first_pin, None, path)
+            return Ok(get_range(st, bucket, key, window, &first_pin, extra, path)
                 .await?
                 .body
                 .data);
@@ -394,7 +395,7 @@ impl S3FileSystem {
                     Some(e) => Pin::IfMatch(e.clone()),
                     None => first_pin,
                 },
-                None,
+                extra,
                 path,
             )
             .await?;
@@ -423,7 +424,7 @@ impl S3FileSystem {
             path: path.to_owned(),
             info: FileInfo::file(path, total),
             pin,
-            extra: None,
+            extra: extra.cloned(),
             hints: self.inner.hints,
         });
         let len = usize::try_from(want_end - start).map_err(|_| {
@@ -449,6 +450,17 @@ impl S3FileSystem {
     }
 
     pub(crate) async fn cat_file_impl(&self, path: &str, range: ByteRange) -> Result<Bytes> {
+        self.cat_file_with(path, range, None).await
+    }
+
+    /// `cat_file` with per-call parameters (SSE-C key, `RequestPayer`, ...)
+    /// on every GET.
+    pub(crate) async fn cat_file_with(
+        &self,
+        path: &str,
+        range: ByteRange,
+        extra: Option<&Params>,
+    ) -> Result<Bytes> {
         let sp = split_path(path, self.inner.opts.version_aware);
         if sp.key.is_empty() {
             return Err(Error::is_a_directory(path));
@@ -461,16 +473,25 @@ impl S3FileSystem {
         let version = sp.version_id.as_deref();
         match range {
             ByteRange::Full => {
-                self.fetch_window(&st, &sp.bucket, &sp.key, version, 0, None, &name)
+                self.fetch_window(&st, &sp.bucket, &sp.key, version, 0, None, extra, &name)
                     .await
             }
             ByteRange::From(s) => {
-                self.fetch_window(&st, &sp.bucket, &sp.key, version, s, None, &name)
+                self.fetch_window(&st, &sp.bucket, &sp.key, version, s, None, extra, &name)
                     .await
             }
             ByteRange::Bounded { start, end } => {
-                self.fetch_window(&st, &sp.bucket, &sp.key, version, start, Some(end), &name)
-                    .await
+                self.fetch_window(
+                    &st,
+                    &sp.bucket,
+                    &sp.key,
+                    version,
+                    start,
+                    Some(end),
+                    extra,
+                    &name,
+                )
+                .await
             }
             ByteRange::Suffix(_) => {
                 let pin = match version {
@@ -478,7 +499,7 @@ impl S3FileSystem {
                     None => Pin::None,
                 };
                 Ok(
-                    get_range(&st, &sp.bucket, &sp.key, range, &pin, None, &name)
+                    get_range(&st, &sp.bucket, &sp.key, range, &pin, extra, &name)
                         .await?
                         .body
                         .data,
@@ -577,9 +598,17 @@ impl S3FileSystem {
                     .into_iter()
                     .map(|r| {
                         let f = file.clone();
+                        let budget = &st.budget;
                         async move {
-                            let data = reader.read_at(r.start, (r.end - r.start) as usize).await?;
-                            blocking(move || write_all_at(&f, r.start, &data)).await
+                            // Each in-flight part holds a request_size
+                            // buffer until it is written: count it against
+                            // the global budget like every other bulk read.
+                            let len = (r.end - r.start) as usize;
+                            let guard = budget.acquire(len).await;
+                            let data = reader.read_at(r.start, len).await?;
+                            blocking(move || write_all_at(&f, r.start, &data)).await?;
+                            drop(guard);
+                            Ok::<_, Error>(())
                         }
                     })
                     .collect();

@@ -289,6 +289,15 @@ impl Params {
         out
     }
 
+    /// `self` without the parameters `other` sets (what `merged` keeps of
+    /// `self`).
+    pub fn without(&self, other: &Params) -> Params {
+        let mut out = self.clone();
+        out.items
+            .retain(|(s, _, _)| !other.items.iter().any(|(o, _, _)| o.name == s.name));
+        out
+    }
+
     /// Whether parameter `name` is set.
     pub fn contains(&self, name: &str) -> bool {
         self.items.iter().any(|(s, _, _)| s.name == name)

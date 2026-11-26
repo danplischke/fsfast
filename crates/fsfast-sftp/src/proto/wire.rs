@@ -84,6 +84,20 @@ impl Cursor {
         })
     }
 
+    /// A `string` that must be valid UTF-8 (file names: they are sent back
+    /// to the server as paths, so a lossy decoding would make different
+    /// files share one name and later operations hit the wrong file).
+    /// Invalid UTF-8 is an error, as in paramiko (`get_text`, strict).
+    pub fn string_utf8(&mut self, what: &str) -> Result<String, ProtoError> {
+        let b = self.string()?;
+        String::from_utf8(b.to_vec()).map_err(|_| {
+            ProtoError::new(format!(
+                "{what} is not valid UTF-8: b\"{}\"",
+                b.escape_ascii()
+            ))
+        })
+    }
+
     /// Everything not consumed yet, as a slice.
     pub fn rest(&mut self) -> Bytes {
         let s = self.buf.slice(self.pos..);
@@ -136,6 +150,16 @@ mod tests {
         assert_eq!(&c.string().unwrap()[..], b"hello");
         assert_eq!(c.string_lossy().unwrap(), "\u{fffd}a");
         c.finish("test").unwrap();
+        let mut b = BytesMut::new();
+        put_string(&mut b, "é".as_bytes());
+        put_string(&mut b, b"bad\xff");
+        let mut c = Cursor::new(b.freeze());
+        assert_eq!(c.string_utf8("name").unwrap(), "é");
+        let e = c.string_utf8("name").unwrap_err().to_string();
+        assert!(
+            e.contains("not valid UTF-8") && e.contains("bad\\xff"),
+            "{e}"
+        );
         assert!(c.u8().is_err());
         assert!(c.u32().is_err());
         assert!(c.u64().is_err());

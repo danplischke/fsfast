@@ -27,6 +27,9 @@ pub(crate) struct Built {
     pub fs: DynFileSystem,
     /// The same backend, downcastable to its concrete type.
     pub any: AnyFs,
+    /// The backend's own wire-request counters, for backends that keep
+    /// them (network backends); `None` for in-process ones.
+    pub wire: Option<Arc<fsfast_engine::Stats>>,
 }
 
 impl Built {
@@ -37,7 +40,15 @@ impl Built {
         Built {
             fs: fs.clone(),
             any: fs,
+            wire: None,
         }
+    }
+
+    /// Attach the backend's wire-request counters.
+    #[allow(dead_code)] // unused only in a build without a network backend
+    fn with_wire(mut self, stats: Arc<fsfast_engine::Stats>) -> Built {
+        self.wire = Some(stats);
+        self
     }
 }
 
@@ -151,34 +162,44 @@ fn build_memory(opts: Options) -> Result<Built> {
 
 #[cfg(feature = "http")]
 fn build_http(opts: Options) -> Result<Built> {
-    Ok(Built::new(fsfast_http::HttpFileSystem::from_options(opts)?))
+    let fs = fsfast_http::HttpFileSystem::from_options(opts)?;
+    let wire = fs.client().stats().clone();
+    Ok(Built::new(fs).with_wire(wire))
 }
 
 #[cfg(feature = "s3")]
 fn build_s3(opts: Options) -> Result<Built> {
-    Ok(Built::new(fsfast_s3::S3FileSystem::from_options(opts)?))
+    let fs = fsfast_s3::S3FileSystem::from_options(opts)?;
+    let wire = fs.stats().clone();
+    Ok(Built::new(fs).with_wire(wire))
 }
 
 #[cfg(feature = "smb")]
 fn build_smb(opts: Options) -> Result<Built> {
-    Ok(Built::new(fsfast_smb::SmbFileSystem::from_options(opts)?))
+    let fs = fsfast_smb::SmbFileSystem::from_options(opts)?;
+    let wire = fs.stats().clone();
+    Ok(Built::new(fs).with_wire(wire))
 }
 
 #[cfg(feature = "sftp")]
 fn build_sftp(opts: Options) -> Result<Built> {
-    Ok(Built::new(fsfast_sftp::SftpFileSystem::from_options(opts)?))
+    let fs = fsfast_sftp::SftpFileSystem::from_options(opts)?;
+    let wire = fs.stats().clone();
+    Ok(Built::new(fs).with_wire(wire))
 }
 
 #[cfg(feature = "gcs")]
 fn build_gcs(opts: Options) -> Result<Built> {
-    Ok(Built::new(fsfast_gcs::GCSFileSystem::from_options(opts)?))
+    let fs = fsfast_gcs::GCSFileSystem::from_options(opts)?;
+    let wire = fs.stats().clone();
+    Ok(Built::new(fs).with_wire(wire))
 }
 
 #[cfg(feature = "azure")]
 fn build_azure(opts: Options) -> Result<Built> {
-    Ok(Built::new(fsfast_azure::AzureBlobFileSystem::from_options(
-        opts,
-    )?))
+    let fs = fsfast_azure::AzureBlobFileSystem::from_options(opts)?;
+    let wire = fs.stats().clone();
+    Ok(Built::new(fs).with_wire(wire))
 }
 
 // ---------------------------------------------------------------------------

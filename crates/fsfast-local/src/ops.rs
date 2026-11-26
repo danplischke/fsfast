@@ -94,7 +94,9 @@ pub(crate) fn open_for_write(dst: &Path, mode: WriteMode) -> io::Result<File> {
 /// `mode` decides how an existing destination is treated (`wb`, `xb`, `ab`).
 /// Unlike `shutil.copyfile`, a copy that fails half-way does not leave a
 /// partial destination behind: a file this call created or truncated is
-/// removed again, an appended-to file is cut back to its previous length.
+/// removed again (unless `dst` is a symlink, which is kept; see
+/// [`remove_written`]), an appended-to file is cut back to its previous
+/// length.
 pub(crate) fn copy_file(src: &Path, dst: &Path, mode: WriteMode) -> io::Result<u64> {
     let mut reader = File::open(src)?;
     let src_meta = reader.metadata()?;
@@ -127,10 +129,7 @@ pub(crate) fn copy_file(src: &Path, dst: &Path, mode: WriteMode) -> io::Result<u
         Err(e) => {
             let undo = match mode {
                 WriteMode::Append => writer.set_len(original_len),
-                WriteMode::Overwrite | WriteMode::CreateNew => {
-                    drop(writer);
-                    fs::remove_file(dst)
-                }
+                WriteMode::Overwrite | WriteMode::CreateNew => remove_written(writer, dst),
             };
             if let Err(u) = undo {
                 tracing::warn!(dst = %dst.display(), "cleaning up after a failed copy failed: {u}");
@@ -138,6 +137,19 @@ pub(crate) fn copy_file(src: &Path, dst: &Path, mode: WriteMode) -> io::Result<u
             Err(e)
         }
     }
+}
+
+/// Undo a failed `Overwrite`/`CreateNew` write: remove `path` only if it is
+/// still the file that was opened as `file`. When `path` is a symlink, the
+/// write went to its target: unlinking `path` would delete the user's
+/// symlink (fsspec keeps it), so it is left alone, as is a path that was
+/// replaced meanwhile.
+pub(crate) fn remove_written(file: File, path: &Path) -> io::Result<()> {
+    if !crate::handles::still_linked_at(&file, path) {
+        return Ok(());
+    }
+    drop(file);
+    fs::remove_file(path)
 }
 
 /// What `cp_file` found at the source.

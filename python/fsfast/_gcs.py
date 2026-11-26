@@ -516,6 +516,9 @@ class GCSFileSystem(ObjectStoreFileSystem):
         return ((await self._info(path)).get("metadata") or {})[attr]
 
     def setxattrs(self, path: Any, content_type: Any = None, content_encoding: Any = None, fixed_key_metadata: Any = None, **kwargs: Any) -> Any:
+        """Not implemented (gcsfs patches the object's metadata); raises
+        ``NotImplementedError``. Pass ``metadata=``/``content_type=`` to
+        ``open()`` or ``pipe_file()`` instead."""
         raise NotImplementedError("fsfast.GCSFileSystem does not implement setxattrs (object PATCH)")
 
     def modified(self, path: Any) -> Any:

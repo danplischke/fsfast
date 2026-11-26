@@ -118,8 +118,15 @@ impl SmbReadHandle {
     /// Read exactly `len` bytes at `offset` unless EOF comes first (servers
     /// may return less than asked; the rest is re-requested).
     async fn read_exact_or_eof(&self, offset: u64, len: usize) -> Result<Bytes> {
-        let (asked, resp) = self.send_read(offset, len).await?;
-        let first = read_result(resp.recv().await?, &self.info.name)?;
+        let started = Instant::now();
+        let first = async {
+            let (asked, resp) = self.send_read(offset, len).await?;
+            Ok::<_, Error>((asked, read_result(resp.recv().await?, &self.info.name)?))
+        }
+        .await;
+        self.stats
+            .record_request(OpKind::Read, started.elapsed(), first.is_ok());
+        let (asked, first) = first?;
         if first.len() >= len {
             return Ok(first.slice(..len));
         }
@@ -132,8 +139,15 @@ impl SmbReadHandle {
         out.extend_from_slice(&first);
         while out.len() < len {
             let off = offset + out.len() as u64;
-            let (asked, resp) = self.send_read(off, len - out.len()).await?;
-            let d = read_result(resp.recv().await?, &self.info.name)?;
+            let started = Instant::now();
+            let r = async {
+                let (asked, resp) = self.send_read(off, len - out.len()).await?;
+                Ok::<_, Error>((asked, read_result(resp.recv().await?, &self.info.name)?))
+            }
+            .await;
+            self.stats
+                .record_request(OpKind::Read, started.elapsed(), r.is_ok());
+            let (asked, d) = r?;
             out.extend_from_slice(&d[..d.len().min(len - out.len())]);
             if d.len() < asked {
                 break;
@@ -173,17 +187,16 @@ impl ReadHandle for SmbReadHandle {
             return Ok(Bytes::new());
         }
         let n = (len as u64).min(size - offset) as usize;
-        let started = Instant::now();
         let chunk = self.shape.chunk;
         let res = if n <= chunk {
             // One request: the response data is returned as a slice of the
             // received frame, without any copy.
             self.read_exact_or_eof(offset, n).await
         } else {
-            self.read_pipelined(offset, n).await
+            self.read_pipelined(&[], offset, n).await
         };
-        self.stats
-            .record_request(OpKind::Read, started.elapsed(), res.is_ok());
+        // Requests are counted per READ message (see `read_exact_or_eof`
+        // and `read_pipelined`), bytes once per call.
         if let Ok(b) = &res {
             self.stats.add_bytes_read(b.len() as u64);
         }
@@ -194,22 +207,46 @@ impl ReadHandle for SmbReadHandle {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        ops::close(&self.ctx, self.fid, &self.info.name).await
+        self.stats
+            .measure(
+                OpKind::Close,
+                ops::close(&self.ctx, self.fid, &self.info.name),
+            )
+            .await
     }
 }
 
 impl SmbReadHandle {
-    /// A large read: chunks in flight concurrently, landing in one buffer.
+    /// `head` followed by the file's bytes `[offset, offset + n)` (fewer at
+    /// EOF), in one buffer: the rest of a whole-file read whose first part
+    /// already arrived (only `head` is copied; the remainder is received
+    /// straight into the result like any pipelined read). The handle must
+    /// still be open; `n` is not clamped to the handle's size.
+    pub(crate) async fn read_after(&self, head: &[u8], offset: u64, n: usize) -> Result<Bytes> {
+        if n == 0 {
+            return Ok(Bytes::copy_from_slice(head));
+        }
+        let res = self.read_pipelined(head, offset, n).await;
+        if let Ok(b) = &res {
+            self.stats.add_bytes_read((b.len() - head.len()) as u64);
+        }
+        res
+    }
+
+    /// A large read: chunks in flight concurrently, landing in one buffer
+    /// (after a copy of `head`, usually empty).
     ///
     /// The destination is allocated once and split into one piece per READ;
     /// each piece travels with its request, so the reader task can receive
     /// the data straight into it (no copy). Pieces of responses that took
     /// the regular path are filled by copying. The pieces are re-joined in
     /// O(1) (`BytesMut::unsplit` of adjacent pieces).
-    async fn read_pipelined(&self, offset: u64, n: usize) -> Result<Bytes> {
+    async fn read_pipelined(&self, head: &[u8], offset: u64, n: usize) -> Result<Bytes> {
         let chunk = self.shape.chunk;
         // A zeroed allocation comes from calloc: fresh pages cost no memset.
-        let mut rest = BytesMut::zeroed(n);
+        let mut rest = BytesMut::zeroed(head.len() + n);
+        let mut out = rest.split_to(head.len());
+        out.copy_from_slice(head);
         let mut pieces: Vec<Option<BytesMut>> = Vec::with_capacity(n / chunk + 1);
         let mut next = 0usize;
         // End of valid data (a short read means the file shrank).
@@ -238,7 +275,13 @@ impl SmbReadHandle {
                 pieces.push(None);
                 let at = next;
                 next += want;
-                inflight.push(async move { (idx, at, want, resp.recv_read().await) });
+                let (stats, started) = (&self.stats, Instant::now());
+                inflight.push(async move {
+                    let reply = resp.recv_read().await;
+                    // One wire request per READ message.
+                    stats.record_request(OpKind::Read, started.elapsed(), reply.is_ok());
+                    (idx, at, want, reply)
+                });
             }
             let Some((idx, at, asked, reply)) = inflight.next().await else {
                 break;
@@ -258,8 +301,7 @@ impl SmbReadHandle {
             dest.truncate(len);
             pieces[idx] = Some(dest);
         }
-        // Join the pieces in order up to the first short one.
-        let mut out = BytesMut::new();
+        // Join the pieces in order (after `head`) up to the first short one.
         let mut total = 0usize;
         for p in pieces {
             let Some(p) = p else { break };
@@ -270,7 +312,7 @@ impl SmbReadHandle {
                 break;
             }
         }
-        out.truncate(valid.min(n));
+        out.truncate(head.len() + valid.min(n));
         Ok(out.freeze())
     }
 }

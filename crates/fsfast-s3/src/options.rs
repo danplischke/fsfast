@@ -61,6 +61,19 @@ const IGNORED: &[&str] = &[
     "max_paths",
 ];
 
+/// botocore's `request_checksum_calculation`: whether object uploads carry
+/// a checksum (`"when_supported"`) or only operations that require one do
+/// (`"when_required"`).
+pub fn parse_checksum_calculation(v: &str, what: &str) -> Result<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "when_supported" => Ok(true),
+        "when_required" => Ok(false),
+        _ => Err(Error::invalid_input(format!(
+            "{what}: request_checksum_calculation must be \"when_supported\" or \"when_required\", got {v:?}"
+        ))),
+    }
+}
+
 /// Parsed and validated s3fs options.
 #[derive(Debug, Clone)]
 pub struct S3Options {
@@ -95,6 +108,11 @@ pub struct S3Options {
     pub us_east_1_regional: Option<bool>,
     /// `config_kwargs["s3"]["payload_signing_enabled"]`.
     pub payload_signing: Option<bool>,
+    /// `config_kwargs["request_checksum_calculation"]`: `Some(true)` for
+    /// `"when_supported"` (object data carries a `Content-MD5`), `Some(false)`
+    /// for `"when_required"`; `None`: from the environment or profile, else
+    /// `"when_supported"` (botocore's default).
+    pub request_checksum: Option<bool>,
     /// `requester_pays`.
     pub requester_pays: bool,
     /// `version_aware`.
@@ -271,6 +289,7 @@ impl S3Options {
         let mut accelerate = None;
         let mut us_east_1_regional = None;
         let mut payload_signing = None;
+        let mut request_checksum = None;
         let mut anon = anon;
         // `client_kwargs["config"]` (a botocore Config converted to a dict)
         // first, then `config_kwargs`, which s3fs merges on top.
@@ -293,6 +312,9 @@ impl S3Options {
                         "{what}: signature_version {v:?} (only SigV4 is implemented)"
                     )));
                 }
+            }
+            if let Some(v) = c.string("request_checksum_calculation")? {
+                request_checksum = Some(parse_checksum_calculation(&v, what)?);
             }
             if let Some(d) = c.duration_secs("connect_timeout")? {
                 http.connect_timeout = Some(d);
@@ -412,7 +434,6 @@ impl S3Options {
                 "proxies_config",
                 "request_min_compression_size_bytes",
                 "disable_request_compression",
-                "request_checksum_calculation",
                 "response_checksum_validation",
                 "account_id_endpoint_mode",
                 "auth_scheme_preference",
@@ -486,6 +507,7 @@ impl S3Options {
             accelerate,
             us_east_1_regional,
             payload_signing,
+            request_checksum,
             requester_pays,
             version_aware,
             cache_regions,

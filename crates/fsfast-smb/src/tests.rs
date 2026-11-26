@@ -944,3 +944,171 @@ async fn sealed_reads_of_dropped_callers_are_still_authenticated() {
     assert!(conn.is_dead());
     drop(keep_req);
 }
+
+/// A standalone CREATE on tree 7 (no related CLOSE in its chain).
+fn create_msg(session_id: u64) -> EncodedMessage {
+    let r = crate::ops::read_open_req("f.txt", fsfast_smb_proto::fscc::ShareAccess::empty());
+    let h = crate::session::header_for(&r, session_id, 7, true);
+    encode_message(&h, &r).unwrap()
+}
+
+fn create_resp(req: &Header, fid: FileId) -> EncodedMessage {
+    let body = fsfast_smb_proto::msg::CreateResponse {
+        file_id: fid,
+        end_of_file: 5,
+        ..Default::default()
+    };
+    encode_message(&resp(req, NtStatus::SUCCESS, 1), &body).unwrap()
+}
+
+/// The next request frame, or `None` if nothing arrives within `ms`.
+async fn next_within(server: &mut Server, ms: u64) -> Option<Incoming> {
+    tokio::time::timeout(Duration::from_millis(ms), server.rx.recv())
+        .await
+        .ok()
+        .flatten()
+}
+
+fn assert_close_of(inc: &Incoming, fid: FileId) {
+    let h = inc.msgs[0].header();
+    assert_eq!(h.command, Command::CLOSE, "expected a CLOSE");
+    assert_eq!(h.tree_id(), Some(7));
+    let c: fsfast_smb_proto::msg::CloseRequest = inc.msgs[0].decode().unwrap();
+    assert_eq!(c.file_id, fid);
+}
+
+#[tokio::test]
+async fn abandoned_create_that_succeeds_is_closed() {
+    let (conn, mut server) = pair(None, None, None).await;
+    handshake(&conn, &mut server, 10).await;
+    let r = conn
+        .shared
+        .send(vec![create_msg(0)], &Security::none())
+        .await
+        .unwrap();
+    let inc = server.next().await;
+    drop(r);
+    let fid = FileId::new(0x1234, 0x5678);
+    server.send(vec![create_resp(inc.msgs[0].header(), fid)], false, false);
+    let close = server.next().await;
+    assert_close_of(&close, fid);
+    assert!(!conn.is_dead());
+}
+
+#[tokio::test]
+async fn create_delivered_but_never_consumed_is_closed() {
+    let (conn, mut server) = pair(None, None, None).await;
+    handshake(&conn, &mut server, 10).await;
+    let r = conn
+        .shared
+        .send(vec![create_msg(0)], &Security::none())
+        .await
+        .unwrap();
+    let inc = server.next().await;
+    let fid = FileId::new(9, 10);
+    server.send(vec![create_resp(inc.msgs[0].header(), fid)], false, false);
+    // The response reaches the caller's channel, then the caller goes away
+    // without reading it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(r);
+    let close = server.next().await;
+    assert_close_of(&close, fid);
+}
+
+#[tokio::test]
+async fn abandoned_compound_create_with_close_is_not_closed_twice() {
+    let (conn, mut server) = pair(None, None, None).await;
+    handshake(&conn, &mut server, 10).await;
+    let mut b = CompoundBuilder::new();
+    let req = crate::ops::read_open_req("f.txt", fsfast_smb_proto::fscc::ShareAccess::empty());
+    b.push(crate::session::header_for(&req, 0, 7, true), &req)
+        .unwrap();
+    let close = fsfast_smb_proto::msg::CloseRequest {
+        flags: fsfast_smb_proto::msg::CloseFlags::empty(),
+        file_id: FileId::RELATED,
+    };
+    b.push_related(crate::session::header_for(&close, 0, 7, true), &close)
+        .unwrap();
+    let r = conn
+        .shared
+        .send(b.finish(), &Security::none())
+        .await
+        .unwrap();
+    let inc = server.next().await;
+    drop(r);
+    let fid = FileId::new(3, 4);
+    let ch = *inc.msgs[1].header();
+    let close_resp = encode_message(
+        &resp(&ch, NtStatus::SUCCESS, 1),
+        &fsfast_smb_proto::msg::CloseResponse::default(),
+    )
+    .unwrap();
+    let mut out = CompoundBuilder::new();
+    out.push_encoded(create_resp(inc.msgs[0].header(), fid));
+    out.push_encoded(close_resp);
+    server.send(out.finish(), false, false);
+    assert!(
+        next_within(&mut server, 200).await.is_none(),
+        "the compound's own CLOSE already closed the handle"
+    );
+}
+
+#[tokio::test]
+async fn abandoned_request_is_cancelled_when_the_interim_arrives_later() {
+    let (conn, mut server) = pair(None, None, None).await;
+    handshake(&conn, &mut server, 10).await;
+    let r = conn
+        .shared
+        .send(vec![create_msg(0)], &Security::none())
+        .await
+        .unwrap();
+    let inc = server.next().await;
+    let req = *inc.msgs[0].header();
+    // The caller goes away before the server says STATUS_PENDING.
+    drop(r);
+    let mut ih = resp(&req, NtStatus::PENDING, 1);
+    ih.id = HeaderId::Async { async_id: 42 };
+    server.send(
+        vec![encode_error_message(&ih, &ErrorResponse::default()).unwrap()],
+        false,
+        false,
+    );
+    let cancel = server.next().await;
+    let ch = cancel.msgs[0].header();
+    assert_eq!(ch.command, Command::CANCEL);
+    assert_eq!(ch.async_id(), Some(42));
+    assert_eq!(ch.message_id, req.message_id);
+    // The CREATE completes anyway (the cancel came too late): its async
+    // final response carries no TreeId, the CLOSE still targets tree 7.
+    let fid = FileId::new(5, 6);
+    let mut fh = resp(&req, NtStatus::SUCCESS, 0);
+    fh.id = HeaderId::Async { async_id: 42 };
+    let fin = encode_message(
+        &fh,
+        &fsfast_smb_proto::msg::CreateResponse {
+            file_id: fid,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    server.send(vec![fin], false, false);
+    let close = server.next().await;
+    assert_close_of(&close, fid);
+    assert!(!conn.is_dead());
+}
+
+#[tokio::test]
+async fn multi_credit_requires_the_servers_large_mtu_capability() {
+    let (conn, _server) = pair(None, None, None).await;
+    assert!(conn.shared.multi_credit());
+    let (conn2, _server2) = pair(None, None, None).await;
+    let mut n = conn2.neg().clone();
+    n.server_capabilities = fsfast_smb_proto::Capabilities::empty();
+    // `set_negotiated` only stores the first value of `negotiated`; the
+    // multi-credit flag follows the latest call.
+    conn2.set_negotiated(n);
+    assert!(
+        !conn2.shared.multi_credit(),
+        "a 3.1.1 server without SMB2_GLOBAL_CAP_LARGE_MTU"
+    );
+}

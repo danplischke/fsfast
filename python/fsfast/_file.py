@@ -54,6 +54,10 @@ class FsfastFile(io.RawIOBase):
 
     DEFAULT_BLOCK_SIZE = 5 * 2**20
     _details: dict[str, Any] | None = None
+    #: An fsspec cache object installed by a caching layer (fsspec's
+    #: ``blockcache::`` sets ``f.cache = MMapCache(..., f._fetch_range,
+    #: ...)``); when set, ``read``/``readinto`` are served through it.
+    _py_cache: Any = None
 
     def __init__(
         self,
@@ -67,6 +71,7 @@ class FsfastFile(io.RawIOBase):
         size: int | None = None,
         version: str | None = None,
         extra: dict[str, Any] | None = None,
+        rust_fs: Any = None,
         **kwargs: Any,
     ) -> None:
         self.path = path
@@ -95,7 +100,8 @@ class FsfastFile(io.RawIOBase):
         #: Position of the first byte this handle writes (see
         #: ``FsfastFileSystem._append_tell_from_end``).
         self._tell_base = 0
-        rfs = fs._rfs
+        # ``rust_fs``: a client carrying per-call request options (http).
+        rfs = fs._rfs if rust_fs is None else rust_fs
         if mode == "rb":
             self._reader = rfs.open_read(
                 path,
@@ -133,6 +139,12 @@ class FsfastFile(io.RawIOBase):
     def closed(self) -> bool:  # type: ignore[override]
         return getattr(self, "_closed", True)
 
+    @closed.setter
+    def closed(self, value: bool) -> None:
+        # fsspec's caching layers set ``f.closed = True`` after closing a
+        # file (``AbstractBufferedFile.closed`` is a plain attribute).
+        self._closed = bool(value)
+
     @property
     def loc(self) -> int:
         """Current position (bytes written, in write mode)."""
@@ -168,10 +180,41 @@ class FsfastFile(io.RawIOBase):
     @property
     def cache(self) -> Any:
         """Description of the read cache (fsspec files expose their cache
-        object; here the caching happens in Rust)."""
+        object; here the caching happens in Rust), or the fsspec cache
+        object a caching layer installed."""
+        if self._py_cache is not None:
+            return self._py_cache
         if self._reader is None:
             return None
         return SimpleNamespace(name=self._reader.cache_mode, blocksize=self.blocksize)
+
+    @cache.setter
+    def cache(self, value: Any) -> None:
+        # fsspec's CachingFileSystem (``blockcache::``) replaces the file's
+        # cache with an MMapCache over ``_fetch_range``: honour it, so its
+        # local block store is used (AbstractBufferedFile reads through
+        # ``self.cache._fetch``).
+        self._py_cache = value
+
+    def _fetch_range(self, start: int, end: int) -> bytes:
+        """Bytes ``[start, end)`` from the backend, without moving the
+        position (fsspec's ``AbstractBufferedFile._fetch_range``, the
+        fetcher fsspec caches are built on)."""
+        reader = self._check_read()
+        if end <= start:
+            return b""
+        return reader.read_ranges([(start, end)])[0]
+
+    def _cached_read(self, length: int) -> bytes:
+        """``read`` through an installed fsspec cache (see ``cache``)."""
+        reader = self._reader
+        loc = reader.tell()
+        end = self.size if length < 0 else min(self.size, loc + length)
+        if end <= loc:
+            return b""
+        out = self._py_cache._fetch(loc, end)
+        reader.seek(loc + len(out))
+        return out
 
     def url(self, **kwargs: Any) -> str:
         """HTTP(S) URL of this file (s3fs/gcsfs files offer this), from the
@@ -219,19 +262,30 @@ class FsfastFile(io.RawIOBase):
             return b""
         if length < -1 and self.fs._strict_negative_read:
             raise ValueError("read length must be non-negative or -1")
+        if self._py_cache is not None:
+            return self._cached_read(length)
         return reader.read(length if length > 0 else None)
 
     def read1(self, size: int = -1) -> bytes:
+        """Same as :meth:`read`: the Rust reader has no partial-read mode."""
         return self.read(size if size >= 0 else -1)
 
     def readall(self) -> bytes:
+        """Read to the end of the file."""
         return self.read(-1)
 
     def readinto(self, b: Any) -> int:  # type: ignore[override]
         """Fill ``b`` (any writable buffer) without intermediate copies."""
-        return self._check_read().readinto(b)
+        reader = self._check_read()
+        if self._py_cache is not None:
+            view = memoryview(b).cast("B")
+            data = self._cached_read(len(view))
+            view[: len(data)] = data
+            return len(data)
+        return reader.readinto(b)
 
     def readinto1(self, b: Any) -> int:  # type: ignore[override]
+        """Same as :meth:`readinto`."""
         return self.readinto(b)
 
     def readline(self, size: int | None = -1) -> bytes:  # type: ignore[override]
@@ -259,7 +313,11 @@ class FsfastFile(io.RawIOBase):
             out = [line + b"\n" for line in lines[:-1]]
             return out if data.endswith(b"\n") else out + [lines[-1]]
         out, total = [], 0
-        while total < hint:
+        # io.IOBase (CPython files, fsspec's local files) stops once the
+        # total *exceeds* the hint; BytesIO (fsspec's memory files) once it
+        # reaches it.
+        stop_at = hint if self.fs._readlines_bytesio else hint + 1
+        while total < stop_at:
             line = reader.readline(None)
             if not line:
                 break
@@ -293,6 +351,13 @@ class FsfastFile(io.RawIOBase):
             raise OSError(ESPIPE, "Seek only available in read mode")
         if self.closed:
             raise ValueError("I/O operation on closed file.")
+        if loc < 0 and whence in (1, 2) and self.fs._seek_clamps_negative:
+            # BytesIO (fsspec's memory files) clamps a relative seek before
+            # the start to 0; only a negative absolute position raises.
+            base = self._reader.tell() if whence == 1 else self._reader.seek(0, 2)
+            if base + loc < 0:
+                return self._reader.seek(0, 0)
+            return self._reader.seek(base + loc, 0)
         return self._reader.seek(loc, whence)
 
     def tell(self) -> int:
@@ -329,6 +394,7 @@ class FsfastFile(io.RawIOBase):
         write is deferred to a transaction)."""
         if getattr(self, "_unclosable", False) or self.closed:
             return
+        reentrant = False
         try:
             if self._reader is not None:
                 self._reader.close()
@@ -338,8 +404,15 @@ class FsfastFile(io.RawIOBase):
                 self._writer.close()
                 if self.autocommit or self._target == self.path:
                     self._invalidate()
+        except RuntimeError as e:
+            # Called by a signal handler while this thread is inside an
+            # operation on the file: nothing was closed (CPython's buffered
+            # files raise the same and stay open).
+            reentrant = str(e).startswith("reentrant call")
+            raise
         finally:
-            self._closed = True
+            if not reentrant:
+                self._closed = True
 
     def _invalidate(self) -> None:
         fs = self.fs

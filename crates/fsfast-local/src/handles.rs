@@ -145,6 +145,17 @@ impl LocalReadHandle {
             hints,
         }
     }
+
+    /// The open file's current length (`fstat`).
+    async fn current_len(&self) -> Result<u64> {
+        let (file, name) = (self.file.clone(), self.name.clone());
+        blocking(move || {
+            file.metadata()
+                .map(|m| m.len())
+                .map_err(|e| io_err(e, &name))
+        })
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -157,15 +168,27 @@ impl ReadHandle for LocalReadHandle {
         self.hints
     }
 
-    /// Reads are limited to the size observed at open (the contract's
-    /// `min(len, size - offset)`); large reads are split across several
-    /// blocking tasks ([`read_parallel`]).
+    /// Reads go to the file's *current* end, like the OS file object
+    /// fsspec's `LocalFileOpener` wraps: data appended after open is
+    /// returned (local reads are not pinned, see `current_size`). Large
+    /// reads are split across several blocking tasks ([`read_parallel`]).
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
-        let size = self.info.size;
-        if len == 0 || offset >= size {
+        if len == 0 {
             return Ok(Bytes::new());
         }
-        let n = (len as u64).min(size - offset) as usize;
+        // Known to be inside the file: one exact-size buffer. Past the size
+        // seen at open, the file may have grown since: ask for `len` bytes
+        // (truncated at the current end), but without allocating more than
+        // the file can hold for huge `len`s.
+        let n = if offset.saturating_add(len as u64) <= self.info.size {
+            len
+        } else {
+            let size = self.current_len().await?;
+            if offset >= size {
+                return Ok(Bytes::new());
+            }
+            (len as u64).min(size - offset) as usize
+        };
         read_parallel(
             self.file.clone(),
             self.name.clone(),
@@ -177,6 +200,12 @@ impl ReadHandle for LocalReadHandle {
         .await
     }
 
+    /// `fstat` on the open descriptor: local files can grow (or shrink)
+    /// while open, and readers follow them.
+    async fn current_size(&self) -> Result<Option<u64>> {
+        self.current_len().await.map(Some)
+    }
+
     /// Coalesce nearby ranges (64 KiB gap by default), then read: merged
     /// ranges above `2 × request_size` with [`read_parallel`], smaller ones
     /// packed into batches of about `request_size` bytes, each batch one
@@ -184,7 +213,13 @@ impl ReadHandle for LocalReadHandle {
     /// Many tiny ranges thus cost a few thread hops instead of one each, and
     /// large ranges still read in parallel.
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let size = self.info.size;
+        // Ranges past the size seen at open may hold data appended since.
+        let reach = ranges.iter().map(|r| r.end).max().unwrap_or(0);
+        let size = if reach > self.info.size {
+            self.current_len().await?
+        } else {
+            self.info.size
+        };
         let clamped: Vec<Range<u64>> = ranges
             .iter()
             .map(|r| {
@@ -280,7 +315,7 @@ impl ReadHandle for LocalReadHandle {
 
 /// Whether `path` (not following symlinks) is still the file open as `file`.
 #[cfg(unix)]
-fn still_linked_at(file: &File, path: &std::path::Path) -> bool {
+pub(crate) fn still_linked_at(file: &File, path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (file.metadata(), std::fs::symlink_metadata(path)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
@@ -292,7 +327,7 @@ fn still_linked_at(file: &File, path: &std::path::Path) -> bool {
 /// `FILE_SHARE_DELETE` (std's default), so the path cannot have been
 /// replaced while the handle was open.
 #[cfg(not(unix))]
-fn still_linked_at(_file: &File, _path: &std::path::Path) -> bool {
+pub(crate) fn still_linked_at(_file: &File, _path: &std::path::Path) -> bool {
     true
 }
 

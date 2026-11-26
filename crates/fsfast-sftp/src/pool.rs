@@ -70,6 +70,10 @@ struct PoolInner {
     last_grow_failure: Mutex<Option<Instant>>,
     caps: AtomicU8,
     seq: AtomicU64,
+    /// Incremented (under the `sessions` lock) by every `close`, so a
+    /// background grow that finishes its handshake after a close drops its
+    /// connection instead of putting it back into the closed pool.
+    epoch: AtomicU64,
 }
 
 /// The session pool of one filesystem.
@@ -100,6 +104,7 @@ impl Pool {
                 last_grow_failure: Mutex::new(None),
                 caps: AtomicU8::new(0),
                 seq: AtomicU64::new(0),
+                epoch: AtomicU64::new(0),
             }),
         }
     }
@@ -168,6 +173,9 @@ impl Pool {
             return;
         }
         let inner = self.inner.clone();
+        // Taken before anything awaits: a close() after this point (even
+        // before the task runs) cancels the grow.
+        let epoch = inner.epoch.load(Ordering::Acquire);
         tokio::spawn(async move {
             {
                 let _g = inner.connect_lock.lock().await;
@@ -176,9 +184,18 @@ impl Pool {
                     s.retain(|s| !s.is_closed());
                     s.len()
                 };
-                if live < inner.cfg.connections {
+                if live < inner.cfg.connections && inner.epoch.load(Ordering::Acquire) == epoch {
                     match inner.connect().await {
-                        Ok(s) => inner.sessions.lock().push(s),
+                        Ok(s) => {
+                            let mut v = inner.sessions.lock();
+                            if inner.epoch.load(Ordering::Acquire) == epoch {
+                                v.push(s);
+                            } else {
+                                // The pool was closed during the handshake.
+                                drop(v);
+                                drop(s);
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!("sftp: opening an extra connection failed: {e}");
                             *inner.last_grow_failure.lock() = Some(Instant::now());
@@ -192,7 +209,11 @@ impl Pool {
 
     /// Close every session (the pool reconnects on the next `get`).
     pub async fn close(&self) {
-        let sessions: Vec<Session> = std::mem::take(&mut *self.inner.sessions.lock());
+        let sessions: Vec<Session> = {
+            let mut v = self.inner.sessions.lock();
+            self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+            std::mem::take(&mut *v)
+        };
         drop(sessions);
     }
 }

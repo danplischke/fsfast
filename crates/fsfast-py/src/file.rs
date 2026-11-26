@@ -22,7 +22,6 @@ use std::task::{Context, Poll, Waker};
 use bytes::{Bytes, BytesMut};
 use fsfast_core::{Error, ErrorKind, FileInfo, Result, WriteHandle};
 use fsfast_engine::{CacheMode, FileReader, OpKind, ReaderConfig, Stats};
-use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -30,6 +29,7 @@ use crate::buffer::{ReadSource, WriteTarget};
 use crate::convert::{bytes_from_py, bytes_to_py, info_to_py, zeroed_bytes};
 use crate::errors::to_pyerr;
 use crate::ops::seek_target;
+use crate::owned::OwnedMutex;
 use crate::registry::Backend;
 use crate::runtime::{drive, fork_generation, runtime};
 
@@ -43,6 +43,13 @@ const INLINE_WRITE_MAX: usize = 64 << 10;
 /// `read(n)` of at least this many bytes reads straight into the result
 /// `bytes` object instead of assembling a buffer and copying it.
 const DIRECT_READ_MIN: usize = 2 << 20;
+
+/// A file method called by a Python signal handler while an operation on
+/// the same file is in progress on the same thread (see [`crate::owned`]):
+/// CPython's buffered files raise this instead of deadlocking.
+fn reentrant_error(what: &str) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("reentrant call inside {what}"))
+}
 
 fn closed_error() -> Error {
     Error::invalid_input("I/O operation on closed file.")
@@ -345,7 +352,7 @@ fn find(hay: &[u8], delim: &[u8]) -> Option<usize> {
 /// whole-file, or none. Large reads are fetched as parallel ranged requests.
 #[pyclass(frozen, module = "fsfast._core")]
 pub struct RustReader {
-    state: Mutex<Option<ReaderState>>,
+    state: OwnedMutex<Option<ReaderState>>,
     info: FileInfo,
     path: String,
     size: u64,
@@ -366,12 +373,22 @@ impl RustReader {
         RustReader {
             size: reader.size(),
             cache_mode: reader.cache_mode(),
-            state: Mutex::new(Some(ReaderState::new(reader, cfg))),
+            state: OwnedMutex::new(Some(ReaderState::new(reader, cfg))),
             info,
             path,
             backend,
             stats,
         }
+    }
+
+    /// `RuntimeError` if this thread is already inside an operation on this
+    /// file (a signal handler touching it): waiting for the state would
+    /// never end.
+    fn check_reentry(&self) -> PyResult<()> {
+        if self.state.held_by_current_thread() {
+            return Err(reentrant_error(&self.__repr__()));
+        }
+        Ok(())
     }
 
     /// The open reader state, made usable in this process (see
@@ -394,6 +411,7 @@ impl RustReader {
         if let Some(mut g) = self.state.try_lock() {
             return raise(py, self.open_state(&mut g).and_then(f));
         }
+        self.check_reentry()?;
         let r = py.detach(|| {
             let mut g = self.state.lock();
             self.open_state(&mut g).and_then(f)
@@ -424,6 +442,7 @@ impl RustReader {
             let r = py.detach(move || drive(&slot, fut));
             return raise(py, r?);
         }
+        self.check_reentry()?;
         let r: PyResult<Result<T>> = py.detach(|| {
             let mut g = self.state.lock();
             match self.open_state(&mut g) {
@@ -450,6 +469,7 @@ impl RustReader {
     /// Large read straight into a new `bytes` object (the engine fills it
     /// with parallel ranged reads): no intermediate buffer, one copy.
     fn read_direct<'py>(&self, py: Python<'py>, len: usize) -> PyResult<Bound<'py, PyBytes>> {
+        self.check_reentry()?;
         let (obj, mut buf) = zeroed_bytes(py, len)?;
         let slot = runtime();
         let dst = buf.as_mut_slice();
@@ -505,8 +525,20 @@ impl RustReader {
     #[pyo3(signature = (n=None))]
     fn read<'py>(&self, py: Python<'py>, n: Option<i64>) -> PyResult<Bound<'py, PyBytes>> {
         let n = opt_len(n);
-        let pos = self.with_state(py, |st| Ok(st.tell()))?;
-        let avail = self.size.saturating_sub(pos);
+        let (pos, size) = if n.is_none() {
+            // To the end: a handle that is not pinned to the size seen at
+            // open (a local file being appended to) is read to its current
+            // end, like a Python file object. A no-op for other handles.
+            self.run(py, |st| {
+                Box::pin(async move {
+                    let size = st.reader.refresh_size().await?;
+                    Ok((st.tell(), size))
+                })
+            })?
+        } else {
+            self.with_state(py, |st| Ok((st.tell(), st.reader.size())))?
+        };
+        let avail = size.saturating_sub(pos);
         let len = n.map_or(avail, |n| (n as u64).min(avail));
         if len >= DIRECT_READ_MIN as u64
             && let Ok(len) = usize::try_from(len)
@@ -539,6 +571,7 @@ impl RustReader {
                 e
             }
         })?;
+        self.check_reentry()?;
         let slot = runtime();
         let dst = target.as_mut_slice();
         let r: PyResult<Result<usize>> = py.detach(|| {
@@ -593,9 +626,19 @@ impl RustReader {
     /// the end is allowed; before the start is a `ValueError`.
     #[pyo3(signature = (offset, whence=0))]
     fn seek(&self, py: Python<'_>, offset: i64, whence: i32) -> PyResult<u64> {
-        let size = self.size;
+        if whence == 2 {
+            // Relative to the current end of a handle whose size may have
+            // changed since open (local files), like a Python file object.
+            return self.run(py, move |st| {
+                Box::pin(async move {
+                    let size = st.reader.refresh_size().await?;
+                    let to = seek_target(offset, whence, st.tell(), size)?;
+                    st.seek(to)
+                })
+            });
+        }
         self.with_state(py, move |st| {
-            let to = seek_target(offset, whence, st.tell(), size)?;
+            let to = seek_target(offset, whence, st.tell(), st.reader.size())?;
             st.seek(to)
         })
     }
@@ -641,6 +684,7 @@ impl RustReader {
     /// Close the file (idempotent). Cancels background prefetches and
     /// releases the backend handle.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_reentry()?;
         let slot = runtime();
         let r: PyResult<Result<()>> = py.detach(|| {
             let mut g = self.state.lock();
@@ -658,9 +702,13 @@ impl RustReader {
         raise(py, r?)
     }
 
-    /// Whether `close()` was called.
+    /// Whether `close()` was called. Inside an operation on this thread (a
+    /// signal handler) the file is open: it has not been closed yet.
     #[getter]
     fn closed(&self, py: Python<'_>) -> bool {
+        if self.state.held_by_current_thread() {
+            return false;
+        }
         py.detach(|| self.state.lock().is_none())
     }
 
@@ -817,7 +865,7 @@ impl InData {
 /// (like a Python file flushed on garbage collection).
 #[pyclass(frozen, module = "fsfast._core")]
 pub struct RustWriter {
-    state: Mutex<WriterState>,
+    state: OwnedMutex<WriterState>,
     path: String,
     stats: Arc<Stats>,
 }
@@ -830,7 +878,7 @@ impl RustWriter {
         stats: Arc<Stats>,
     ) -> Self {
         RustWriter {
-            state: Mutex::new(WriterState {
+            state: OwnedMutex::new(WriterState {
                 handle: Some(handle),
                 buf: BytesMut::new(),
                 buffer_size,
@@ -854,6 +902,9 @@ impl RustWriter {
         T: Send,
         F: for<'a> FnOnce(&'a mut WriterState) -> futures::future::BoxFuture<'a, Result<T>> + Send,
     {
+        if self.state.held_by_current_thread() {
+            return Err(reentrant_error(&self.__repr__()));
+        }
         let slot = runtime();
         if inline_first && let Some(mut g) = self.state.try_lock() {
             g.check_fork();
@@ -973,13 +1024,19 @@ impl RustWriter {
 
     /// Bytes accepted by `write` so far (including buffered bytes).
     #[getter]
-    fn bytes_written(&self, py: Python<'_>) -> u64 {
-        py.detach(|| self.state.lock().accepted)
+    fn bytes_written(&self, py: Python<'_>) -> PyResult<u64> {
+        if self.state.held_by_current_thread() {
+            return Err(reentrant_error(&self.__repr__()));
+        }
+        Ok(py.detach(|| self.state.lock().accepted))
     }
 
     /// Whether `close()` or `abort()` was called.
     #[getter]
     fn closed(&self, py: Python<'_>) -> bool {
+        if self.state.held_by_current_thread() {
+            return false; // inside an operation on this thread: still open
+        }
         py.detach(|| self.state.lock().closed)
     }
 

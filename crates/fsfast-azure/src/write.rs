@@ -16,6 +16,12 @@
 //!   data is pushed on `flush`, when 4 MiB accumulate, and on `close`; `abort`
 //!   discards what was not pushed yet. A missing blob is created as an append
 //!   blob (adlfs `create_append_blob`) on the first push.
+//!   A failed Append Block has already taken its chunk out of the buffer, so
+//!   the handle then refuses to append anything more (`flush`/`close` fail)
+//!   rather than commit the rest after a hole.
+//! * A `close` that fails or is cancelled leaves the handle failed: a later
+//!   `close` reports an error instead of success (as does `close` after
+//!   `abort`).
 //! * Append to a **block blob** (adlfs fails here): the new data is staged as
 //!   blocks and committed after the existing blocks with `If-Match` on the
 //!   ETag seen at open, keeping the blob's metadata and content settings, so
@@ -563,8 +569,14 @@ enum State {
         pos: Option<u64>,
         hdr: BlobHeaders,
     },
-    /// Closed or aborted.
+    /// Closed successfully.
     Done,
+    /// Aborted.
+    Aborted,
+    /// An append or the commit failed (or its future was dropped half-way):
+    /// buffered data may be lost, so the handle refuses to commit anything
+    /// more (`flush`/`close` fail; `abort` discards the rest).
+    Failed,
 }
 
 /// An open blob for writing.
@@ -583,6 +595,8 @@ impl std::fmt::Debug for AzureWriteHandle {
             State::Blocks { .. } => "block blob",
             State::Append { .. } => "append blob",
             State::Done => "closed",
+            State::Aborted => "aborted",
+            State::Failed => "failed",
         };
         f.debug_struct("AzureWriteHandle")
             .field("path", &self.target.path)
@@ -593,76 +607,52 @@ impl std::fmt::Debug for AzureWriteHandle {
 }
 
 impl AzureWriteHandle {
+    /// The error for using a handle that is no longer open.
+    fn not_open(&self) -> Error {
+        match self.state {
+            State::Aborted => Error::invalid_input("write was aborted"),
+            State::Failed => Error::new(
+                ErrorKind::Io,
+                "an earlier append or commit of this file failed; nothing more is committed",
+            ),
+            _ => Error::invalid_input("write to a closed file"),
+        }
+        .with_path(&self.target.path)
+    }
+
+    /// Push buffered append-blob data (whole 4 MiB chunks, or everything
+    /// with `all`).
+    ///
+    /// A chunk leaves the buffer before its Append Block is sent, so if that
+    /// request fails (or this future is dropped) the chunk is gone; the
+    /// handle is then [`State::Failed`] and never appends the rest after the
+    /// hole. The state is parked as `Failed` while requests are in flight
+    /// and only restored on success, which makes this cancel-safe.
     async fn push_append(&mut self, all: bool) -> Result<()> {
-        let State::Append { pending, pos, hdr } = &mut self.state else {
+        if !matches!(self.state, State::Append { .. }) {
             return Ok(());
+        }
+        let State::Append {
+            mut pending,
+            mut pos,
+            hdr,
+        } = std::mem::replace(&mut self.state, State::Failed)
+        else {
+            unreachable!("checked above")
         };
-        if pos.is_none() {
-            match self.target.create_append_blob(hdr, true).await {
-                Ok(()) => *pos = Some(0),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    // Created concurrently: append to it if it is an append blob.
-                    let p = self
-                        .target
-                        .sh
-                        .fs()
-                        .head_blob(
-                            &self.target.container,
-                            &self.target.blob,
-                            None,
-                            &self.target.path,
-                        )
-                        .await?;
-                    if p.blob_type != BlobType::Append {
-                        return Err(e);
-                    }
-                    *pos = Some(p.size);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        while pending.len() >= APPEND_CHUNK || (all && !pending.is_empty()) {
-            let n = pending.len().min(APPEND_CHUNK);
-            let chunk = pending.split_to(n).freeze();
-            let at = pos.unwrap_or(0);
-            *pos = Some(self.target.append_block(at, chunk).await?);
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl WriteHandle for AzureWriteHandle {
-    async fn write(&mut self, data: Bytes) -> Result<()> {
-        let n = data.len() as u64;
-        match &mut self.state {
-            State::Blocks { up: Some(up), .. } => up.write(data).await?,
-            State::Append { pending, .. } => {
-                pending.extend_from_slice(&data);
-                if pending.len() >= APPEND_CHUNK {
-                    self.push_append(false).await?;
-                }
-            }
-            _ => {
-                return Err(
-                    Error::invalid_input("write to a closed file").with_path(&self.target.path)
-                );
-            }
-        }
-        self.written += n;
+        self.target
+            .push_append(&mut pending, &mut pos, &hdr, all)
+            .await?;
+        self.state = State::Append { pending, pos, hdr };
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<()> {
-        if matches!(self.state, State::Append { .. }) {
-            self.push_append(true).await?;
-        }
-        Ok(())
-    }
-
-    async fn close(&mut self) -> Result<()> {
-        match std::mem::replace(&mut self.state, State::Done) {
-            State::Done => Ok(()),
+    /// Commit the upload in `state` (taken out of the handle by `close`).
+    async fn commit(&mut self, state: State) -> Result<()> {
+        match state {
+            State::Done | State::Aborted | State::Failed => {
+                unreachable!("close handles finished states")
+            }
             State::Blocks {
                 up,
                 base,
@@ -706,19 +696,104 @@ impl WriteHandle for AzureWriteHandle {
                     }
                 }
             }
-            state @ State::Append { .. } => {
-                self.state = state;
-                let r = self.push_append(true).await;
-                self.state = State::Done;
-                r
+            State::Append {
+                mut pending,
+                mut pos,
+                hdr,
+            } => {
+                self.target
+                    .push_append(&mut pending, &mut pos, &hdr, true)
+                    .await
             }
         }
     }
+}
+
+impl Target {
+    /// Append buffered data to the append blob at `*pos` (creating the blob
+    /// first when `*pos` is `None`), advancing `*pos`.
+    async fn push_append(
+        &self,
+        pending: &mut BytesMut,
+        pos: &mut Option<u64>,
+        hdr: &BlobHeaders,
+        all: bool,
+    ) -> Result<()> {
+        if pos.is_none() {
+            match self.create_append_blob(hdr, true).await {
+                Ok(()) => *pos = Some(0),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Created concurrently: append to it if it is an append blob.
+                    let p = self
+                        .sh
+                        .fs()
+                        .head_blob(&self.container, &self.blob, None, &self.path)
+                        .await?;
+                    if p.blob_type != BlobType::Append {
+                        return Err(e);
+                    }
+                    *pos = Some(p.size);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        while pending.len() >= APPEND_CHUNK || (all && !pending.is_empty()) {
+            let n = pending.len().min(APPEND_CHUNK);
+            let chunk = pending.split_to(n).freeze();
+            let at = pos.unwrap_or(0);
+            *pos = Some(self.append_block(at, chunk).await?);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl WriteHandle for AzureWriteHandle {
+    async fn write(&mut self, data: Bytes) -> Result<()> {
+        let n = data.len() as u64;
+        match &mut self.state {
+            State::Blocks { up: Some(up), .. } => up.write(data).await?,
+            State::Append { pending, .. } => {
+                pending.extend_from_slice(&data);
+                if pending.len() >= APPEND_CHUNK {
+                    self.push_append(false).await?;
+                }
+            }
+            _ => return Err(self.not_open()),
+        }
+        self.written += n;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        match self.state {
+            State::Append { .. } => self.push_append(true).await,
+            State::Failed => Err(self.not_open()),
+            _ => Ok(()),
+        }
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        match self.state {
+            State::Done => return Ok(()),
+            State::Aborted | State::Failed => return Err(self.not_open()),
+            State::Blocks { .. } | State::Append { .. } => {}
+        }
+        // Parked as `Failed` while the commit is in flight: if it fails, or
+        // this future is dropped half-way, a later `close` must not report
+        // success for data that was never (fully) committed.
+        let state = std::mem::replace(&mut self.state, State::Failed);
+        self.commit(state).await?;
+        self.state = State::Done;
+        Ok(())
+    }
 
     async fn abort(&mut self) -> Result<()> {
-        if let State::Blocks { up: Some(up), .. } = std::mem::replace(&mut self.state, State::Done)
-        {
-            (*up).abort().await;
+        match std::mem::replace(&mut self.state, State::Aborted) {
+            State::Blocks { up: Some(up), .. } => (*up).abort().await,
+            // Aborting after a successful close changes nothing.
+            State::Done => self.state = State::Done,
+            _ => {}
         }
         Ok(())
     }

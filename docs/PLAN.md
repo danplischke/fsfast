@@ -779,3 +779,16 @@ through `TextIOWrapper`), `rm`, `rm_file`, `rmdir`, `mkdir`, `makedirs`,
 **Module level:** `fsspec.open`, `open_files`, `url_to_fs`, `filesystem`,
 chained URLs, `fsspec.parquet.open_parquet_file` (through `cat_ranges`),
 pickling, and instance caching.
+
+---
+
+## Status note (2026-11-26)
+
+Appended after the wave-3 review. This note does not change the plan above.
+The tier-1 launch set (local, memory, HTTP, S3, SMB 2/3, SFTP, GCS, Azure
+Blob) is implemented and has Python drop-in classes and the `fsf` CLI. It
+passes fsspec's abstract suite and the listed upstream suites against local
+servers and emulators only. Tier 2, the SMB-3/SMB-4 milestones, full ADLS
+Gen2, fuzzing, traceability and interop matrices, and real-network or cloud
+benchmarks are not done. [STATUS.md](STATUS.md) has the per-item status and
+evidence.

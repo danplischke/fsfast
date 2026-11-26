@@ -575,6 +575,24 @@ pub struct TokenCache {
     /// Held by the one caller that is fetching a token.
     refresh: tokio::sync::Mutex<()>,
     fetches: AtomicUsize,
+    /// How many fetches have completed, and a copy of the latest one's error
+    /// if it failed.
+    /// Callers that were already waiting for that fetch share its failure
+    /// instead of each repeating it in turn (azure-identity likewise fails
+    /// fast once a credential turned out to be unavailable).
+    last: parking_lot::Mutex<(usize, Option<Error>)>,
+}
+
+/// A copy of `e` for another caller (`Error` is not `Clone`).
+fn copy_error(e: &Error) -> Error {
+    let mut c = Error::new(e.kind(), e.message()).with_retryable(e.is_retryable());
+    if let Some(p) = e.path() {
+        c = c.with_path(p);
+    }
+    for d in e.details() {
+        c = c.with_detail(d.clone());
+    }
+    c
 }
 
 impl fmt::Debug for TokenCache {
@@ -594,6 +612,7 @@ impl TokenCache {
             current: parking_lot::Mutex::new(None),
             refresh: tokio::sync::Mutex::new(()),
             fetches: AtomicUsize::new(0),
+            last: parking_lot::Mutex::new((0, None)),
         })
     }
 
@@ -621,8 +640,13 @@ impl TokenCache {
     /// in flight. While a token that is about to expire (but has not) is
     /// being refreshed, other callers keep using it instead of waiting for
     /// the token endpoint (which can take seconds, e.g. the Azure CLI);
-    /// without a valid token, they wait for the fetch.
+    /// without a valid token, they wait for the fetch, and when it fails
+    /// they all get its error (rather than each running the whole, possibly
+    /// slow, credential chain again in turn).
     pub async fn token(&self) -> Result<Zeroizing<String>> {
+        // Fetches completed before this call; one completing later (even if
+        // it started earlier) is a fetch this caller waited for.
+        let seen = self.last.lock().0;
         let _guard = match self.current(SystemTime::now()) {
             Some((t, true)) => return Ok(t),
             Some((t, false)) => match self.refresh.try_lock() {
@@ -637,8 +661,26 @@ impl TokenCache {
         if let Some((t, true)) = self.current(now) {
             return Ok(t);
         }
+        // ... or failed to: share that failure (keeping a token that has
+        // not expired yet, as below).
+        let shared = match &*self.last.lock() {
+            (n, Some(e)) if *n > seen => Some(copy_error(e)),
+            _ => None,
+        };
+        if let Some(e) = shared {
+            return match self.current(now) {
+                Some((t, _)) => Ok(t),
+                None => Err(e),
+            };
+        }
         self.fetches.fetch_add(1, Ordering::Relaxed);
-        match self.source.fetch(&self.http).await {
+        let r = self.source.fetch(&self.http).await;
+        {
+            let mut last = self.last.lock();
+            last.0 += 1;
+            last.1 = r.as_ref().err().map(copy_error);
+        }
+        match r {
             Ok(t) => {
                 let out = t.token.clone();
                 *self.current.lock() = Some(t);
@@ -718,6 +760,57 @@ mod tests {
         assert_eq!(t.as_str(), "t0");
         assert_eq!(refresher.await.unwrap().as_str(), "t1");
         assert_eq!(cache.token().await.unwrap().as_str(), "t1");
+        assert_eq!(cache.fetch_count(), 2);
+    }
+
+    /// Fails slowly, counting its calls.
+    #[derive(Debug)]
+    struct FailingSource(AtomicUsize);
+
+    #[async_trait]
+    impl TokenSource for FailingSource {
+        async fn fetch(&self, _: &TokenHttp) -> Result<AccessToken> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Err(Error::new(ErrorKind::PermissionDenied, "no credentials")
+                .with_detail(fsfast_core::Detail::Code("Nope".into())))
+        }
+        fn name(&self) -> &'static str {
+            "Failing"
+        }
+    }
+
+    /// Concurrent callers waiting for a fetch that fails share its error
+    /// instead of each repeating the (slow) fetch in turn; a later call
+    /// tries again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_callers_share_a_failed_fetch() {
+        let http = HttpClient::new(fsfast_http_transport::HttpConfig::default()).unwrap();
+        let cache = TokenCache::new(
+            Box::new(FailingSource(AtomicUsize::new(0))),
+            TokenHttp {
+                aad: http.clone(),
+                local: http,
+            },
+        );
+        let start = std::time::Instant::now();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let c = cache.clone();
+                tokio::spawn(async move { c.token().await })
+            })
+            .collect();
+        for t in tasks {
+            let e = t.await.unwrap().unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+            assert_eq!(e.message(), "no credentials");
+            assert_eq!(e.details(), &[fsfast_core::Detail::Code("Nope".into())]);
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(cache.fetch_count(), 1, "took {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+        // Not cached beyond the callers that waited for it.
+        assert!(cache.token().await.is_err());
         assert_eq!(cache.fetch_count(), 2);
     }
 

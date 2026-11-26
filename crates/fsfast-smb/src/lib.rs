@@ -137,6 +137,17 @@ pub struct ConnectionInfo {
 /// Largest speculative READ of the one-round-trip `cat_file`.
 const INLINE_READ: usize = 1 << 20;
 
+/// Outcome of `cat_file`'s one-round-trip CREATE+READ+CLOSE attempt.
+enum Inline {
+    /// The whole requested range.
+    Done(Bytes),
+    /// A bounded range larger than one READ: nothing was sent.
+    TooLarge,
+    /// An unbounded read of a file larger than the speculative READ: `data`
+    /// holds its first bytes, `eof` the file's size.
+    Partial { data: Bytes, eof: u64 },
+}
+
 /// The fsspec `info()` keys after `name`/`size`/`type`, in the reference
 /// implementation's order (for the Python bindings).
 pub const INFO_KEYS: &[&str] = &["uid", "gid", "time", "mtime"];
@@ -352,9 +363,38 @@ impl SmbFileSystem {
         )))
     }
 
+    /// Finish a whole-file (`Full`/`From`) read whose speculative inline
+    /// READ returned `data` (the bytes at `start`) of a file of `eof` bytes:
+    /// only the remainder is read, through a handle, instead of discarding
+    /// `data` and reading everything again. If the file's size changed in
+    /// between, the whole range is re-read so the result is one consistent
+    /// version.
+    async fn read_rest(&self, p: &SmbPath, start: u64, data: Bytes, eof: u64) -> Result<Bytes> {
+        let h = self
+            .measure(OpKind::Open, self.open_handle(p, &ReadOptions::default()))
+            .await?;
+        let size = h.size();
+        let out = if size == eof {
+            self.client.stats.add_bytes_read(data.len() as u64);
+            let at = start + data.len() as u64;
+            h.read_after(&data, at, size.saturating_sub(at) as usize)
+                .await
+        } else if size > start {
+            h.read_at(start, (size - start) as usize).await
+        } else {
+            Ok(Bytes::new())
+        };
+        let closed = h.close().await;
+        let out = out?;
+        closed?;
+        Ok(out)
+    }
+
     /// Read `[start, end)` (`end = None`: to EOF) through a handle.
     async fn read_via_handle(&self, p: &SmbPath, range: ByteRange) -> Result<Bytes> {
-        let h = self.open_handle(p, &ReadOptions::default()).await?;
+        let h = self
+            .measure(OpKind::Open, self.open_handle(p, &ReadOptions::default()))
+            .await?;
         let r = range.resolve(h.size());
         let out = if r.end > r.start {
             h.read_at(r.start, (r.end - r.start) as usize).await
@@ -598,54 +638,63 @@ impl FileSystem for SmbFileSystem {
         };
         let share = self.share_mode(true);
         let chunk = self.client.cfg.read_chunk_size;
+        // The inline read is one compound round trip (CREATE+READ+CLOSE):
+        // one wire request. `None` (too large) also cost that request.
         let fast = self
             .client
-            .run(&p, true, |ctx| {
-                let p = &p;
-                async move {
-                    let max = if ctx.multi_credit() {
-                        ctx.max_read()
-                    } else {
-                        65536
-                    };
-                    let inline = ctx.credit_limited(chunk.min(max));
-                    let len = match want {
-                        Some(w) if w > inline as u64 => return Ok(None),
-                        Some(w) => w as usize,
-                        // A read of unknown length is speculative (the
-                        // server allocates the full length): at most 1 MiB,
-                        // enough for typical small files.
-                        None => inline.min(INLINE_READ),
-                    };
-                    let (meta, data) = ops::read_small(&ctx, p, share, start, len).await?;
-                    let eof = meta.end_of_file;
-                    let end = match want {
-                        Some(w) => start.saturating_add(w).min(eof),
-                        None => eof,
-                    };
-                    if end <= start {
-                        return Ok(Some(Bytes::new()));
+            .stats
+            .measure(
+                OpKind::Read,
+                self.client.run(&p, true, |ctx| {
+                    let p = &p;
+                    async move {
+                        let max = if ctx.multi_credit() {
+                            ctx.max_read()
+                        } else {
+                            65536
+                        };
+                        let inline = ctx.credit_limited(chunk.min(max));
+                        let len = match want {
+                            Some(w) if w > inline as u64 => return Ok(Inline::TooLarge),
+                            Some(w) => w as usize,
+                            // A read of unknown length is speculative (the
+                            // server allocates the full length): at most 1 MiB,
+                            // enough for typical small files.
+                            None => inline.min(INLINE_READ),
+                        };
+                        let (meta, data) = ops::read_small(&ctx, p, share, start, len).await?;
+                        let eof = meta.end_of_file;
+                        let end = match want {
+                            Some(w) => start.saturating_add(w).min(eof),
+                            None => eof,
+                        };
+                        if end <= start {
+                            return Ok(Inline::Done(Bytes::new()));
+                        }
+                        let need = (end - start) as usize;
+                        if data.len() >= need {
+                            return Ok(Inline::Done(data.slice(..need)));
+                        }
+                        if want.is_some() {
+                            // Short read of a bounded range: the file ended.
+                            return Ok(Inline::Done(data));
+                        }
+                        Ok(Inline::Partial { data, eof })
                     }
-                    let need = (end - start) as usize;
-                    if data.len() >= need {
-                        return Ok(Some(data.slice(..need)));
-                    }
-                    if want.is_some() {
-                        // Short read of a bounded range: the file ended.
-                        return Ok(Some(data));
-                    }
-                    Ok(None)
-                }
-            })
+                }),
+            )
             .await;
-        let out = match fast {
-            Ok(Some(b)) => Ok(b),
-            // Larger than one request: read through a pipelined handle.
-            Ok(None) => self.read_via_handle(&p, range).await,
+        match fast {
+            Ok(Inline::Done(b)) => {
+                self.client.stats.add_bytes_read(b.len() as u64);
+                Ok(b)
+            }
+            // Larger than one request: read through a pipelined handle
+            // (which counts its own requests and bytes).
+            Ok(Inline::TooLarge) => self.read_via_handle(&p, range).await,
+            Ok(Inline::Partial { data, eof }) => self.read_rest(&p, start, data, eof).await,
             Err(e) => Err(e),
-        }?;
-        self.client.stats.add_bytes_read(out.len() as u64);
-        Ok(out)
+        }
     }
 
     async fn pipe_file(&self, path: &str, data: Bytes, opts: &WriteOptions) -> Result<()> {

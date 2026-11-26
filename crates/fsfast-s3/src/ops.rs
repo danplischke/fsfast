@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use fsfast_core::{Error, ErrorKind, Result, path as fspath};
 use fsfast_http_transport::Method;
-use fsfast_http_transport::header::HeaderMap;
+use fsfast_http_transport::header::{HeaderMap, HeaderName, HeaderValue};
 use futures::{StreamExt, stream};
 
 use crate::client::Call;
@@ -534,6 +534,16 @@ impl S3FileSystem {
             }
             .build(),
         );
+        // Pin every part to the version the HEAD saw (s3transfer's
+        // CopySourceIfMatch): parts are separate reads of the source, and a
+        // source overwritten mid-copy must fail the copy (412 ->
+        // PreconditionFailed) rather than stitch two versions together.
+        let mut source_headers = source_headers;
+        if let Some(etag) = meta.etag.as_deref().filter(|e| !e.is_empty())
+            && let Ok(v) = HeaderValue::from_str(etag)
+        {
+            source_headers.insert(HeaderName::from_static("x-amz-copy-source-if-match"), v);
+        }
         let ranges = fsfast_core::split_range(0..meta.size, part);
         let res = async {
             let sink2 = &sink;

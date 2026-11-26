@@ -114,10 +114,29 @@ jobs:
         run: .github/scripts/ci-services.sh
       - name: Rust tests with live services
         run: cargo test --workspace --locked
+      # The SFTP public-key tests write the test user's authorized_keys,
+      # which test-services.sh (run as root) leaves writable by root and the
+      # test user only: as the runner user they print a skip message and
+      # pass. Run that one test binary as root and fail if it still skips.
+      - name: SFTP public-key auth tests (as root)
+        run: |
+          bin=$(cargo test -p fsfast-sftp --test key_auth --locked --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and .target.name == "key_auth" and .executable != null) | .executable')
+          test -x "$bin"
+          sudo -E "$bin" --nocapture 2>&1 | tee key_auth.log
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q "skipping key auth test" key_auth.log; then
+            echo "::error::the SFTP key auth tests were skipped"
+            exit 1
+          fi
       - name: Build the Python extension
         run: VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release -m crates/fsfast-py/Cargo.toml
       - name: Python tests
         run: .venv/bin/python -m pytest tests/python -q -ra
+      - name: Benchmark harness and compliance runner tests
+        run: .venv/bin/python -m pytest bench/test_bench.py tests/compliance/test_runner.py -q -ra -p no:cacheprovider
+      - name: Compliance (fsspec abstract suite on every backend)
+        run: FSFAST_COMPLIANCE_REPORTS="$PWD/compliance-reports" tests/compliance/run.sh abstract
       - name: fsf smoke benchmark on every service
         run: |
           cargo build --locked -p fsfast-cli
@@ -128,6 +147,12 @@ jobs:
         with:
           name: fsf-smoke-bench
           path: bench-results/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compliance-reports
+          path: compliance-reports/
           if-no-files-found: ignore
       - name: Service logs
         if: failure()

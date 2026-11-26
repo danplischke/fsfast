@@ -46,7 +46,7 @@ All the protocols are in `fsfast.CLASSES`, so `fsfast.install()` and `FSFAST_OVE
   - The reference extras each class provides.
 - Without the service environment variables, the service tests skip and the offline tests still run. Plain `pytest` passes without services.
 
-Result with a release build of the extension (`maturin develop --release`): 674 passed and 2 skipped in `tests/python`. The 2 skips are permission tests that need a non-root user. Per backend:
+Result with a release build of the extension (`maturin develop --release`): 674 passed and 2 skipped in `tests/python` when this page was written; 745 passed and 2 skipped on 2026-11-26, after the review and performance fixes added their regression tests (`test_review_fixes.py`, `test_perf_fixes.py`). The 2 skips are permission tests that need a non-root user. Per backend:
 - s3: 17 passed
 - gcs: 16 passed
 - azure: 16 passed

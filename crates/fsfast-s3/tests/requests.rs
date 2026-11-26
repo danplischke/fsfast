@@ -66,6 +66,9 @@ struct Store {
     objects: BTreeMap<String, (Vec<u8>, HeaderMap)>,
     uploads: HashMap<String, BTreeMap<u32, Vec<u8>>>,
     next_upload: usize,
+    /// Replace this object with these bytes right after the first
+    /// `UploadPartCopy` (a concurrent overwrite in the middle of a copy).
+    overwrite_after_part_copy: Option<(String, Vec<u8>)>,
 }
 
 /// Injected faults: (operation, how many times, status, error code).
@@ -258,6 +261,15 @@ fn handle(store: &Mutex<Store>, s: &Seen) -> (u16, Vec<(String, String)>, Vec<u8
             let Some((data, meta)) = st.objects.get(&src).cloned() else {
                 return not_found();
             };
+            if let Some(m) = s.h("x-amz-copy-source-if-match")
+                && m != etag_of(&data)
+            {
+                return (
+                    412,
+                    vec![],
+                    b"<Error><Code>PreconditionFailed</Code><Condition>x-amz-copy-source-If-Match</Condition></Error>".to_vec(),
+                );
+            }
             let data = match s.h("x-amz-copy-source-range") {
                 Some(r) => {
                     let (a, b) = r.trim_start_matches("bytes=").split_once('-').unwrap();
@@ -275,6 +287,9 @@ fn handle(store: &Mutex<Store>, s: &Seen) -> (u16, Vec<(String, String)>, Vec<u8
                 let id = &s.query["uploadId"];
                 let n: u32 = s.query["partNumber"].parse().unwrap();
                 st.uploads.get_mut(id).unwrap().insert(n, data);
+                if let Some((k, d)) = st.overwrite_after_part_copy.take() {
+                    st.objects.insert(k, (d, HeaderMap::new()));
+                }
                 ok(&format!(
                     "<CopyPartResult><ETag>{etag}</ETag></CopyPartResult>"
                 ))
@@ -1037,4 +1052,262 @@ async fn conditional_write_conflicts_are_retried() {
         .await
         .unwrap_err();
     assert_eq!(e.kind(), ErrorKind::AlreadyExists, "{e}");
+}
+
+/// s3fs merges `s3_additional_kwargs` under each call's own arguments
+/// (`kw = s3_additional_kwargs.copy(); kw.update(kwargs)`): put_file's
+/// guessed ContentType, `WriteOptions` content type / metadata and other
+/// per-call headers win, and a call's Metadata replaces the whole map.
+#[tokio::test]
+async fn call_arguments_override_additional_kwargs() {
+    let f = fake().await;
+    let fs = s3(
+        &f,
+        &[(
+            "s3_additional_kwargs",
+            map(&[
+                ("ContentType", "application/x-default".into()),
+                ("Metadata", map(&[("fsonly", "1".into())])),
+                ("ACL", "private".into()),
+            ]),
+        )],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("d.json");
+    std::fs::write(&local, b"{}").unwrap();
+    fs.put_file(&local, "b/d.json", &WriteOptions::default())
+        .await
+        .unwrap();
+    let put = &f.requests("PutObject")[0];
+    assert_eq!(put.h("content-type"), Some("application/json"));
+    // Arguments the call does not set still come from the kwargs.
+    assert_eq!(put.h("x-amz-meta-fsonly"), Some("1"));
+    assert_eq!(put.h("x-amz-acl"), Some("private"));
+    f.clear();
+    let mut meta = BTreeMap::new();
+    meta.insert("callonly".to_owned(), "2".to_owned());
+    let w = WriteOptions {
+        content_type: Some("text/csv".into()),
+        metadata: meta,
+        ..WriteOptions::default()
+    };
+    fs.pipe_file("b/k", Bytes::from_static(b"a"), &w)
+        .await
+        .unwrap();
+    let put = &f.requests("PutObject")[0];
+    assert_eq!(put.h("content-type"), Some("text/csv"));
+    assert_eq!(put.h("x-amz-meta-callonly"), Some("2"));
+    assert!(put.h("x-amz-meta-fsonly").is_none());
+    // Per-call extras still override both.
+    f.clear();
+    let mut extra = BTreeMap::new();
+    extra.insert("ContentType".to_owned(), Value::from("text/x-extra"));
+    let w = WriteOptions {
+        content_type: Some("text/csv".into()),
+        extra,
+        ..WriteOptions::default()
+    };
+    fs.pipe_file("b/k", Bytes::from_static(b"a"), &w)
+        .await
+        .unwrap();
+    let put = &f.requests("PutObject")[0];
+    assert_eq!(put.h("content-type"), Some("text/x-extra"));
+    assert_eq!(put.h("x-amz-meta-fsonly"), Some("1"));
+}
+
+/// An 'ab' append of a small object downloads it and rewrites it: that
+/// download must carry the per-call parameters (an SSE-C key or
+/// RequestPayer passed only in `WriteOptions.extra`), as the HEAD does.
+#[tokio::test]
+async fn small_append_download_uses_per_call_parameters() {
+    let f = fake().await;
+    let fs = s3(&f, &[]);
+    let key = "0123456789abcdef0123456789abcdef";
+    let mut extra = BTreeMap::new();
+    extra.insert("SSECustomerAlgorithm".to_owned(), Value::from("AES256"));
+    extra.insert("SSECustomerKey".to_owned(), Value::from(key));
+    extra.insert("RequestPayer".to_owned(), Value::from("requester"));
+    let w = WriteOptions {
+        extra: extra.clone(),
+        ..WriteOptions::default()
+    };
+    fs.pipe_file("b/k", Bytes::from_static(b"hello "), &w)
+        .await
+        .unwrap();
+    f.clear();
+    let a = WriteOptions {
+        mode: WriteMode::Append,
+        extra,
+        ..WriteOptions::default()
+    };
+    fs.pipe_file("b/k", Bytes::from_static(b"world"), &a)
+        .await
+        .unwrap();
+    for op in ["HeadObject", "GetObject", "PutObject"] {
+        let r = &f.requests(op)[0];
+        assert_eq!(
+            r.h("x-amz-server-side-encryption-customer-key"),
+            Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+            "{op}"
+        );
+        assert_eq!(r.h("x-amz-request-payer"), Some("requester"), "{op}");
+    }
+    assert_eq!(&f.store.lock().objects["b/k"].0[..], b"hello world");
+}
+
+/// A multipart server-side copy is several reads of the source: every
+/// `UploadPartCopy` is pinned to the ETag the copy started from
+/// (s3transfer's `CopySourceIfMatch`), so a source overwritten in the middle
+/// of the copy fails it instead of producing an object that never existed
+/// (and `mv` then keeps the source).
+#[tokio::test]
+async fn multipart_copies_are_pinned_to_the_source_etag() {
+    let f = fake().await;
+    let fs = s3(
+        &f,
+        &[
+            ("copy_threshold", Value::Int(6 << 20)),
+            ("copy_part_size", Value::Int(5 << 20)),
+            ("max_concurrency", Value::Int(1)),
+        ],
+    );
+    let a = vec![b'A'; 12 << 20];
+    f.store
+        .lock()
+        .objects
+        .insert("b/src".into(), (a.clone(), HeaderMap::new()));
+    fs.cp_file("b/src", "b/ok").await.unwrap();
+    let parts = f.requests("UploadPartCopy");
+    assert_eq!(parts.len(), 3);
+    let etag = etag_of(&a);
+    assert!(
+        parts
+            .iter()
+            .all(|p| p.h("x-amz-copy-source-if-match") == Some(etag.as_str()))
+    );
+    assert_eq!(f.store.lock().objects["b/ok"].0, a);
+
+    // Overwritten after the first part: the copy (and the move) fail.
+    for mv in [false, true] {
+        f.clear();
+        f.store.lock().overwrite_after_part_copy = Some(("b/src".into(), vec![b'B'; 12 << 20]));
+        let res = if mv {
+            fs.mv_file("b/src", "b/mixed").await
+        } else {
+            fs.cp_file("b/src", "b/mixed").await
+        };
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "{err}");
+        let st = f.store.lock();
+        assert!(!st.objects.contains_key("b/mixed"));
+        assert!(st.objects.contains_key("b/src"), "mv kept the source");
+        assert!(st.uploads.is_empty(), "the upload was aborted");
+        drop(st);
+        assert!(f.ops().contains(&"AbortMultipartUpload"));
+        // Back to the original for the next round.
+        f.store
+            .lock()
+            .objects
+            .insert("b/src".into(), (a.clone(), HeaderMap::new()));
+    }
+
+    // An append copies the existing object into the first part(s): pinned
+    // to the version its HEAD saw.
+    f.clear();
+    let opts = WriteOptions {
+        mode: WriteMode::Append,
+        ..WriteOptions::default()
+    };
+    let mut w = fs.open_write("b/src", &opts).await.unwrap();
+    w.write(Bytes::from_static(b"tail")).await.unwrap();
+    f.store
+        .lock()
+        .objects
+        .insert("b/src".into(), (vec![b'B'; 6 << 20], HeaderMap::new()));
+    let err = w.close().await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PreconditionFailed, "{err}");
+    let copies = f.requests("UploadPartCopy");
+    assert_eq!(
+        copies[0].h("x-amz-copy-source-if-match"),
+        Some(etag.as_str())
+    );
+    assert_eq!(f.store.lock().objects["b/src"].0, vec![b'B'; 6 << 20]);
+}
+
+/// Object data carries a Content-MD5 (botocore sends a CRC32 by default):
+/// S3 refuses uploads to Object Lock buckets with a retention period, or
+/// with ObjectLock* parameters, without one. `request_checksum_calculation
+/// = "when_required"` turns it off, as in botocore.
+#[tokio::test]
+async fn object_data_carries_content_md5() {
+    use base64::Engine as _;
+    use md5::{Digest, Md5};
+    let md5 = |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(Md5::digest(d));
+    let f = fake().await;
+    let fs = s3(&f, &[("part_size", Value::Int(5 << 20))]);
+    let w = WriteOptions::default();
+    fs.pipe_file("b/small", Bytes::from_static(b"hello"), &w)
+        .await
+        .unwrap();
+    fs.pipe_file("b/empty", Bytes::new(), &w).await.unwrap();
+    let big: Vec<u8> = (0..(11u32 << 20)).map(|i| (i % 251) as u8).collect();
+    fs.pipe_file("b/big", Bytes::from(big.clone()), &w)
+        .await
+        .unwrap();
+    let puts = f.requests("PutObject");
+    assert_eq!(puts[0].h("content-md5"), Some(md5(b"hello").as_str()));
+    assert_eq!(puts[1].h("content-md5"), Some(md5(b"").as_str()));
+    let parts = f.requests("UploadPart");
+    assert_eq!(parts.len(), 3);
+    for p in &parts {
+        assert_eq!(p.h("content-md5"), Some(md5(&p.body).as_str()));
+    }
+    // Not on calls without object data.
+    for op in ["CreateMultipartUpload", "CompleteMultipartUpload"] {
+        assert!(f.requests(op)[0].h("content-md5").is_none(), "{op}");
+    }
+    assert_eq!(f.store.lock().objects["b/big"].0, big);
+    // Opt out: Config, or the environment variable.
+    let from_env = {
+        let mut o = Options::new();
+        o.insert("endpoint_url".into(), Value::from(f.base.as_str()));
+        o.insert("key".into(), Value::from("AK"));
+        o.insert("secret".into(), Value::from("SK"));
+        S3FileSystem::with_options(
+            S3Options::parse_with_env(
+                o,
+                Env::from_map([
+                    ("AWS_EC2_METADATA_DISABLED", "true"),
+                    ("AWS_REQUEST_CHECKSUM_CALCULATION", "WHEN_REQUIRED"),
+                ]),
+            )
+            .unwrap(),
+        )
+    };
+    let from_config = s3(
+        &f,
+        &[(
+            "config_kwargs",
+            map(&[("request_checksum_calculation", "when_required".into())]),
+        )],
+    );
+    for fs in [from_env, from_config] {
+        f.clear();
+        fs.pipe_file("b/small", Bytes::from_static(b"hello"), &w)
+            .await
+            .unwrap();
+        assert!(f.requests("PutObject")[0].h("content-md5").is_none());
+    }
+    let bad = S3Options::parse_with_env(
+        {
+            let mut o = Options::new();
+            o.insert(
+                "config_kwargs".into(),
+                map(&[("request_checksum_calculation", "sometimes".into())]),
+            );
+            o
+        },
+        Env::from_map([("AWS_EC2_METADATA_DISABLED", "true")]),
+    );
+    assert_eq!(bad.unwrap_err().kind(), ErrorKind::InvalidInput);
 }
